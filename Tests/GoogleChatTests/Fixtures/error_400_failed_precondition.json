@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 400,
+    "message": "CANARY-7f3a Thread spaces/CANARY-7f3a/threads/X was deleted.",
+    "status": "FAILED_PRECONDITION"
+  }
+}

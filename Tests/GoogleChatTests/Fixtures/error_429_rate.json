@@ -1,0 +1,15 @@
+{
+  "error": {
+    "code": 429,
+    "message": "CANARY-7f3a Quota exceeded for quota metric 'Read requests' for space spaces/CANARY-7f3a",
+    "status": "RESOURCE_EXHAUSTED",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": "RATE_LIMIT_EXCEEDED",
+        "domain": "googleapis.com",
+        "metadata": { "quota_limit": "ReadsPerMinutePerProject" }
+      }
+    ]
+  }
+}

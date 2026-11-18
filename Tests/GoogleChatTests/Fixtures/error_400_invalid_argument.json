@@ -1,0 +1,13 @@
+{
+  "error": {
+    "code": 400,
+    "message": "CANARY-7f3a Invalid value at 'filter'",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [{ "field": "filter", "description": "CANARY-7f3a" }]
+      }
+    ]
+  }
+}

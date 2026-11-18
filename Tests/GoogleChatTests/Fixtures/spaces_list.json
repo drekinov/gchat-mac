@@ -1,0 +1,57 @@
+{
+  "spaces": [
+    {
+      "name": "spaces/AAAAThreaded",
+      "spaceType": "SPACE",
+      "displayName": "Engineering",
+      "spaceThreadingState": "THREADED_MESSAGES",
+      "lastActiveTime": "2026-10-14T09:15:30.123456Z",
+      "createTime": "2025-01-02T03:04:05Z",
+      "externalUserAllowed": true,
+      "spaceHistoryState": "HISTORY_ON"
+    },
+    {
+      "name": "spaces/AAAAGrouped",
+      "spaceType": "SPACE",
+      "displayName": "Random",
+      "spaceThreadingState": "GROUPED_MESSAGES"
+    },
+    {
+      "name": "spaces/AAAAUnthreaded",
+      "spaceType": "SPACE",
+      "displayName": "Announcements",
+      "spaceThreadingState": "UNTHREADED_MESSAGES"
+    },
+    {
+      "name": "spaces/DMDMDM",
+      "spaceType": "DIRECT_MESSAGE",
+      "singleUserBotDm": true,
+      "lastActiveTime": "not a timestamp",
+      "spaceHistoryState": "HISTORY_OFF"
+    },
+    {
+      "name": "spaces/GCGCGC",
+      "spaceType": "GROUP_CHAT",
+      "spaceThreadingState": "SOME_FUTURE_STATE"
+    },
+    {
+      "name": "spaces/FUTURE",
+      "spaceType": "HOLOGRAM",
+      "displayName": "Unknown type is skipped"
+    },
+    {
+      "name": "spaces/bad name/with slash",
+      "spaceType": "SPACE"
+    },
+    {
+      "spaceType": "SPACE",
+      "displayName": "No name"
+    },
+    {
+      "name": "spaces/WRONGTYPE",
+      "spaceType": "SPACE",
+      "displayName": 42
+    }
+  ],
+  "nextPageToken": "page/2+token=="
+}

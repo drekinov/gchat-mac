@@ -1,0 +1,42 @@
+.DS_Store
+xcuserdata/
+DerivedData/
+build/
+.build/
+*.xcuserstate
+*.p12
+*.mobileprovision
+.env
+.env.*
+secrets/
+client_secret*.json
+
+# generated
+*.xcodeproj/
+
+# local signing
+App/Local.xcconfig
+
+# Local OAuth, signing and application state
+credentials.json
+client.json
+accounts.json
+login-url.txt
+*.credentials.*.json
+*.pem
+*.key
+*.p8
+*.pfx
+*.provisionprofile
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+*.app/
+*.dSYM/
+
+# Local development sessions
+.swiftpm/
+.claude/
+.codex/
+.agents/

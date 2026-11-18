@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 403,
+    "message": "CANARY-7f3a The write quota for this space has been exceeded.",
+    "status": "RESOURCE_EXHAUSTED"
+  }
+}

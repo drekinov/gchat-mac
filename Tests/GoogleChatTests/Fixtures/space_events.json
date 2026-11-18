@@ -1,0 +1,118 @@
+{
+  "spaceEvents": [
+    {
+      "name": "spaces/AAAA/spaceEvents/E1",
+      "eventTime": "2026-10-14T10:00:00Z",
+      "eventType": "google.workspace.chat.message.v1.created",
+      "messageCreatedEventData": {
+        "message": { "name": "spaces/AAAA/messages/M1", "createTime": "2026-10-14T09:59:59Z", "text": "one" }
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E2",
+      "eventTime": "2026-10-14T10:01:00Z",
+      "eventType": "google.workspace.chat.message.v1.batchCreated",
+      "messageBatchCreatedEventData": {
+        "messages": [
+          { "message": { "name": "spaces/AAAA/messages/M2", "createTime": "2026-10-14T10:00:10Z", "text": "two" } },
+          { "message": { "name": "spaces/AAAA/messages", "createTime": "2026-10-14T10:00:11Z" } },
+          { "message": { "name": "spaces/AAAA/messages/M3", "createTime": "2026-10-14T10:00:12Z", "text": "three" } }
+        ]
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E3",
+      "eventTime": "2026-10-14T10:02:00Z",
+      "eventType": "google.workspace.chat.message.v1.updated",
+      "messageUpdatedEventData": {
+        "message": { "name": "spaces/AAAA/messages/M1", "createTime": "2026-10-14T09:59:59Z",
+                     "lastUpdateTime": "2026-10-14T10:01:59Z", "text": "one (edited)" }
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E4",
+      "eventTime": "2026-10-14T10:03:00Z",
+      "eventType": "google.workspace.chat.message.v1.deleted",
+      "messageDeletedEventData": {
+        "message": { "name": "spaces/AAAA/messages/M2", "createTime": "2026-10-14T10:00:10Z",
+                     "deletionMetadata": { "deletionType": "CREATOR" } }
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E5",
+      "eventTime": "2026-10-14T10:04:00Z",
+      "eventType": "google.workspace.chat.reaction.v1.batchCreated",
+      "reactionBatchCreatedEventData": {
+        "reactions": [
+          { "reaction": { "name": "spaces/AAAA/messages/M1/reactions/R1", "user": { "name": "users/1" }, "emoji": { "unicode": "👍" } } },
+          { "reaction": { "name": "spaces/AAAA/messages/M3/reactions/R2", "user": { "name": "users/2" } } },
+          { "reaction": { "name": "spaces/AAAA/messages/M1/reactions/R3", "user": { "name": "users/3" } } },
+          { "reaction": { "name": "spaces/AAAA/reactions/R4" } },
+          { "reaction": { "name": "spaces/AAAA/messages/M1" } },
+          {}
+        ]
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E6",
+      "eventTime": "2026-10-14T10:05:00Z",
+      "eventType": "google.workspace.chat.reaction.v1.deleted",
+      "reactionDeletedEventData": {
+        "reaction": { "name": "spaces/AAAA/messages/M1/reactions/R1" }
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E7",
+      "eventTime": "2026-10-14T10:06:00Z",
+      "eventType": "google.workspace.chat.membership.v1.batchCreated",
+      "membershipBatchCreatedEventData": {
+        "memberships": [
+          { "membership": { "name": "spaces/AAAA/members/U1", "state": "JOINED" } },
+          { "membership": { "name": "spaces/AAAA/members/U2", "state": "JOINED" } }
+        ]
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E8",
+      "eventTime": "2026-10-14T10:07:00Z",
+      "eventType": "google.workspace.chat.membership.v1.deleted",
+      "membershipDeletedEventData": {
+        "membership": { "name": "spaces/AAAA/members/U1", "state": "NOT_A_MEMBER" }
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E9",
+      "eventTime": "2026-10-14T10:08:00Z",
+      "eventType": "google.workspace.chat.space.v1.updated",
+      "spaceUpdatedEventData": {
+        "space": { "name": "spaces/AAAA", "spaceType": "SPACE", "displayName": "Renamed", "spaceThreadingState": "THREADED_MESSAGES" }
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E10",
+      "eventTime": "2026-10-14T10:09:00Z",
+      "eventType": "google.workspace.chat.space.v1.batchUpdated",
+      "spaceBatchUpdatedEventData": {
+        "spaces": [
+          { "space": { "name": "spaces/AAAA", "spaceType": "SPACE", "displayName": "Renamed twice" } },
+          { "space": { "name": "spaces/AAAA", "spaceType": "HOLOGRAM" } }
+        ]
+      }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E11",
+      "eventTime": "2026-10-14T10:10:00Z",
+      "eventType": "google.workspace.chat.something.v1.new",
+      "somethingNewEventData": { "thing": {} }
+    },
+    {
+      "name": "spaces/AAAA/spaceEvents/E12",
+      "eventTime": "garbage",
+      "eventType": "google.workspace.chat.message.v1.created",
+      "messageCreatedEventData": {
+        "message": { "name": "spaces/AAAA/messages/M9", "createTime": "2026-10-14T10:10:00Z" }
+      }
+    }
+  ],
+  "nextPageToken": "events-next"
+}

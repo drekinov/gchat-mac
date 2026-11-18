@@ -1,0 +1,38 @@
+{
+  "reactions": [
+    {
+      "name": "spaces/AAAA/messages/M1/reactions/R1",
+      "user": { "name": "users/1001", "type": "HUMAN" },
+      "emoji": { "unicode": "👍" }
+    },
+    {
+      "name": "spaces/AAAA/messages/M1/reactions/R2",
+      "user": { "name": "users/1002" },
+      "emoji": { "customEmoji": { "name": "customEmojis/PARTY1", "uid": "PARTY1", "emojiName": ":party:" } }
+    },
+    {
+      "name": "spaces/AAAA/messages/M1/reactions",
+      "user": { "name": "users/1003" },
+      "emoji": { "unicode": "🎉" }
+    },
+    {
+      "name": "spaces/AAAA/messages/M1/reactions/R4",
+      "emoji": { "unicode": "🎉" }
+    },
+    {
+      "name": "spaces/AAAA/messages/M1/reactions/R5",
+      "user": { "name": "users/1005" }
+    },
+    {
+      "name": "spaces/AAAA/messages/M1/reactions/R6",
+      "user": { "name": "users/1006" },
+      "emoji": { "customEmoji": { "name": "bad" } }
+    },
+    {
+      "name": "spaces/AAAA/messages/M1/reactions/R7",
+      "user": 5,
+      "emoji": { "unicode": "🎉" }
+    }
+  ],
+  "nextPageToken": "react-next"
+}

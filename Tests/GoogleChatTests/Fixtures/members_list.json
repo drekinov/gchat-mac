@@ -1,0 +1,19 @@
+{
+  "memberships": [
+    {
+      "name": "spaces/AAAA/members/U1",
+      "state": "JOINED",
+      "role": "ROLE_MANAGER",
+      "member": { "name": "users/1", "displayName": "Alice", "type": "HUMAN" }
+    },
+    {
+      "name": "spaces/AAAA/members/U2",
+      "state": "SOMETHING_NEW",
+      "role": "ROLE_FUTURE",
+      "member": { "name": "users/2", "type": "BOT" }
+    },
+    { "name": "spaces/AAAA/members/G1", "state": "JOINED", "groupMember": { "name": "groups/1" } },
+    { "name": "spaces/AAAA/members", "member": { "name": "users/3" } },
+    { "name": "spaces/AAAA/members/U4", "member": { "name": "bad" } }
+  ]
+}

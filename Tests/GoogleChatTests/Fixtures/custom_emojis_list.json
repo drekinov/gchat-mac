@@ -1,0 +1,10 @@
+{
+  "customEmojis": [
+    { "name": "customEmojis/PARTY1", "uid": "PARTY1", "emojiName": ":party:",
+      "temporaryImageUri": "https://lh3.googleusercontent.test/emoji.png" },
+    { "name": "customEmojis/INSECURE", "emojiName": ":insecure:", "temporaryImageUri": "http://example.com/e.png" },
+    { "name": "customEmojis/NOSHORT" },
+    { "name": "emoji/oops", "emojiName": ":oops:" }
+  ],
+  "nextPageToken": ""
+}

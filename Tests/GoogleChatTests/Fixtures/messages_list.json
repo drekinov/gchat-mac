@@ -1,0 +1,35 @@
+{
+  "messages": [
+    {
+      "name": "spaces/AAAA/messages/GOOD1",
+      "sender": { "name": "users/1001", "type": "BOT" },
+      "createTime": "2026-10-14T12:00:00Z",
+      "text": "first"
+    },
+    { "name": "spaces/AAAA/messages", "createTime": "2026-10-14T12:00:01Z", "text": "bad name" },
+    { "name": "spaces/AAAA/messages/..", "createTime": "2026-10-14T12:00:02Z", "text": "dotdot" },
+    { "name": "spaces/AAAA/messages/NOTIME", "text": "no createTime" },
+    { "name": "spaces/AAAA/messages/BADTIME", "createTime": "yesterday", "text": "bad createTime" },
+    { "name": "spaces/AAAA/messages/WRONGTYPE", "createTime": "2026-10-14T12:00:03Z", "text": 5 },
+    {
+      "name": "spaces/AAAA/messages/NOSENDER",
+      "createTime": "2026-10-14T12:00:04Z",
+      "text": "no sender",
+      "fallbackText": "ignored without cards",
+      "cardsV2": []
+    },
+    {
+      "name": "spaces/AAAA/messages/CARD",
+      "createTime": "2026-10-14T12:00:05Z",
+      "fallbackText": "Card text",
+      "cardsV2": [{ "cardId": "x", "card": {} }]
+    },
+    {
+      "name": "spaces/AAAA/messages/TOMB",
+      "createTime": "2026-10-14T12:00:06Z",
+      "deleteTime": "2026-10-14T12:30:00Z",
+      "deletionMetadata": { "deletionType": "SPACE_OWNER" }
+    }
+  ],
+  "nextPageToken": "msgs-next"
+}

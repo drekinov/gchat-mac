@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 404,
+    "message": "CANARY-7f3a Requested entity was not found.",
+    "status": "NOT_FOUND"
+  }
+}

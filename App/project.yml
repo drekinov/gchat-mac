@@ -1,0 +1,54 @@
+name: gchat-mac
+options:
+  deploymentTarget:
+    macOS: "27.0"
+  createIntermediateGroups: true
+packages:
+  Core:
+    path: ..
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+targets:
+  gchat-mac:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    dependencies:
+      - package: Core
+        product: ChatSync
+      - package: Core
+        product: ChatAuth
+      - package: Core
+        product: ChatKeychain
+      - package: Core
+        product: ChatModel
+      - package: Core
+        product: ChatText
+      - package: Core
+        product: Diagnostics
+      - package: Core
+        product: FakeChatServer
+      - package: Core
+        product: GoogleChat
+      - package: Core
+        product: ChatStore
+      - package: Core
+        product: ChatNet
+    settings:
+      base:
+        INFOPLIST_FILE: Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.drekinov.gchat-mac
+        PRODUCT_NAME: gchat-mac
+        MARKETING_VERSION: 0.1.0
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "6.0"
+        OTHER_SWIFT_FLAGS: "-enable-upcoming-feature ExistentialAny -enable-upcoming-feature NonisolatedNonsendingByDefault -enable-upcoming-feature InferIsolatedConformances"
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_ENTITLEMENTS: gchat-mac.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        ENABLE_DEBUG_DYLIB: NO

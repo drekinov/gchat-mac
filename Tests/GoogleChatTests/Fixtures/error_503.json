@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 503,
+    "message": "CANARY-7f3a The service is currently unavailable.",
+    "status": "UNAVAILABLE"
+  }
+}
