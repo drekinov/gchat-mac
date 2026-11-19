@@ -65,6 +65,8 @@ final class AppModel {
     private(set) var attachmentErrors: [ComposerID: String] = [:]
     /// Text and web links dropped on a conversation, waiting for that composer to type them in.
     private(set) var droppedText: [ComposerID: [String]] = [:]
+    /// Bumped on every queued drop, so a second identical drop still reaches the composer.
+    private(set) var droppedTextRevision = 0
     @ObservationIgnored var activeComposer: ComposerID?
     private(set) var openWindowRequest = 0
     var showsNewMessage = false
@@ -742,15 +744,20 @@ final class AppModel {
         }
         // Not for an account that's gone or going: its composer won't be there to take them.
         let textQueued = !texts.isEmpty && sessions[id.key.account] != nil && removingAccount != id.key.account
-        if textQueued { droppedText[id, default: []] += texts }
+        if textQueued {
+            droppedText[id, default: []] += texts
+            droppedTextRevision &+= 1
+        }
         let attachable = canAttach(to: id)
         attach(candidates, to: id, problems: problems)
         return (attachable && !(candidates.isEmpty && problems.isEmpty)) || textQueued
     }
 
-    /// The text and links dropped on this composer, handed over once.
+    /// The text and links dropped on this composer, handed over once, and only while it is on screen: a composer
+    /// on its way out leaves them for the next time it shows.
     func takeDroppedText(_ id: ComposerID) -> [String] {
-        droppedText.removeValue(forKey: id) ?? []
+        guard selection == id.key, id.thread == nil || openThread == id.thread else { return [] }
+        return droppedText.removeValue(forKey: id) ?? []
     }
 
     static let attachmentLimitProblem = "A message can have up to \(maxAttachmentsPerMessage) attachments."

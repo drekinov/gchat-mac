@@ -1,3 +1,4 @@
+import AppKit
 import ChatModel
 import ChatSync
 import CoreTransferable
@@ -7,8 +8,8 @@ import UniformTypeIdentifiers
 /// One dropped item. Some drags are file promises: the screenshot and screen-recording thumbnails (and apps like
 /// Photos) promise the image or movie, and a Safari bookmark promises a `.webloc`. Only the promised content type is
 /// importable then, so importing a `URL` fails and the drop is discarded without ever reaching the app. Promised
-/// images and movies therefore arrive as copies and link files as the link they hold; files that already exist on
-/// disk, and everything else, arrive as a URL, as before.
+/// images, movies and documents therefore arrive as copies and link files as the link they hold; files that already
+/// exist on disk arrive as a URL, as before.
 enum DroppedFile: Transferable {
     /// What the drag pointed at; not necessarily a file.
     case link(URL)
@@ -30,6 +31,26 @@ enum DroppedFile: Transferable {
         FileRepresentation(importedContentType: .internetShortcut) { linkFile($0.file) }
         ProxyRepresentation(importing: { (url: URL) in DroppedFile.link(url) })
         ProxyRepresentation(importing: { (text: String) in DroppedFile.text(text) })
+        DataRepresentation(importedContentType: .rtf) { try await richText($0) }
+        // Promised documents (a Mail attachment); after text so text drags never become files. Composite content
+        // (PDF, Office, iWork) rather than `.content`, which also takes HTML.
+        FileRepresentation(importedContentType: .compositeContent, shouldAttemptToOpenInPlace: true) {
+            try received($0)
+        }
+        FileRepresentation(importedContentType: .audio, shouldAttemptToOpenInPlace: true) { try received($0) }
+        FileRepresentation(importedContentType: .archive, shouldAttemptToOpenInPlace: true) { try received($0) }
+    }
+
+    struct EmptyText: Error {}
+
+    /// Styled text offered without a plain-text form, typed in as plain text.
+    static func richText(_ rtf: Data) async throws -> DroppedFile {
+        guard let text = await plainText(fromRTF: rtf), !text.isEmpty else { throw EmptyText() }
+        return .text(text)
+    }
+
+    @concurrent private static func plainText(fromRTF rtf: Data) async -> String? {
+        NSAttributedString(rtf: rtf, documentAttributes: nil)?.string
     }
 
     /// The web link in a `.webloc` (a property list) or `.url` (`URL=` line) file. A link file can't name a file

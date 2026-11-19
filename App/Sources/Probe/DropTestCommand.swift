@@ -4,6 +4,7 @@
     import ChatSync
     import ObjectiveC
     import SwiftUI
+    import UniformTypeIdentifiers
 
     /// `--drop-test`: drives drag-and-drop into the main and thread composers of the sample world without a mouse.
     /// For each payload and drop spot it builds the pasteboard a real drag carries, asks AppKit's own window routing
@@ -82,6 +83,9 @@
             }
             await checkStagedCopyRemoval(textView: editors[0], id: composers[0].2, model: model, window: window)
             checkLinkFiles()
+            await checkRepresentations()
+            await reportFileWithText(textView: editors[0], id: composers[0].2, model: model, window: window)
+            await checkDroppedTextQueue(current: entry.id, model: model, window: window)
             print("DROPTEST \(failures == 0 ? "ALL \(ran) PASSED" : "\(failures) OF \(ran) FAILED")")
             try? FileManager.default.removeItem(at: scratch)
             return failures == 0 ? 0 : 1
@@ -242,6 +246,153 @@
             )
         }
 
+        /// Which `DroppedFile` each kind of dragged item becomes. This checks the representation order, not a real
+        /// promise delivery.
+        private func checkRepresentations() async {
+            func data(_ type: String, _ bytes: Data) -> NSItemProvider {
+                let provider = NSItemProvider()
+                provider.registerDataRepresentation(forTypeIdentifier: type, visibility: .all) { done in
+                    done(bytes, nil)
+                    return nil
+                }
+                return provider
+            }
+            let rtf = Data("{\\rtf1\\ansi Test}".utf8)
+            let png = scratch.appending(path: "Shot.png")
+            try? NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2, bitsPerSample: 8, samplesPerPixel: 4,
+                hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)?
+                .representation(using: .png, properties: [:])?.write(to: png)
+            let webloc = scratch.appending(path: "Link.webloc")
+            try? PropertyListSerialization.data(
+                fromPropertyList: ["URL": "https://example.com/a"], format: .xml, options: 0
+            ).write(to: webloc)
+
+            let cases: [(String, NSItemProvider, (DroppedFile?) -> Bool)] = [
+                ("pdfData", data(UTType.pdf.identifier, Data("%PDF-1.4\n%%EOF\n".utf8)), { $0.isCopy }),
+                ("zipData", data(UTType.zip.identifier, Data("PK\u{5}\u{6}".utf8) + Data(count: 18)), { $0.isCopy }),
+                ("privateData", data("com.example.drop-test.private", Data([1, 2, 3])), { $0 == nil }),
+                ("htmlOnly", data(UTType.html.identifier, Data("<b>Test</b>".utf8)), { $0 == nil }),
+                ("plainText", NSItemProvider(object: "Test" as NSString), { $0.text == "Test" }),
+                ("rtfOnly", data(UTType.rtf.identifier, rtf), { $0.text == "Test" }),
+                ("emptyRTF", data(UTType.rtf.identifier, Data("{\\rtf1 }".utf8)), { $0 == nil }),
+                ("malformedRTF", data(UTType.rtf.identifier, Data("not rtf".utf8)), { $0 == nil || $0.text != nil }),
+                ("pngFile", NSItemProvider(contentsOf: png) ?? NSItemProvider(), { $0 != nil && $0.text == nil }),
+                (
+                    "weblocFile", NSItemProvider(contentsOf: webloc) ?? NSItemProvider(),
+                    {
+                        $0.link == URL(string: "https://example.com/a")
+                    }
+                ),
+            ]
+            for (name, provider, expect) in cases {
+                ran += 1
+                let result = await Self.load(provider)
+                let ok = expect(result)
+                if !ok { failures += 1 }
+                print("DROPTEST \(ok ? "PASS" : "FAIL") representation \(name): \(Self.describe(result))")
+                if case .copy(let copy) = result { AttachmentStaging.discard(copy) }
+            }
+
+            let textFile = scratch.appending(path: "Notes.txt")
+            try? Data("Notes".utf8).write(to: textFile)
+            let promise = NSItemProvider()
+            promise.registerFileRepresentation(
+                forTypeIdentifier: UTType.plainText.identifier, fileOptions: [], visibility: .all
+            ) { done in
+                done(textFile, false, nil)
+                return nil
+            }
+            let promised = await Self.load(promise)
+            print("DROPTEST INFO promised text file becomes \(Self.describe(promised))")
+            if case .copy(let copy) = promised { AttachmentStaging.discard(copy) }
+        }
+
+        /// A Finder file that also offers its name as text, dropped on the text view. Reported, not counted: whether
+        /// it attaches depends on which view AppKit picks.
+        private func reportFileWithText(textView: NSTextView, id: ComposerID, model: AppModel, window: NSWindow) async {
+            textView.string = ""
+            textView.didChangeText()
+            for attachment in model.attachments(for: id) { model.removeAttachment(attachment.id, from: id) }
+            let file = scratch.appending(path: "Named.pdf")
+            try? Data("%PDF-1.4\n%%EOF\n".utf8).write(to: file)
+            let pasteboard = NSPasteboard(name: NSPasteboard.Name("drop-test-\(UUID().uuidString)"))
+            defer { pasteboard.releaseGlobally() }
+            pasteboard.clearContents()
+            pasteboard.writeObjects([file as NSURL])
+            pasteboard.addTypes([.string], owner: nil)
+            pasteboard.setString("Named.pdf", forType: .string)
+            let frame = textView.convert(textView.bounds, to: nil)
+            let drag = MockDrag(pasteboard: pasteboard, location: NSPoint(x: frame.midX, y: frame.midY), window: window)
+            let target = Self.windowDragTarget(window, drag)
+            if let destination: any NSDraggingDestination = target {
+                _ = destination.draggingEntered?(drag)
+                _ = destination.draggingUpdated?(drag)
+                _ = destination.performDragOperation?(drag)
+            }
+            await Self.pump(.milliseconds(1200))
+            let chips = model.attachments(for: id).count
+            print(
+                "DROPTEST KNOWN fileWithText@textCentre: target=\(target.map { "\(type(of: $0))" } ?? "none") "
+                    + "chips=\(chips) text=\(textView.string.isEmpty ? "empty" : "\"\(textView.string)\"")")
+            for attachment in model.attachments(for: id) { model.removeAttachment(attachment.id, from: id) }
+            textView.string = ""
+            textView.didChangeText()
+        }
+
+        /// Text dropped for a composer that isn't on screen waits for it, and is delivered once when it shows; a
+        /// second identical drop is typed in again.
+        private func checkDroppedTextQueue(current: SpaceKey, model: AppModel, window: NSWindow) async {
+            ran += 1
+            guard let other = model.inbox.first(where: { $0.id != current })?.id else {
+                failures += 1
+                print("DROPTEST FAIL droppedTextQueue: no second space")
+                return
+            }
+            let hidden = ComposerID(key: other, thread: nil)
+            _ = model.addDroppedFiles([.text("Queued")], to: hidden)
+            await Self.pump(.milliseconds(500))
+            let waited = model.droppedText[hidden] == ["Queued"]
+
+            model.select(other)
+            await Self.pump(.seconds(2))
+            let editor = Self.textViews(in: window).filter(\.isEditable).min {
+                $0.convert($0.bounds, to: nil).minX < $1.convert($1.bounds, to: nil).minX
+            }
+            let delivered = model.droppedText[hidden] == nil && editor?.string.contains("Queued") == true
+
+            editor?.string = ""
+            editor?.didChangeText()
+            await Self.pump(.milliseconds(300))
+            for _ in 0..<2 {
+                _ = model.addDroppedFiles([.text("Twice")], to: hidden)
+                await Self.pump(.milliseconds(500))
+            }
+            let twice = editor?.string.components(separatedBy: "Twice").count == 3
+            let ok = waited && delivered && twice
+            if !ok { failures += 1 }
+            print(
+                "DROPTEST \(ok ? "PASS" : "FAIL") droppedTextQueue: waited=\(waited) deliveredOnShow=\(delivered) "
+                    + "identicalTwice=\(twice)")
+        }
+
+        private static func load(_ provider: NSItemProvider) async -> DroppedFile? {
+            await withCheckedContinuation { continuation in
+                _ = provider.loadTransferable(type: DroppedFile.self) { continuation.resume(returning: try? $0.get()) }
+            }
+        }
+
+        private static func describe(_ drop: DroppedFile?) -> String {
+            switch drop {
+            case nil: "refused"
+            case .link(let url): "link(\(url.isFileURL ? url.lastPathComponent : url.absoluteString))"
+            case .text(let text): "text(\"\(text.prefix(40))\")"
+            case .copy(let url): "copy(\(url.lastPathComponent))"
+            case .tooLarge(let name): "tooLarge(\(name))"
+            case .unusable(let name): "unusable(\(name))"
+            }
+        }
+
         /// AppKit's window routing: the view a real drag with this info would be delivered to.
         private static func windowDragTarget(_ window: NSWindow, _ drag: any NSDraggingInfo) -> NSView? {
             let selector = NSSelectorFromString("_findDragTargetFrom:")
@@ -280,6 +431,12 @@
             }
             return !model.inbox.isEmpty
         }
+    }
+
+    extension Optional where Wrapped == DroppedFile {
+        fileprivate var isCopy: Bool { if case .copy = self { true } else { false } }
+        fileprivate var text: String? { if case .text(let text) = self { text } else { nil } }
+        fileprivate var link: URL? { if case .link(let url) = self { url } else { nil } }
     }
 
     /// The parts of `NSDraggingInfo` that drag destinations read.
