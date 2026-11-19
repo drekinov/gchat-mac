@@ -163,8 +163,8 @@ struct IsolationRig: Sendable {
         let work = await sessionA.work
         let giveUp = ContinuousClock.now + .seconds(10)
         while ContinuousClock.now < giveUp {
-            if let until = await sessionA.backoffUntil, until > clockA.now(), await aPolledTheClock(), work.count == 1,
-                await sessionA.backoffUntil == until
+            if let until = await sessionA.retryUntil, until > clockA.now(), await aPolledTheClock(), work.count == 1,
+                await sessionA.retryUntil == until
             {
                 return until
             }
