@@ -107,6 +107,8 @@ public actor EventChannel {
     var foreign: Set<EventSubscriptionName> = []
     var verifyRetry: [EventSubscriptionName: (attempts: Int, at: Timestamp)] = [:]
     var failures = 0
+    /// Failed record or ack passes; only a delivery batch handled in full resets it, not an empty pull.
+    var processFailures = 0
     var pullDegraded: EventChannelStatus.Reason?
     var healthFailures = 0
     var healthDegraded: EventChannelStatus.Reason?
@@ -149,8 +151,11 @@ public actor EventChannel {
         cycle &+= 1
         parked = false
         failures = 0
+        processFailures = 0
         pullDegraded = nil
         nextHealth = nil
+        lastPull = nil
+        lastHealthy = nil
         guard settings.enabled, let path = settings.path else {
             phase = .off
             return await publishStatus()
@@ -220,10 +225,14 @@ public actor EventChannel {
         loadStored()
         while isCurrent(cycle, generation) {
             await publishStatus()
-            guard let session, !(await session.channelBlocked) else {
+            guard let session else { return }
+            let blocked = await session.channelBlocked
+            guard isCurrent(cycle, generation) else { return }
+            guard !blocked else {
                 parked = true
                 return await publishStatus()
             }
+            var pulled = false
             do {
                 if topic == nil || nextHealth.map({ $0 <= clock.now() }) ?? true {
                     let usable = try await repair(path, cycle, generation)
@@ -238,11 +247,13 @@ public actor EventChannel {
                 let received = try await services.pubsub.pull(path, maxMessages: Self.pullBatch)
                 guard isCurrent(cycle, generation) else { return }
                 let held = clock.now().interval(since: started)
-                lastPull = clock.now()
+                pulled = true
                 failures = 0
-                pullDegraded = nil
                 try await process(received, path, cycle, generation)
                 guard isCurrent(cycle, generation) else { return }
+                if !received.isEmpty { processFailures = 0 }
+                lastPull = clock.now()
+                if processFailures < Self.degradedAfter { pullDegraded = nil }
                 await publishStatus()
                 if !received.isEmpty {
                     try? await clock.sleep(for: Self.busyFloor)
@@ -255,10 +266,11 @@ public actor EventChannel {
                     parked = true
                     return await publishStatus()
                 }
-                failures += 1
-                if failures >= Self.degradedAfter { pullDegraded = Self.reason(for: error) }
+                if pulled { processFailures += 1 } else { failures += 1 }
+                let streak = max(failures, processFailures)
+                if streak >= Self.degradedAfter { pullDegraded = Self.reason(for: error) }
                 await publishStatus()
-                try? await clock.sleep(for: Self.backoff(failures))
+                try? await clock.sleep(for: Self.backoff(streak))
             }
         }
     }
@@ -313,6 +325,7 @@ public actor EventChannel {
         do throws(ChatAPIError) {
             found = try await services.pubsub.getSubscription(path)
         } catch {
+            guard isCurrent(cycle, generation) else { return false }
             switch error {
             case .permissionDenied, .notFound, .invalidArgument, .decoding, .failedPrecondition:
                 phase = .setupIncomplete
@@ -332,11 +345,14 @@ public actor EventChannel {
         phase = .running
         do {
             try await checkSubscription(found.topic, cycle, generation)
-        } catch is OtherTopic {
-            phase = .otherTopic
-            nextHealth = clock.now().adding(Self.healthInterval)
-            return false
-        } catch let error as ChatAPIError {
+        } catch {
+            guard isCurrent(cycle, generation) else { return false }
+            guard !(error is OtherTopic) else {
+                phase = .otherTopic
+                nextHealth = clock.now().adding(Self.healthInterval)
+                return false
+            }
+            guard let error = error as? ChatAPIError else { throw error }
             if error == .unauthorized || error == .noCredentials { throw error }
             healthFailures += 1
             if healthFailures >= Self.degradedAfter { healthDegraded = Self.reason(for: error) }
@@ -356,11 +372,15 @@ public actor EventChannel {
             }
             guard isCurrent(cycle, generation) else { return }
             if let found = current {
-                if matches(found, topic: topic) { remember(found, generation) } else { current = nil }
+                if matches(found, topic: topic), !hasLapsed(found) {
+                    remember(found, generation)
+                } else {
+                    current = nil
+                }
             }
         }
         if current == nil || current?.state == .deleted {
-            current = try await create(topic, generation)
+            current = try await create(topic, cycle, generation)
             guard isCurrent(cycle, generation) else { return }
         }
         guard var found = current else { return }
@@ -373,6 +393,7 @@ public actor EventChannel {
                     reactivateAttempts = 0
                     nextReactivate = nil
                 } catch {
+                    guard isCurrent(cycle, generation) else { return }
                     if error == .unauthorized || error == .noCredentials { throw error }
                     let delays = Self.reactivateDelays
                     nextReactivate = clock.now().adding(delays[min(reactivateAttempts, delays.count - 1)])
@@ -400,14 +421,21 @@ public actor EventChannel {
         }
     }
 
+    /// A subscription past its confirmed expiry is gone even while the server still reports it active.
+    func hasLapsed(_ found: EventSubscription) -> Bool {
+        found.state == .active && found.expireTime.map { $0 <= clock.now() } ?? false
+    }
+
     /// Creates the shared subscription, or adopts the equivalent one another Mac created.
-    func create(_ topic: PubSubTopicPath, _ generation: Generation) async throws -> EventSubscription {
+    func create(
+        _ topic: PubSubTopicPath, _ cycle: UInt64, _ generation: Generation
+    ) async throws -> EventSubscription {
+        let created: EventSubscription
         do throws(ChatAPIError) {
-            let created = try await services.events.createSubscription(topic: topic)
-            remember(created, generation)
-            return created
+            created = try await services.events.createSubscription(topic: topic)
         } catch  where error.isAlreadyExists {
             let listed = try await services.events.listSubscriptions(filter: .chat)
+            guard isCurrent(cycle, generation) else { throw CancellationError() }
             if let match = listed.first(where: { matches($0, topic: topic) && $0.state != .deleted }) {
                 remember(match, generation)
                 return match
@@ -421,6 +449,9 @@ public actor EventChannel {
             }
             throw error
         }
+        guard isCurrent(cycle, generation) else { throw CancellationError() }
+        remember(created, generation)
+        return created
     }
 
     // MARK: Deliveries
@@ -444,7 +475,7 @@ public actor EventChannel {
                 if let known = verdicts[source] {
                     verdict = known
                 } else {
-                    verdict = await verify(source, generation)
+                    verdict = await verify(source, cycle, generation)
                     verdicts[source] = verdict
                     guard isCurrent(cycle, generation) else { return }
                 }
@@ -472,7 +503,10 @@ public actor EventChannel {
             }
             if record.isEmpty { acks.append(event.ackID) } else { deliveries.append((event.ackID, record)) }
         }
-        if askForPoll { await session.requestSidebarTick() }
+        if askForPoll {
+            await session.requestSidebarTick()
+            guard isCurrent(cycle, generation) else { return }
+        }
         var hasMessages = false
         if !deliveries.isEmpty {
             let recorded = try await session.recordEvents(deliveries.flatMap(\.events))
@@ -488,64 +522,64 @@ public actor EventChannel {
                     hasMessages = true
                 }
             }
+            if hasMessages { await session.requestOwedSync() }
         }
-        var ackError: (any Error)?
-        if !acks.isEmpty {
-            do { try await services.pubsub.acknowledge(path, ackIDs: acks) } catch { ackError = error }
+        if !acks.isEmpty { try await services.pubsub.acknowledge(path, ackIDs: acks) }
+        for event in lifecycle {
+            guard isCurrent(cycle, generation) else { return }
+            await handleLifecycle(event, cycle, generation)
         }
-        if hasMessages { await session.requestOwedSync() }
-        if let ackError { throw ackError }
-        guard isCurrent(cycle, generation) else { return }
-        for event in lifecycle { await handleLifecycle(event, cycle, generation) }
     }
 
-    /// Checks an unfamiliar publisher before anything from it is acked. Transient failures back off per source.
-    func verify(_ source: EventSubscriptionName, _ generation: Generation) async -> Verdict {
+    /// Checks an unfamiliar publisher before anything from it is acked. Only a successful read that proves a
+    /// mismatch acks; every failure is inconclusive and backs off per source.
+    func verify(_ source: EventSubscriptionName, _ cycle: UInt64, _ generation: Generation) async -> Verdict {
         if foreign.contains(source) { return .mismatch }
         guard let topic else { return .inconclusive(fresh: false) }
         let now = clock.now()
         if let retry = verifyRetry[source], retry.at > now { return .inconclusive(fresh: false) }
+        let found: EventSubscription
         do throws(ChatAPIError) {
-            let found = try await services.events.getSubscription(source)
-            verifyRetry[source] = nil
-            guard matches(found, topic: topic) else {
-                foreign.insert(source)
-                return .mismatch
-            }
-            if gate.isCurrent(generation) { remember(found, generation) }
-            return .match
+            found = try await services.events.getSubscription(source)
         } catch {
-            switch error {
-            case .notFound, .permissionDenied, .invalidArgument:
-                verifyRetry[source] = nil
-                foreign.insert(source)
-                return .mismatch
-            default:
-                let attempts = (verifyRetry[source]?.attempts ?? 0) + 1
-                let delays = Self.verifyDelays
-                verifyRetry[source] = (attempts, now.adding(delays[min(attempts - 1, delays.count - 1)]))
-                return .inconclusive(fresh: true)
-            }
+            guard isCurrent(cycle, generation) else { return .inconclusive(fresh: false) }
+            let attempts = (verifyRetry[source]?.attempts ?? 0) + 1
+            let delays = Self.verifyDelays
+            verifyRetry[source] = (attempts, now.adding(delays[min(attempts - 1, delays.count - 1)]))
+            return .inconclusive(fresh: true)
         }
+        guard isCurrent(cycle, generation) else { return .inconclusive(fresh: false) }
+        verifyRetry[source] = nil
+        guard matches(found, topic: topic) else {
+            foreign.insert(source)
+            return .mismatch
+        }
+        remember(found, generation)
+        return .match
     }
 
+    /// Applies a lifecycle event only while its publisher is still the current one.
     func handleLifecycle(_ event: ChatEvent, _ cycle: UInt64, _ generation: Generation) async {
         switch event {
         case .expirationReminder(let name, _):
+            guard name == subscription else { return }
             do {
                 let renewed = try await services.events.renewSubscription(name)
-                guard isCurrent(cycle, generation) else { return }
+                guard isCurrent(cycle, generation), name == subscription else { return }
                 remember(renewed, generation)
                 lastHealthy = clock.now()
             } catch {
+                guard isCurrent(cycle, generation), name == subscription else { return }
                 nextHealth = clock.now()
             }
-        case .suspended:
+        case .suspended(let name):
+            guard name == subscription else { return }
             nextReactivate = nil
             lastHealthy = nil
             nextHealth = clock.now()
-        case .expired:
-            if let old = subscription { accepted.insert(old) }
+        case .expired(let name):
+            guard name == subscription else { return }
+            accepted.insert(name)
             subscription = nil
             lastHealthy = nil
             nextHealth = clock.now()

@@ -84,6 +84,7 @@ struct HoldingPubSub: PubSubAPI {
     let clock: any SyncClock
     let hold: Duration
     let pulls: CallLog
+    let ackBarrier: Barrier
 
     func getSubscription(_ path: PubSubSubscriptionPath) async throws(ChatAPIError) -> PubSubSubscription {
         try await base.getSubscription(path)
@@ -100,15 +101,26 @@ struct HoldingPubSub: PubSubAPI {
     }
 
     func acknowledge(_ path: PubSubSubscriptionPath, ackIDs: [String]) async throws(ChatAPIError) {
+        await ackBarrier.pass()
         try await base.acknowledge(path, ackIDs: ackIDs)
     }
 }
 
-/// Lets a test answer create with ALREADY_EXISTS, or park it until released.
+/// A Workspace subscription `get` answers with instead of asking the server.
+final class StaleGets: Sendable {
+    private let value = Mutex<EventSubscription?>(nil)
+
+    func set(_ subscription: EventSubscription?) { value.withLock { $0 = subscription } }
+    func answer(_ name: EventSubscriptionName) -> EventSubscription? { value.withLock { $0?.name == name ? $0 : nil } }
+}
+
+/// Lets a test answer create with ALREADY_EXISTS, park create or get until released, or script a get.
 struct ScriptedEvents: WorkspaceEventsAPI {
     let base: any WorkspaceEventsAPI
     let conflictOnCreate: Bool
     let createBarrier: Barrier
+    let getBarrier: Barrier
+    let staleGets: StaleGets
 
     func createSubscription(topic: PubSubTopicPath) async throws(ChatAPIError) -> EventSubscription {
         await createBarrier.pass()
@@ -119,7 +131,10 @@ struct ScriptedEvents: WorkspaceEventsAPI {
     }
 
     func getSubscription(_ name: EventSubscriptionName) async throws(ChatAPIError) -> EventSubscription {
-        try await base.getSubscription(name)
+        var found = staleGets.answer(name)
+        if found == nil { found = try await base.getSubscription(name) }
+        await getBarrier.pass()
+        return found!
     }
 
     func listSubscriptions(filter: EventSubscriptionFilter) async throws(ChatAPIError) -> [EventSubscription] {
@@ -231,6 +246,9 @@ struct Mac: Sendable {
     let poster = RecordingPoster()
     let pulls = CallLog()
     let createBarrier = Barrier()
+    let getBarrier = Barrier()
+    let ackBarrier = Barrier()
+    let staleGets = StaleGets()
     let session: AccountSession
     let recorder: SnapshotRecorder
 
@@ -249,8 +267,11 @@ struct Mac: Sendable {
         timing.logoutDrain = .seconds(2)
         let client = world.client()
         let services = EventServices(
-            events: ScriptedEvents(base: client, conflictOnCreate: conflictOnCreate, createBarrier: createBarrier),
-            pubsub: HoldingPubSub(base: client, clock: world.clock, hold: hold, pulls: pulls), hasScope: hasScope)
+            events: ScriptedEvents(
+                base: client, conflictOnCreate: conflictOnCreate, createBarrier: createBarrier, getBarrier: getBarrier,
+                staleGets: staleGets),
+            pubsub: HoldingPubSub(base: client, clock: world.clock, hold: hold, pulls: pulls, ackBarrier: ackBarrier),
+            hasScope: hasScope)
         session = AccountSession(
             account: AccountID(), me: world.alice.user.name,
             api: GoogleChatClient(
@@ -401,16 +422,73 @@ extension EventWorld {
         await world.shutdown(mac)
     }
 
-    @Test func aForeignSourceIsAckedWithoutRecording() async throws {
+    @Test func aSourceProvenForeignIsAckedWithoutRecording() async throws {
         let world = EventWorld()
         let mac = Mac(world)
         #expect(await mac.startLive())
+        let ours = world.workspaceSubscription?.name
+        let elsewhere = PubSubTopicPath("projects/example-project/topics/gchat-events-9")!
+        let other = try await world.client().createSubscription(topic: elsewhere)
         let message = world.server.post("not ours", in: world.space, from: .account(world.bob))
-        world.publish([message.name], source: "subscriptions/someone-else")
+        world.publish([message.name], source: other.name.rawValue)
         #expect(await world.run(step: .milliseconds(20)) { mac.unacked == 0 })
         #expect(try mac.store.owed(world.space) == nil)
-        #expect(world.requests("GET", "/v1/subscriptions/someone-else") == 1)
-        #expect(mac.storedSubscription == world.workspaceSubscription?.name)
+        #expect(world.requests("GET", other.name.rawValue) == 1)
+        #expect(mac.storedSubscription == ours)
+        await world.shutdown(mac)
+    }
+
+    @Test func anUnreadableSourceIsNeverAckedOrCachedAsForeign() async throws {
+        let world = EventWorld()
+        let mac = Mac(world)
+        #expect(await mac.startLive())
+        let listings = world.requests("GET", "/v1/spaces")
+        let message = world.server.post("whose?", in: world.space, from: .account(world.bob))
+        world.publish([message.name], source: "subscriptions/someone-else")
+        #expect(await world.run(step: .milliseconds(20)) { world.requests("GET", "/v1/spaces") > listings })
+        await world.pass(.seconds(20))
+        #expect(mac.unacked == 1, "a 404 doesn't prove the publisher is foreign")
+        #expect(await mac.channel.foreign.isEmpty)
+        await world.shutdown(mac)
+    }
+
+    @Test func aForbiddenVerificationIsRetriedAndTheReplacementAdopted() async throws {
+        let world = EventWorld()
+        let mac = Mac(world)
+        #expect(await mac.startLive())
+        let old = try #require(world.workspaceSubscription?.name)
+        world.server.removeEventSubscription(old)
+        let replacement = try await world.client().createSubscription(topic: EventWorld.topic)
+        world.server.fail(.permissionDenied(route: .getEventSubscription, times: 1))
+
+        let message = world.post("from the new publisher")
+        #expect(await world.run(step: .milliseconds(20)) { world.requests("GET", replacement.name.rawValue) == 1 })
+        #expect(mac.unacked == 1)
+        #expect(await world.run { mac.unacked == 0 && mac.hasMessage(message) })
+        #expect(mac.storedSubscription == replacement.name.rawValue)
+        await world.shutdown(mac)
+    }
+
+    @Test func aVerificationSupersededByAPathChangeChangesNothing() async throws {
+        let world = EventWorld()
+        let mac = Mac(world)
+        #expect(await mac.startLive())
+        let old = try #require(world.workspaceSubscription?.name)
+        world.server.removeEventSubscription(old)
+        _ = try await world.client().createSubscription(topic: EventWorld.topic)
+        mac.getBarrier.arm()
+        world.post("verify me")
+        #expect(await world.run(step: .milliseconds(20)) { mac.getBarrier.arrivals == 1 })
+
+        let elsewhere = EventWorld.path("elsewhere").rawValue
+        await mac.session.configureEvents(EventSettings(subscriptionPath: elsewhere))
+        #expect(await world.run { mac.status == .setupIncomplete })
+        mac.getBarrier.release()
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(mac.storedSubscription == old)
+        #expect(await mac.channel.subscription?.rawValue == old)
+        #expect(await mac.channel.accepted.isEmpty)
+        #expect(mac.status == .setupIncomplete)
         await world.shutdown(mac)
     }
 
@@ -444,6 +522,81 @@ extension EventWorld {
         #expect(mac.storedSubscription == old)
 
         #expect(await world.run { mac.unacked == 0 && mac.hasMessage(message) })
+        #expect(mac.storedSubscription == replacement.name.rawValue)
+        await world.shutdown(mac)
+    }
+
+    @Test func repeatedAckFailuresDegradeTheChannel() async throws {
+        let world = EventWorld()
+        let mac = Mac(world)
+        #expect(await mac.startLive())
+        world.server.fail(.unavailable(route: .acknowledge, times: nil))
+        world.post("never acked")
+        #expect(await world.run(upTo: .seconds(300)) { if case .degraded = mac.status { true } else { false } })
+        #expect(!(await mac.session.liveChannel))
+        await world.shutdown(mac)
+    }
+
+    @Test func theOwedSyncStartsBeforeTheAckReturns() async throws {
+        let world = EventWorld()
+        let mac = Mac(world)
+        #expect(await mac.startLive())
+        mac.ackBarrier.arm()
+        let message = world.post("fetch me first")
+        #expect(await world.run(step: .milliseconds(20)) { mac.ackBarrier.arrivals == 1 })
+        #expect(await world.run(upTo: .seconds(20)) { mac.hasMessage(message) })
+        mac.ackBarrier.release()
+        #expect(await world.run { mac.unacked == 0 })
+        await world.shutdown(mac)
+    }
+
+    @Test func aRestartIsNotLiveUntilTheNewRunValidates() async throws {
+        let world = EventWorld()
+        let mac = Mac(world)
+        #expect(await mac.startLive())
+        world.server.fail(.unavailable(route: .getPullSubscription, times: nil))
+        await mac.channel.restart()
+        #expect(mac.status != .live)
+        await world.pass(.seconds(5))
+        #expect(mac.status != .live)
+        #expect(!(await mac.session.liveChannel))
+        await world.shutdown(mac)
+    }
+
+    @Test func aSubscriptionPastItsExpiryIsRecreatedEvenWhileReportedActive() async throws {
+        let world = EventWorld()
+        let mac = Mac(world)
+        #expect(await mac.startLive())
+        let old = try #require(world.workspaceSubscription?.name)
+        let oldName = try #require(EventSubscriptionName(old))
+        var lapsed = try await world.client().getSubscription(oldName)
+        lapsed.expireTime = world.server.now.adding(.zero - .seconds(1))
+        mac.staleGets.set(lapsed)
+        world.server.removeEventSubscription(old)
+        let patches = world.requests("PATCH", old)
+
+        await mac.channel.restart()
+        #expect(await world.run { mac.storedSubscription.map { $0 != old } ?? false })
+        #expect(mac.storedSubscription == world.workspaceSubscription?.name)
+        #expect(world.requests("PATCH", old) == patches)
+        await world.shutdown(mac)
+    }
+
+    @Test func aLifecycleEventFromTheReplacedPublisherLeavesTheReplacementAlone() async throws {
+        let world = EventWorld()
+        let mac = Mac(world)
+        #expect(await mac.startLive())
+        let old = try #require(world.workspaceSubscription?.name)
+        world.server.removeEventSubscription(old)
+        let replacement = try await world.client().createSubscription(topic: EventWorld.topic)
+        let creates = world.requests("POST", "/v1/subscriptions")
+
+        world.server.publishLifecycle(.expired, topic: EventWorld.topic.rawValue, subscription: old)
+        let message = world.post("from the new publisher")
+        #expect(await world.run { mac.hasMessage(message) && mac.unacked == 0 })
+        await world.pass(.seconds(5))
+        #expect(world.requests("POST", "/v1/subscriptions") == creates)
+        #expect(await mac.channel.subscription == replacement.name)
         #expect(mac.storedSubscription == replacement.name.rawValue)
         await world.shutdown(mac)
     }
