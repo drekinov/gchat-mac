@@ -1,0 +1,6 @@
+{
+  "name": "projects/example-project/subscriptions/events-1-mac",
+  "topic": "projects/example-project/topics/events-1",
+  "ackDeadlineSeconds": 10,
+  "messageRetentionDuration": "600s"
+}

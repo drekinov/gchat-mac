@@ -89,6 +89,20 @@ public enum ChatAPIError: Error, Sendable, Equatable {
         return .seconds(min(seconds, 3600))
     }
 
+    /// A create that found an equivalent resource already in place.
+    public var isAlreadyExists: Bool {
+        if case .conflict(let info) = self { return info.status == nil || info.status == "ALREADY_EXISTS" }
+        return false
+    }
+
+    /// A long-running operation that was still running when polling stopped. The write may yet complete.
+    public var isOperationPending: Bool {
+        if case .server(let info) = self { return info.status == Self.operationPendingStatus }
+        return false
+    }
+
+    static let operationPendingStatus = "OPERATION_PENDING"
+
     /// Worth retrying with backoff (reads, and writes that carry a `requestId`).
     public var isRetryable: Bool {
         switch self {

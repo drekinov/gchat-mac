@@ -6,7 +6,7 @@ import Synchronization
 /// An in-process fake of the Chat REST API. Requests reach it through `FakeChatURLProtocol`, which finds the
 /// server from the bearer token.
 public final class FakeChatServer: Sendable {
-    private let state: Mutex<State>
+    let state: Mutex<State>
 
     public static let defaultMaxUploadBytes = 200 * 1024 * 1024
 
@@ -24,7 +24,9 @@ public final class FakeChatServer: Sendable {
 
     public func makeTransport() -> AuthTransport {
         AuthTransport(
-            allowedHosts: ["chat.googleapis.com", Endpoint.directoryHost], protocolClasses: [Self.protocolClass])
+            allowedHosts: [
+                "chat.googleapis.com", Endpoint.directoryHost, Endpoint.workspaceEventsHost, Endpoint.pubSubHost,
+            ], protocolClasses: [Self.protocolClass])
     }
 
     // MARK: Accounts

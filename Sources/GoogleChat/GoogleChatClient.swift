@@ -30,14 +30,14 @@ public struct GoogleChatClient: Sendable {
 
     /// Sends with the bearer token, refreshing once on 401, and decodes `Response` from a 2xx body.
     func send<Response: Decodable>(
-        _ method: HTTPMethod, _ url: URL, as _: Response.Type = Response.self
+        _ method: HTTPMethod, _ url: URL, timeout: Duration? = nil, as _: Response.Type = Response.self
     ) async throws(ChatAPIError) -> Response {
-        let response = try await authorized(method, url, body: nil)
+        let response = try await authorized(method, url, body: nil, timeout: timeout)
         return try Self.decode(Response.self, from: response.body)
     }
 
     func send<Body: Encodable, Response: Decodable>(
-        _ method: HTTPMethod, _ url: URL, body: Body, as _: Response.Type = Response.self
+        _ method: HTTPMethod, _ url: URL, body: Body, timeout: Duration? = nil, as _: Response.Type = Response.self
     ) async throws(ChatAPIError) -> Response {
         let encoded: Data
         do {
@@ -45,11 +45,13 @@ public struct GoogleChatClient: Sendable {
         } catch {
             throw .decoding(path: "request")
         }
-        let response = try await authorized(method, url, body: encoded)
+        let response = try await authorized(method, url, body: encoded, timeout: timeout)
         return try Self.decode(Response.self, from: response.body)
     }
 
-    func authorized(_ method: HTTPMethod, _ url: URL, body: Data?) async throws(ChatAPIError) -> HTTPResponse {
+    func authorized(
+        _ method: HTTPMethod, _ url: URL, body: Data?, timeout: Duration? = nil
+    ) async throws(ChatAPIError) -> HTTPResponse {
         var refreshed = false
         while true {
             let token = try await tokens.accessToken()
@@ -57,7 +59,9 @@ public struct GoogleChatClient: Sendable {
             if body != nil { headers["Content-Type"] = "application/json; charset=utf-8" }
             let response: HTTPResponse
             do {
-                response = try await transport.send(HTTPRequest(method: method, url: url, headers: headers, body: body))
+                var request = HTTPRequest(method: method, url: url, headers: headers, body: body)
+                if let timeout { request.timeout = timeout }
+                response = try await transport.send(request)
             } catch .redirected(let status, _) {
                 throw .transport(.redirected(status: status, location: nil))
             } catch {

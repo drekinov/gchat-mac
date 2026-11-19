@@ -99,6 +99,7 @@ struct State: Sendable {
     var emails: [UserName: String] = [:]
     var knownUsers: [UserName: User] = [:]
     var directoryEnabled = true
+    var events = EventsState()
 
     init(start: Timestamp) {
         now = start

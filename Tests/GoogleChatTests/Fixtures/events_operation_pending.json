@@ -1,0 +1,6 @@
+{
+  "name": "operations/op-1",
+  "metadata": {
+    "@type": "type.googleapis.com/google.apps.events.subscriptions.v1.CreateSubscriptionMetadata"
+  }
+}
