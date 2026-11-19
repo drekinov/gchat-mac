@@ -71,7 +71,8 @@ final class NotificationCenterPoster: NotificationPoster {
     @discardableResult
     static func requestAuthorization() async -> Bool {
         let granted =
-            (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])) ?? false
+            (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]))
+            ?? false
         UserDefaults.standard.set(granted, forKey: enabledKey)
         return granted
     }
