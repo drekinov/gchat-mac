@@ -6,8 +6,9 @@ import UniformTypeIdentifiers
 
 /// One dropped item. Some drags are file promises: the screenshot and screen-recording thumbnails (and apps like
 /// Photos) promise the image or movie, and a Safari bookmark promises a `.webloc`. Only the promised content type is
-/// importable then, so importing a `URL` fails and the drop is discarded without ever reaching the app. Images and
-/// movies therefore arrive as copies and link files as the link they hold; everything else is a URL, as before.
+/// importable then, so importing a `URL` fails and the drop is discarded without ever reaching the app. Promised
+/// images and movies therefore arrive as copies and link files as the link they hold; files that already exist on
+/// disk, and everything else, arrive as a URL, as before.
 enum DroppedFile: Transferable {
     /// What the drag pointed at; not necessarily a file.
     case link(URL)
@@ -22,9 +23,9 @@ enum DroppedFile: Transferable {
     case unusable(name: String)
 
     static var transferRepresentation: some TransferRepresentation {
-        // Listed first so a promise is fulfilled; an image file from Finder is copied the same way.
-        FileRepresentation(importedContentType: .image) { try received($0.file) }
-        FileRepresentation(importedContentType: .movie) { try received($0.file) }
+        // Listed first so a promise is fulfilled. Opened in place, a Finder file is bookmarked rather than copied.
+        FileRepresentation(importedContentType: .image, shouldAttemptToOpenInPlace: true) { try received($0) }
+        FileRepresentation(importedContentType: .movie, shouldAttemptToOpenInPlace: true) { try received($0) }
         FileRepresentation(importedContentType: .internetLocation) { linkFile($0.file) }
         FileRepresentation(importedContentType: .internetShortcut) { linkFile($0.file) }
         ProxyRepresentation(importing: { (url: URL) in DroppedFile.link(url) })
@@ -50,7 +51,9 @@ enum DroppedFile: Transferable {
     }
 
     /// Checks the limits before copying, so nothing is written for a file that can't attach.
-    static func received(_ file: URL) throws -> DroppedFile {
+    static func received(_ received: ReceivedTransferredFile) throws -> DroppedFile {
+        let file = received.file
+        if received.isOriginalFile { return .link(file) }
         let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
         guard values?.isRegularFile == true, let size = values?.fileSize else {
             return .unusable(name: file.lastPathComponent)
@@ -134,9 +137,16 @@ enum AttachmentStaging {
         if let scratch = scratchFolder(of: dropped) { try? FileManager.default.removeItem(at: scratch) }
     }
 
-    /// Nothing outlives the run that received it, so copies left by a quit or crash mid-drop go at launch.
-    static func clearDrops() {
-        try? FileManager.default.removeItem(at: dropsRoot)
+    /// Copies left by a quit or crash mid-drop go at launch. A drop is adopted or discarded within seconds, so an
+    /// hour-old folder is abandoned, while a second instance's drop in progress is left alone.
+    static func clearDrops(olderThan age: TimeInterval = 3600, now: Date = Date()) {
+        let fm = FileManager.default
+        guard let folders = try? fm.contentsOfDirectory(at: dropsRoot, includingPropertiesForKeys: [.creationDateKey])
+        else { return }
+        for folder in folders {
+            let created = (try? folder.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? now
+            if now.timeIntervalSince(created) > age { try? fm.removeItem(at: folder) }
+        }
     }
 
     /// The per-drop folder `receive(_:)` made for `dropped`; `nil` for any other path, which is never deleted.

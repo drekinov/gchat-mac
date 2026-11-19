@@ -143,7 +143,7 @@
             let drag = MockDrag(pasteboard: pasteboard, location: point, window: window)
             let target = Self.windowDragTarget(window, drag)
             var performed = false
-            if let destination = target as? NSDraggingDestination {
+            if let destination: any NSDraggingDestination = target {
                 let entered = destination.draggingEntered?(drag) ?? []
                 let updated = destination.draggingUpdated?(drag) ?? entered
                 if !updated.isEmpty, destination.prepareForDragOperation?(drag) ?? true {
@@ -164,7 +164,8 @@
                     + "text=\(text.isEmpty ? "empty" : "\"\(text.prefix(40))\"") chips=\(chips)")
         }
 
-        /// A dropped image is staged as a copy, and removing its chip deletes that copy.
+        /// A Finder image attaches without a copy and removing its chip leaves the original; a staged copy (what a
+        /// promised screenshot becomes) is deleted with its chip.
         private func checkStagedCopyRemoval(textView: NSTextView, id: ComposerID, model: AppModel, window: NSWindow)
             async
         {
@@ -182,7 +183,7 @@
             pasteboard.writeObjects([image as NSURL])
             let frame = textView.convert(textView.bounds, to: nil)
             let drag = MockDrag(pasteboard: pasteboard, location: NSPoint(x: frame.midX, y: frame.midY), window: window)
-            if let destination = Self.windowDragTarget(window, drag) as? NSDraggingDestination {
+            if let destination: any NSDraggingDestination = Self.windowDragTarget(window, drag) {
                 _ = destination.draggingEntered?(drag)
                 _ = destination.draggingUpdated?(drag)
                 _ = destination.performDragOperation?(drag)
@@ -193,15 +194,27 @@
                 print("DROPTEST FAIL stagedCopy: the image didn't attach")
                 return
             }
-            let staged = URL(fileURLWithPath: String(decoding: chip.bookmark, as: UTF8.self))
-            let wasStaged =
-                AttachmentStaging.contains(staged, for: id.key.account)
-                && FileManager.default.fileExists(atPath: staged.path)
+            let path = URL(fileURLWithPath: String(decoding: chip.bookmark, as: UTF8.self))
+            let notCopied = !AttachmentStaging.contains(path, for: id.key.account)
             model.removeAttachment(chip.id, from: id)
-            let gone = !FileManager.default.fileExists(atPath: staged.path)
-            let ok = wasStaged && gone
+            let originalKept = FileManager.default.fileExists(atPath: image.path)
+
+            let account = id.key.account
+            var wasStaged = false
+            var gone = false
+            if let staged = AttachmentStaging.stage(image, for: account) {
+                model.addFiles([staged], to: id)
+                if let stagedChip = model.attachments(for: id).first {
+                    wasStaged = String(decoding: stagedChip.bookmark, as: UTF8.self) == staged.path
+                    model.removeAttachment(stagedChip.id, from: id)
+                }
+                gone = !FileManager.default.fileExists(atPath: staged.path)
+            }
+            let ok = notCopied && originalKept && wasStaged && gone
             if !ok { failures += 1 }
-            print("DROPTEST \(ok ? "PASS" : "FAIL") stagedCopy: staged=\(wasStaged) deletedOnRemove=\(gone)")
+            print(
+                "DROPTEST \(ok ? "PASS" : "FAIL") stagedCopy: finderNotCopied=\(notCopied) "
+                    + "originalKept=\(originalKept) staged=\(wasStaged) deletedOnRemove=\(gone)")
         }
 
         /// Link files are read only when small, and only a web link comes out of one.
@@ -230,7 +243,7 @@
         }
 
         /// AppKit's window routing: the view a real drag with this info would be delivered to.
-        private static func windowDragTarget(_ window: NSWindow, _ drag: NSDraggingInfo) -> NSView? {
+        private static func windowDragTarget(_ window: NSWindow, _ drag: any NSDraggingInfo) -> NSView? {
             let selector = NSSelectorFromString("_findDragTargetFrom:")
             guard let method = class_getInstanceMethod(NSWindow.self, selector) else { return nil }
             typealias Find = @convention(c) (NSWindow, Selector, AnyObject) -> AnyObject?

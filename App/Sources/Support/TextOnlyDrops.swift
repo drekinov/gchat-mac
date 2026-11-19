@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 struct TextOnlyDrops: NSViewRepresentable {
     func makeNSView(context: Context) -> Finder { Finder() }
     func updateNSView(_ view: Finder, context: Context) { view.scheduleApply() }
+    static func dismantleNSView(_ view: Finder, coordinator: ()) { view.tearDown() }
 
     /// Locates the text view laid out under it; it never takes clicks or drags itself.
     final class Finder: NSView {
@@ -43,16 +44,25 @@ struct TextOnlyDrops: NSViewRepresentable {
         }
 
         /// Runs after the current update. The text view registers its drag types about half a second after it
-        /// appears, so a check that finds nothing to filter yet is repeated for a few seconds.
+        /// appears, so a check that finds nothing to filter yet is repeated for a few seconds. A check already
+        /// running sees the latest layout on its next attempt, so layout bursts share one.
         func scheduleApply() {
-            pending?.cancel()
+            guard pending == nil else { return }
             pending = Task { [weak self] in
+                defer { self?.pending = nil }
                 for attempt in 0..<50 {
                     if attempt > 0 { try? await Task.sleep(for: .milliseconds(100)) }
                     guard !Task.isCancelled, let self, window != nil else { return }
                     if apply() { return }
                 }
             }
+        }
+
+        func tearDown() {
+            pending?.cancel()
+            pending = nil
+            if let keyObserver { NotificationCenter.default.removeObserver(keyObserver) }
+            keyObserver = nil
         }
 
         /// `true` once the text view is found and takes only text drags.
