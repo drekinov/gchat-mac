@@ -23,7 +23,8 @@
     <key>LSMinimumSystemVersion</key>
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
     <key>NSHumanReadableCopyright</key>
-    <string>A native Mac app for Google Chat™.
+    <string>© 2026 Thimble contributors.
+A native Mac app for Google Chat™.
 Not affiliated with or endorsed by Google. Google Chat is a trademark of Google LLC.</string>
 </dict>
 </plist>
