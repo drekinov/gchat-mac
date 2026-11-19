@@ -9,6 +9,7 @@ struct GChatApp: App {
         let model = AppModel()
         _model = State(initialValue: model)
         responder = NotificationResponder.install(model: model)
+        AppAppearance.applyStored()
     }
 
     var body: some Scene {
