@@ -252,15 +252,16 @@ enum Bookkeeping {
                 record.nextTry = now.adding(OwedRecord.retryDelay(afterAttempts: record.attempts))
                 try putOwed(space, record)
             }
-        case .owedOmitted(let space):
-            guard var record = try owed(space) else { return true }
+        case .owedOmitted(let space, let revision):
+            guard var record = try owed(space), record.revision == revision else { return true }
             record.omitted += 1
             if !record.hasMessages, record.omitted >= OwedRecord.maxOmissions {
                 try drop(space)
             } else {
                 try putOwed(space, record)
             }
-        case .clearOwed(let space):
+        case .clearOwed(let space, let revision):
+            guard try owed(space)?.revision == revision else { return true }
             try putOwed(space, nil)
         case .bumpRelist:
             var record = try relist()
@@ -295,8 +296,9 @@ enum Bookkeeping {
         case .removeNotifyPending(let space, let messages, let overflow, let gap):
             var record = try notify(space)
             let removed = Set(messages.map(id(of:)))
+            let folded = removed.subtracting(record.ids).count
             record.ids.removeAll { removed.contains($0) }
-            record.overflow = max(0, record.overflow - overflow)
+            record.overflow = max(0, record.overflow - overflow - folded)
             if gap { record.gap = false }
             try putNotify(space, record)
         default:

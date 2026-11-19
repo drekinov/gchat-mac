@@ -147,7 +147,7 @@ public actor AccountManager {
                 let session = try await factory(record)
                 sessions[record.id] = session
                 await applyConnectivity(to: session)
-                await session.configureEvents(record.eventSettings)
+                await session.configureEvents(eventSettings(of: record))
                 await session.start()
                 restored.append(record.id)
             } catch {
@@ -176,7 +176,7 @@ public actor AccountManager {
         records.removeAll { $0.id == record.id }
         records.append(record)
         await applyConnectivity(to: session)
-        await session.configureEvents(record.eventSettings)
+        await session.configureEvents(eventSettings(of: record))
         await session.start()
         accounts.send(records)
         return session
@@ -200,7 +200,7 @@ public actor AccountManager {
         let session = try await factory(record)
         sessions[id] = session
         await applyConnectivity(to: session)
-        await session.configureEvents(record.eventSettings)
+        await session.configureEvents(eventSettings(of: record))
         await session.start()
         return session
     }
@@ -253,6 +253,11 @@ public actor AccountManager {
 
     public func systemDidWake() async {
         for session in sessions.values { await session.systemDidWake() }
+    }
+
+    /// The saved settings as they are now; Settings can change them while a session is being built.
+    private func eventSettings(of record: AccountRecord) -> EventSettings {
+        records.first { $0.id == record.id }?.eventSettings ?? record.eventSettings
     }
 
     /// Repeats until the value it applied is still the latest, since a path change can land during the await.

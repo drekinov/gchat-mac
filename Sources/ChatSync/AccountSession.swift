@@ -16,7 +16,8 @@ public struct SessionTiming: Sendable {
     /// Until the first full sync completes, so DMs show names right after sign-in.
     public var initialTitles = 40
     public var activeWindow: Duration = .seconds(30 * 86_400)
-    public var logoutDrain: Duration = .seconds(5)
+    /// The longest wait for ordinary work, and again for media exports, so logout fits in about 6 s.
+    public var logoutDrain: Duration = .seconds(2)
     /// The longest single sleep of the poll loop; it normally sleeps until its next deadline and is woken early.
     public var idleSleep: Duration = .seconds(600)
     /// Event polls after a delete, waiting out the poll's trailing window and any sync already running.
@@ -972,8 +973,9 @@ public actor AccountSession {
         }
     }
 
+    /// Only `resumeAfterLogin` leaves `.needsLogin`.
     func setStatus(_ new: AccountStatus, _ generation: Generation) {
-        status = new
+        if status != .needsLogin { status = new }
         if new == .needsLogin { admissionWasClosed = true }
         publish(generation)
     }
@@ -1035,7 +1037,7 @@ public actor AccountSession {
             AccountSnapshot(account: account, generation: retired, status: .closing, revision: revision + 1))
         let drained = await work.cancelAndDrain(timeout: timing.logoutDrain, clock: clock)
         await eventChannel?.shutdown()
-        await mediaLoader?.close()
+        await mediaLoader?.close(waitingUpTo: timing.logoutDrain)
         let failed = await logoutRunner.run(account)
         if let refreshToken, let revoker { await revoker.revoke(refreshToken) }
         gate.close()

@@ -2,8 +2,12 @@ import ChatModel
 import ChatNet
 import Foundation
 
+/// A project ID (`[a-z][a-z0-9-]{4,28}[a-z0-9]`) or a project number.
 private func isValidProjectID(_ id: Substring) -> Bool {
     let bytes = Array(id.utf8)
+    if (1...30).contains(bytes.count), bytes.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }) {
+        return true
+    }
     guard (6...30).contains(bytes.count), (UInt8(ascii: "a")...UInt8(ascii: "z")).contains(bytes[0]) else {
         return false
     }

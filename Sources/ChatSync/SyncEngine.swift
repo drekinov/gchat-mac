@@ -105,6 +105,7 @@ public struct SyncEngine: Sendable {
     public func syncSpaces(_ generation: Generation) async throws(SyncError) -> SpacesResult {
         try await exclusive("spaces") { () async throws(SyncError) -> SpacesResult in
             let relistVersion = try read { () throws(StoreError) in try store.relist().requested }
+            let owedBefore = try read { () throws(StoreError) in try store.owedRecords() }.mapValues(\.revision)
             var listed: [Space] = []
             var skipped = 0
             var token: String?
@@ -136,10 +137,7 @@ public struct SyncEngine: Sendable {
             let removed =
                 complete ? stored.filter { !$0.isHidden && !listedNames.contains($0.space.name) }.map(\.space.name) : []
             let omitted =
-                complete
-                ? try read { () throws(StoreError) in try store.owedRecords() }.keys.filter {
-                    !listedNames.contains($0) && !removed.contains($0)
-                }.sorted() : []
+                complete ? owedBefore.keys.filter { !listedNames.contains($0) && !removed.contains($0) }.sorted() : []
 
             var hiddenAnonymous: Set<SpaceName> = []
             for stored in stored where stored.isHidden {
@@ -157,9 +155,11 @@ public struct SyncEngine: Sendable {
                 for (name, time) in moved { batch.append(.mergeOwed(name, boundary: time, messages: [])) }
                 for name in removed {
                     batch.append(.setSpaceHidden(name, true))
-                    batch.append(.clearOwed(name))
+                    if let revision = owedBefore[name] { batch.append(.clearOwed(name, revision: revision)) }
                 }
-                for name in omitted { batch.append(.owedOmitted(name)) }
+                for name in omitted {
+                    if let revision = owedBefore[name] { batch.append(.owedOmitted(name, revision: revision)) }
+                }
                 batch.append(.resolveRelist(relistVersion))
             }
             let sorted = changed.sorted {
@@ -325,10 +325,7 @@ public struct SyncEngine: Sendable {
             {
                 staleMembers = (try read { () throws(StoreError) in try store.members(in: space) }, stored.memberTitle)
             }
-            // Catch-up already decided on messages before its checkpoint, including ones pruned since.
-            let caughtUp = try read { () throws(StoreError) in try store.checkpoint(space, .messages) }
-            let candidates = try notifyCandidates(
-                space, created.filter { message in caughtUp.map { message.createTime >= $0 } ?? true })
+            let candidates = try notifyCandidates(space, try undecided(created, in: space))
             try commit(generation) { batch in
                 if !candidates.isEmpty { batch.append(.addNotifyCandidates(space, candidates)) }
                 if let spaceUpdate { batch.append(.mergeSpace(spaceUpdate)) }
@@ -343,6 +340,24 @@ public struct SyncEngine: Sendable {
                 batch.append(.setCheckpoint(space, .events, end))
             }
         }
+    }
+
+    /// Catch-up already decided on messages before its checkpoint, including ones pruned since; a message there that
+    /// is newer than the oldest cached one was never fetched.
+    func undecided(_ created: [Message], in space: SpaceName) throws(SyncError) -> [Message] {
+        guard let caughtUp = try read({ () throws(StoreError) in try store.checkpoint(space, .messages) }) else {
+            return created
+        }
+        var behind: [Message] = []
+        for message in created where message.createTime < caughtUp {
+            if try read({ () throws(StoreError) in try store.message(message.name) }) == nil { behind.append(message) }
+        }
+        guard !behind.isEmpty else { return created.filter { $0.createTime >= caughtUp } }
+        let oldest = try read { () throws(StoreError) in
+            try store.messages(in: space, before: nil, limit: Self.keptMessagesPerSpace).first?.createTime
+        }
+        let late = behind.filter { message in oldest.map { $0 < message.createTime } ?? true }
+        return created.filter { $0.createTime >= caughtUp } + late
     }
 
     // MARK: Read state

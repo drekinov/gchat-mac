@@ -66,6 +66,15 @@ struct ConnectivityRig: Sendable {
     }
 }
 
+func pollAsync(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(2))
+    }
+    return await condition()
+}
+
 final class AdmissionSwitch: Sendable {
     private let open = Mutex(true)
 
@@ -266,6 +275,64 @@ struct ConnectivityTests {
         _ = await session.logout(refreshToken: nil)
     }
 
+    @Test func aSendFailingDuringTheCatchUpLetsTheCatchUpRerunOnceAdmissionReopens() async throws {
+        var timing = SessionTiming.fast
+        timing.sidebarInterval = .seconds(600)
+        timing.inactiveSidebarInterval = .seconds(600)
+        timing.idleSleep = .seconds(600)
+        let rig = ConnectivityRig(timing: timing)
+        #expect(await rig.startAndSync())
+        let restarts = Recorder<Int>()
+        await rig.session.setEventChannelRestart { restarts.append(1) }
+        await rig.session.setConnectivity(.unreachable)
+        let generation = try #require(rig.session.gate.current)
+        _ = try await rig.session.sends.enqueue(text: "queued offline", space: rig.space, thread: nil, generation)
+        rig.server.fail(.networkError(.notConnectedToInternet, route: .createMessage))
+
+        let lists = rig.calls.count("listSpaces")
+        await rig.session.setConnectivity(.reachable)
+        #expect(await poll { rig.calls.count("createMessage") == 1 })
+        #expect(await pollAsync { await rig.session.offlineUntil != nil })
+        #expect(await rig.session.catchUpPending)
+        #expect(restarts.all.isEmpty)
+
+        rig.server.advance(.seconds(30))
+        await rig.session.wake()
+        #expect(await poll { rig.calls.count("listSpaces") >= lists + 2 }, "the catch-up waited for the next interval")
+        #expect(await pollAsync { await rig.session.catchUpPending == false })
+        #expect(await poll { restarts.all.count == 1 })
+        #expect(await poll { rig.server.messages(in: rig.space).contains { $0.text == "queued offline" } })
+        await rig.shutdown()
+    }
+
+    @Test(arguments: [true, false])
+    func aLoginRequirementSurvivesTransportErrorsInEitherOrder(_ authFirst: Bool) async throws {
+        let rig = ConnectivityRig()
+        #expect(await rig.startAndSync())
+        let generation = try #require(rig.session.gate.current)
+        let epoch = await rig.session.connectivityEpoch
+        let offline = SyncError.api(.transport(.offline), .listSpaces)
+        let unauthorized = SyncError.api(.unauthorized, .listSpaces)
+        let limited = SyncError.api(.rateLimited(retryAfter: .seconds(1)), .listSpaces)
+        for error in authFirst ? [unauthorized, offline, limited] : [offline, limited, unauthorized] {
+            await rig.session.handle(error, generation, epoch: epoch)
+        }
+        await rig.session.setConnectivity(.unreachable)
+        await rig.session.setConnectivity(.reachable)
+        rig.server.advance(.seconds(600))
+
+        #expect(await rig.session.status == .needsLogin)
+        #expect(await rig.session.admitted == false)
+        let lists = rig.calls.count("listSpaces")
+        try await rig.settle()
+        #expect(rig.calls.count("listSpaces") == lists, "a cleared deadline reopened admission while signed out")
+
+        await rig.session.resumeAfterLogin()
+        #expect(await rig.session.admitted)
+        #expect(await poll { rig.calls.count("listSpaces") > lists })
+        await rig.shutdown()
+    }
+
     @Test func theBackgroundCadenceIsFasterUnlessTheEventChannelIsLive() {
         let timing = SessionTiming()
         #expect(timing.sidebarInterval(appActive: true, liveChannel: false) == .seconds(60))
@@ -291,6 +358,24 @@ struct ConnectivityTests {
         await rig.session.setLiveChannel(true)
         await rig.session.setAppActive(false)
         #expect(await rig.session.nextSidebar == next, "a slower live cadence never pushes a due tick out")
+        await rig.shutdown()
+    }
+
+    @Test func losingTheLiveChannelPullsTheNextSidebarTickIn() async throws {
+        var timing = SessionTiming.fast
+        timing.sidebarInterval = .seconds(600)
+        timing.inactiveSidebarInterval = .seconds(30)
+        timing.liveSidebarInterval = .seconds(120)
+        let rig = ConnectivityRig(timing: timing)
+        #expect(await rig.startAndSync())
+        let start = rig.server.now
+        _ = await rig.nextSidebar()
+        await rig.session.setLiveChannel(true)
+        await rig.session.setAppActive(false)
+        #expect(try #require(await rig.session.nextSidebar).offset(from: start) > .seconds(60))
+
+        await rig.session.setLiveChannel(false)
+        #expect(try #require(await rig.session.nextSidebar).offset(from: start) <= .seconds(30))
         await rig.shutdown()
     }
 }
@@ -351,6 +436,28 @@ struct SendAdmissionTests {
 
         _ = try await rig.drain()
         #expect(rig.serverTexts() == ["offline"])
+    }
+
+    @Test func admissionClosingAfterACreateLeavesTheItemCommittedForALaterDrain() async throws {
+        let rig = SendRig()
+        rig.tamper.setDropCreatedMessage(true)
+        let item = try rig.enqueue("landed")
+        let checks = Recorder<Int>()
+
+        let outcomes = try #require(
+            try await rig.sends.drain(rig.team, rig.generation) {
+                checks.append(1)
+                return checks.all.count <= 2
+            })
+
+        let name = try #require(rig.server.messages(in: rig.team).first?.name)
+        #expect(outcomes[item.id] == .sent(name))
+        #expect(rig.calls.count("getMessage") == 0, "hydration ran with admission closed")
+        #expect(try rig.outbox().first?.state == .committed(name))
+
+        _ = try await rig.drain()
+        #expect(try rig.outbox().isEmpty)
+        #expect(try rig.store.message(name)?.text == "landed")
     }
 
     @Test func logoutClosesAdmission() async throws {

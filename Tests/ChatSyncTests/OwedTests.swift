@@ -173,6 +173,24 @@ struct OwedTests {
         #expect(try rig.owed(rig.team) == nil)
     }
 
+    @Test func anEventRecordedDuringAStaleListingKeepsItsIDs() async throws {
+        let rig = try SyncRig()
+        try await rig.seed()
+        rig.server.removeMember(rig.alice, from: rig.team)
+        rig.barrier.arm()
+        let listing = Task { try await rig.syncSpaces() }
+        #expect(await rig.barrier.waitForArrival())
+        let late = rig.fabricated(1, in: rig.team)
+        _ = try rig.record([.messagesCreated(space: rig.team, messages: late, time: rig.server.now)])
+        rig.barrier.release()
+        try await listing.value
+
+        #expect(try rig.store.space(rig.team)?.isHidden == true)
+        let kept = try #require(try rig.owed(rig.team), "the listing predates the event")
+        #expect(kept.messages(in: rig.team) == late)
+        #expect(kept.omitted == 0, "an omission seen before the event doesn't apply to it")
+    }
+
     @Test func anUnknownSpaceOmittedFromListingsIsDroppedOnlyWithoutIDs() async throws {
         let rig = try SyncRig()
         try await rig.seed()

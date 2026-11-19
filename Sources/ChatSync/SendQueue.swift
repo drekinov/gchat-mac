@@ -181,7 +181,7 @@ public final class SendQueue: Sendable {
             committed.nextAttempt = nil
             let durable = committed
             try commit(generation) { $0.append(.putOutbox(durable)) }
-            try await hydrate(durable, created.name, generation)
+            if await admit() { try await hydrate(durable, created.name, generation) }
         }
         return .sent(created.name)
     }

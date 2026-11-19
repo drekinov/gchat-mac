@@ -186,6 +186,14 @@ private func json(_ request: HTTPRequest) -> [String: Any] {
         #expect(PubSubSubscriptionPath("projects/example-project/subscriptions/a.b~c+d%e_f-g") != nil)
     }
 
+    @Test func projectNumbersAreAccepted() {
+        #expect(PubSubSubscriptionPath("projects/123456789012/subscriptions/events-1-mac") != nil)
+        #expect(PubSubTopicPath("projects/123456789012/topics/events-1") != nil)
+        for bad in ["projects/12-34/topics/events-1", "projects/" + String(repeating: "1", count: 31) + "/topics/t1"] {
+            #expect(PubSubTopicPath(bad) == nil, "\(bad)")
+        }
+    }
+
     @Test func getReadsTopic() async throws {
         let transport = StubTransport([jsonResponse("pubsub_subscription")])
         let sub = try await eventsClient(transport).getSubscription(pullPath)

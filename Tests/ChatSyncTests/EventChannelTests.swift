@@ -975,3 +975,50 @@ struct EventSettingsTests {
         #expect(held.payload.attachments.last?.uploadToken == nil)
     }
 }
+
+struct EventSettingsReplacementTests {
+    @Test func turningLiveNotificationsOffDuringAReconnectReachesTheReplacementSession() async throws {
+        let server = FakeChatServer()
+        let alice = server.addAccount(displayName: "Alice")
+        let scratch = ScratchDirectory()
+        let tombstones = LogoutTombstones(root: scratch.url)
+        let runner = LogoutRunner(eraser: NoopEraser(), tombstones: tombstones)
+        let hold = Mutex<UncancellableWait?>(nil)
+        let built = Recorder<Int>()
+        let manager = AccountManager(
+            registry: AccountRegistry(secrets: InMemorySecretStore()), recovery: LogoutRecovery(runner: runner),
+            tombstones: tombstones
+        ) { record in
+            built.append(1)
+            if let wait = hold.withLock({ $0 }) { await wait.wait() }
+            let client = WorkspaceEventsClient(
+                transport: server.makeTransport(), tokens: StaticTokens(token: alice.token), sleeper: { _ in })
+            let session = AccountSession(
+                account: record.id, me: record.me,
+                api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: alice.token)),
+                store: InMemoryAccountStore(), clock: RealSleepClock(server: server), logoutRunner: runner,
+                timing: .fast, events: EventServices(events: client, pubsub: client, hasScope: false))
+            await session.setPaused(true)
+            return session
+        }
+        let on = EventSettings(subscriptionPath: EventWorld.path("mac-a").rawValue, enabled: true)
+        var record = AccountRecord(email: "alice@example.com", displayName: "Alice", me: alice.user.name)
+        record.events = on
+        let first = try await manager.add(record)
+        #expect(await first.eventChannel?.settings == on)
+
+        let wait = UncancellableWait()
+        hold.withLock { $0 = wait }
+        let id = record.id
+        let reconnect = Task { try await manager.reconnect(id) {} }
+        #expect(await poll { built.all.count == 2 })
+        var off = on
+        off.enabled = false
+        try await manager.setEventSettings(id, off)
+        wait.release()
+        let replacement = try await reconnect.value
+
+        #expect(await replacement.eventChannel?.settings == off, "the replacement started with stale settings")
+        _ = await replacement.logout(refreshToken: nil)
+    }
+}

@@ -33,9 +33,16 @@ extension AccountSession {
         requestCatchUp()
     }
 
-    /// True while the event channel delivers new messages, which slows the inactive sidebar cadence.
+    /// True while the event channel delivers new messages, which slows the inactive sidebar cadence; losing it
+    /// brings a tick scheduled at the slow cadence forward.
     public func setLiveChannel(_ live: Bool) {
         liveChannel = live
+        guard !live, !appActive, let next = nextSidebar else { return }
+        let due = clock.now().adding(timing.sidebarInterval(appActive: false, liveChannel: false))
+        if due < next {
+            nextSidebar = due
+            wake()
+        }
     }
 
     /// Called once a catch-up has polled the sidebar and drained the outboxes.
@@ -62,6 +69,7 @@ extension AccountSession {
     /// Reruns the work turned away while admission was closed: parked drains, pending retries and read marks.
     func reopenAdmission(_ generation: Generation) {
         admissionWasClosed = false
+        if catchUpPending { nextSidebar = nil }
         let spaces = blockedDrains.union(retryScheduled)
         blockedDrains = []
         for space in spaces {

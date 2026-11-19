@@ -56,8 +56,25 @@ extension Fixture {
         let f = try Fixture(backend)
         try f.commit(.mergeOwed(a, boundary: stamp(20), messages: []))
         let first = try #require(try f.store.owed(a)).revision
-        try f.commit(.clearOwed(a), .mergeOwed(a, boundary: stamp(20), messages: []))
+        try f.commit(.clearOwed(a, revision: first), .mergeOwed(a, boundary: stamp(20), messages: []))
         #expect(try #require(try f.store.owed(a)).revision != first)
+    }
+
+    @Test(arguments: Backend.allCases)
+    func aListingClearsOrCountsOnlyTheRevisionItSaw(_ backend: Backend) throws {
+        let f = try Fixture(backend)
+        let b = spaceName("B")
+        try f.commit(
+            .mergeOwed(a, boundary: stamp(20), messages: []),
+            .mergeOwed(b, boundary: stamp(20), messages: [messageName("B", "m")]))
+        let seenA = try #require(try f.store.owed(a)).revision
+        let seenB = try #require(try f.store.owed(b)).revision
+        try f.commit(
+            .mergeOwed(a, boundary: stamp(30), messages: [messageName("A", "n")]),
+            .mergeOwed(b, boundary: stamp(30), messages: []))
+        try f.commit(.clearOwed(a, revision: seenA), .owedOmitted(b, revision: seenB))
+        #expect(try f.store.owed(a)?.ids == ["n"])
+        #expect(try f.store.owed(b)?.omitted == 0)
     }
 
     @Test(arguments: Backend.allCases)
@@ -136,7 +153,12 @@ extension Fixture {
         try f.commit(
             .mergeOwed(a, boundary: stamp(20), messages: []),
             .mergeOwed(b, boundary: stamp(20), messages: [messageName("B", "m")]))
-        for _ in 0..<OwedRecord.maxOmissions { try f.commit(.owedOmitted(a), .owedOmitted(b)) }
+        let (revisionA, revisionB) = (
+            try #require(try f.store.owed(a)).revision, try #require(try f.store.owed(b)).revision
+        )
+        for _ in 0..<OwedRecord.maxOmissions {
+            try f.commit(.owedOmitted(a, revision: revisionA), .owedOmitted(b, revision: revisionB))
+        }
         #expect(try f.store.owed(a) == nil)
         #expect(try f.store.owed(b)?.omitted == 3)
         #expect(try f.store.owedRecords().keys.sorted() == [b])
@@ -181,6 +203,17 @@ extension Fixture {
         try f.commit(.removeNotifyPending(a, messages: [messageName("A", "after")], overflow: 0, gap: false))
         #expect(try f.store.notifyRecords().isEmpty)
         #expect(try f.store.metas(prefix: NotifyRecord.keyPrefix).isEmpty)
+    }
+
+    @Test(arguments: Backend.allCases)
+    func settledIDsFoldedIntoTheOverflowMeanwhileLeaveIt(_ backend: Backend) throws {
+        let f = try Fixture(backend)
+        let posted = ["p1", "p2"].map { messageName("A", $0) }
+        try f.commit(.addNotifyCandidates(a, posted))
+        try f.commit(.addNotifyCandidates(a, (0..<19).map { messageName("A", "n\($0)") }))
+        #expect(try f.store.notifyRecords()[a] == NotifyRecord(ids: [], overflow: 21))
+        try f.commit(.removeNotifyPending(a, messages: posted, overflow: 0, gap: false))
+        #expect(try f.store.notifyRecords()[a] == NotifyRecord(ids: [], overflow: 19))
     }
 
     @Test(arguments: Backend.allCases)

@@ -70,15 +70,17 @@ public struct StoreWrite: Sendable {
         /// A failed attempt at `revision`: backs off, or drops a row without IDs after `OwedRecord.maxAttempts`.
         case deferOwed(SpaceName, revision: UInt64, at: Timestamp)
         /// A complete listing omitted the space; a row without IDs goes after `OwedRecord.maxOmissions`.
-        case owedOmitted(SpaceName)
-        case clearOwed(SpaceName)
+        /// Like `clearOwed`, it skips a row whose revision is no longer the one the listing started with.
+        case owedOmitted(SpaceName, revision: UInt64)
+        case clearOwed(SpaceName, revision: UInt64)
         case bumpRelist
         /// Resolves relist requests up to `version`, the requested version seen when the listing started.
         case resolveRelist(UInt64)
         /// Must precede the batch's message writes: IDs already stored or notified are skipped.
         case addNotifyCandidates(SpaceName, [MessageName])
         case flagNotifyGap(SpaceName)
-        /// Removes posted or suppressed IDs, subtracts `overflow` and, if `gap`, clears the gap flag.
+        /// Removes posted or suppressed IDs, from the overflow for those folded into it since; subtracts `overflow`
+        /// and, if `gap`, clears the gap flag.
         case removeNotifyPending(SpaceName, messages: [MessageName], overflow: Int, gap: Bool)
     }
 

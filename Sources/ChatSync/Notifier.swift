@@ -51,6 +51,7 @@ struct NotifyPass: Sendable, Equatable {
 /// Posts the durable pending records the sync commits write. An ID leaves its record only once its post was accepted
 /// or suppressed, so a failure or a restart retries it.
 final class Notifier: Sendable {
+    /// Accepted or suppressed posts per pass; retryable failures don't count.
     static let maxPerPass = 10
     /// More live pending messages than this in one space post as a summary.
     static let maxSinglesPerSpace = 5
@@ -137,7 +138,9 @@ final class Notifier: Sendable {
         var settled = Settled()
         let lookup: StoredSpace?
         do { lookup = try store.space(space) } catch { return nil }
-        guard let stored = lookup, !stored.isHidden, !(context.appIsActive && context.focusedSpace == space) else {
+        guard let stored = lookup, !stored.isHidden, !(context.appIsActive && context.focusedSpace == space),
+            stored.notificationSetting?.isMuted != true, NotificationPolicy.effectiveLevel(for: stored) != .off
+        else {
             return Settled(messages: all, overflow: record.overflow, gap: record.gap)
         }
         var live: [Message] = []
@@ -160,10 +163,9 @@ final class Notifier: Sendable {
         let count = record.overflow + folded.count
         if count > 0 || record.gap {
             guard gate.isCurrent(generation), !Task.isCancelled else { return settled }
-            let outcome = await poster.post(summary(stored, count: count))
-            posts += 1
-            switch outcome {
+            switch await poster.post(summary(stored, count: count)) {
             case .accepted, .suppressed:
+                posts += 1
                 settled.messages += folded
                 settled.overflow = record.overflow
                 settled.gap = record.gap
@@ -177,13 +179,13 @@ final class Notifier: Sendable {
                 pass.more = true
                 break
             }
-            let outcome = await poster.post(single(message, in: stored))
-            posts += 1
-            switch outcome {
+            switch await poster.post(single(message, in: stored)) {
             case .accepted:
+                posts += 1
                 settled.messages.append(message.name)
                 settled.notified.append(message.name)
             case .suppressed:
+                posts += 1
                 settled.messages.append(message.name)
             case .retryable:
                 pass.retry = true
