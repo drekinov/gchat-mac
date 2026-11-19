@@ -50,6 +50,7 @@ final class FakeWorld: Sendable {
     struct Entry: Sendable {
         let info: AccountInfo
         let session: AccountSession
+        let events: EventSettings
     }
 
     struct Target: Sendable {
@@ -64,6 +65,9 @@ final class FakeWorld: Sendable {
     /// Org whose server answers media downloads with a redirect to an unauthenticated host.
     static let redirectOrgIndex = 1
     static let mediaHosts: Set<String> = ["media.fake.example", "fake-emoji.example"]
+    /// Every fake org has its own server, so one topic and pull subscription name serve them all.
+    static let eventTopic = "projects/example-project/topics/gchat-events-1"
+    static let eventSubscription = "projects/example-project/subscriptions/gchat-events-1-this-mac"
 
     let servers: [FakeChatServer]
     let entries: [Entry]
@@ -103,7 +107,7 @@ final class FakeWorld: Sendable {
     static func build(
         accounts count: Int, traffic: Bool, trafficRange: ClosedRange<Double>? = nil,
         notifications: (any NotificationPoster)? = nil,
-        timing: SessionTiming = FakeWorld.timing()
+        timing: SessionTiming = FakeWorld.timing(), liveEvents: Bool = true
     ) async -> FakeWorld {
         _ = cleanup
         let realNow = Timestamp(Date())
@@ -142,6 +146,13 @@ final class FakeWorld: Sendable {
         var entries: [Entry] = []
         for (account, info, server) in accounts {
             let client = GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: account.token))
+            var services: EventServices?
+            if liveEvents {
+                server.addPullSubscription(eventSubscription, topic: eventTopic)
+                let events = WorkspaceEventsClient(
+                    transport: server.makeTransport(), tokens: StaticTokens(token: account.token))
+                services = EventServices(events: events, pubsub: events, hasScope: true)
+            }
             let gate = SessionGate()
             let directory = AccountDirectory(root: root, account: info.id)
             let key = StoreKey.random(for: info.id)
@@ -159,9 +170,11 @@ final class FakeWorld: Sendable {
                 account: info.id, me: account.user.name, api: client, store: store, clock: SystemClock(),
                 logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: tombstones), directory: client,
                 gate: gate, timing: timing, notifications: notifications, media: client, files: FakeModeFileAccess(),
-                mediaLoader: loader)
+                mediaLoader: loader, events: services)
+            let events = EventSettings(subscriptionPath: liveEvents ? eventSubscription : nil)
+            await session.configureEvents(events)
             await session.start()
-            entries.append(Entry(info: info, session: session))
+            entries.append(Entry(info: info, session: session, events: events))
         }
 
         let clocked = servers
@@ -209,6 +222,12 @@ final class FakeWorld: Sendable {
         let pool = target.isBot ? FakeScript.botLines : FakeScript.chatter
         let text = pool.randomElement(using: &random) ?? "ok"
         let thread = Double.random(in: 0...1, using: &random) < 0.4 ? target.roots.randomElement(using: &random) : nil
-        target.server.post(text, in: target.space, from: target.isBot ? .bot(sender) : .user(sender), thread: thread)
+        let message = target.server.post(
+            text, in: target.space, from: target.isBot ? .bot(sender) : .user(sender), thread: thread)
+        guard let publisher = target.server.eventSubscriptions.first(where: { $0.pubsubTopic == eventTopic }) else {
+            return
+        }
+        target.server.publishMessagesCreated(
+            topic: eventTopic, subscription: publisher.name, space: target.space, messages: [message.name])
     }
 }

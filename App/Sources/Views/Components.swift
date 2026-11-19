@@ -195,6 +195,27 @@ enum TimeFormat {
     }
 }
 
+extension EventChannelStatus {
+    var label: String {
+        switch self {
+        case .off: "Off"
+        case .needsAccess: "Access not granted"
+        case .starting: "Polling"
+        case .live: "Live"
+        case .setupIncomplete: "Setup incomplete"
+        case .otherTopic: "Another topic"
+        case .degraded(let reason):
+            switch reason {
+            case .network: "Degraded (network)"
+            case .rateLimited: "Degraded (rate limited)"
+            case .server: "Degraded (server errors)"
+            case .permission: "Degraded (permission)"
+            case .subscription: "Degraded (subscription)"
+            }
+        }
+    }
+}
+
 extension AccountStatus {
     var warning: String? {
         switch self {

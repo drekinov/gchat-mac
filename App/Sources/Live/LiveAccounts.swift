@@ -58,6 +58,7 @@ final class LiveSessionMaker: Sendable {
             account: record.id, credentials: credentials, endpoints: endpoints, vault: vault, gate: gate)
         if let grant = pendingGrants.withLock({ $0.removeValue(forKey: record.id) }) { await tokens.prime(grant) }
         let client = GoogleChatClient(transport: transport, tokens: tokens)
+        let events = WorkspaceEventsClient(transport: transport, tokens: tokens)
 
         let directory = AccountDirectory(root: root, account: record.id)
         let (key, state) = try keys.open(for: record.id, storeExists: directory.storeExists())
@@ -74,7 +75,9 @@ final class LiveSessionMaker: Sendable {
         return AccountSession(
             account: record.id, me: record.me, api: client, store: store, clock: SystemClock(), logoutRunner: runner,
             revoker: endpoints, directory: client, gate: gate, notifications: notifications, media: client,
-            files: LiveFileAccess(account: record.id), mediaLoader: loader)
+            files: LiveFileAccess(account: record.id), mediaLoader: loader,
+            events: EventServices(
+                events: events, pubsub: events, hasScope: OAuthScopes.hasPubSub(credentials.grantedScope)))
     }
 }
 
@@ -147,10 +150,17 @@ final class LiveAccounts: Sendable {
         }
     }
 
-    func reconnect(_ info: AccountInfo, client: OAuthClientConfig) async throws -> AccountSession {
+    /// With `liveNotifications`, a fresh consent that must also grant Pub/Sub for this same account; anything
+    /// less leaves the stored credentials and the running session as they are.
+    func reconnect(
+        _ info: AccountInfo, client: OAuthClientConfig, liveNotifications: Bool = false
+    ) async throws -> AccountSession {
         let flow = SignInFlow(
             endpoints: OAuthEndpoints(transport: maker.transport, client: client), browser: WorkspaceBrowser())
-        let result = try await flow.run(loginHint: info.email, reconnecting: info.me)
+        let result =
+            liveNotifications
+            ? try await flow.grantLiveNotifications(account: info.me, loginHint: info.email)
+            : try await flow.run(loginHint: info.email, reconnecting: info.me)
         try Task.checkCancellation()
         defer { maker.prime(info.id, with: nil) }
         return try await manager.reconnect(info.id) { [vault, maker] in

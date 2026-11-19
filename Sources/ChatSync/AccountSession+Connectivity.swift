@@ -6,8 +6,10 @@ extension AccountSession {
     public func setConnectivity(_ connectivity: Connectivity) {
         connectivityEpoch &+= 1
         let wasOffline = !reachable || offlineUntil != nil
+        let pathChanged = reachable != (connectivity == .reachable)
         reachable = connectivity == .reachable
         guard let generation = gate.current else { return }
+        if pathChanged { restartEvents() }
         guard reachable else {
             admissionWasClosed = true
             if status != .needsLogin { setStatus(.offline, generation) }

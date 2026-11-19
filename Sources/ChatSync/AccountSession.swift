@@ -57,6 +57,8 @@ public actor AccountSession {
     /// People to start a DM with, from cached chats and (if granted) the Workspace directory.
     public nonisolated let contacts: Contacts
     public nonisolated let photos: ProfilePhotos
+    /// Workspace Events for this account on this Mac; nil when the session was built without event services.
+    public nonisolated let eventChannel: EventChannel?
 
     let engine: SyncEngine
     let sends: SendQueue
@@ -134,7 +136,7 @@ public actor AccountSession {
         gate: SessionGate = SessionGate(),
         timing: SessionTiming = SessionTiming(), notifications: (any NotificationPoster)? = nil,
         media: (any ChatMediaAPI)? = nil, files: any FileAccess = SecurityScopedFileAccess(),
-        mediaLoader: MediaLoader? = nil
+        mediaLoader: MediaLoader? = nil, events: EventServices? = nil
     ) {
         self.mediaLoader = mediaLoader
         self.account = account
@@ -152,6 +154,7 @@ public actor AccountSession {
         notifier = notifications.map {
             Notifier(account: account, store: store, gate: gate, me: me, poster: $0, clock: clock)
         }
+        eventChannel = events.map { EventChannel(services: $0, store: store, gate: gate, clock: clock, me: me) }
     }
 
     // MARK: Reads for the UI (synchronous store reads; call off the main actor)
@@ -237,13 +240,16 @@ public actor AccountSession {
         scheduleNotifications([], generation, force: true)
         work.spawn { [weak self] in await self?.runLoop(generation) }
         work.spawn { [weak self] in await self?.drainAllOutboxes(generation) }
+        startEventChannel()
     }
 
     public func setPaused(_ paused: Bool) {
+        let changed = paused != self.paused
         self.paused = paused
         if paused { admissionWasClosed = true }
         wake()
         if !paused, status == .offline, reachable, !isFuture(offlineUntil) { status = .ok }
+        if changed { restartEvents() }
     }
 
     /// Re-enables polling after a successful re-login.
@@ -253,6 +259,7 @@ public actor AccountSession {
         nextSidebar = nil
         wake()
         work.spawn { [weak self] in await self?.drainAllOutboxes(generation) }
+        restartEvents()
     }
 
     // MARK: Focus
@@ -999,6 +1006,7 @@ public actor AccountSession {
         closing = true
         wake()
         _ = await work.cancelAndDrain(timeout: timing.logoutDrain, clock: clock)
+        await eventChannel?.shutdown()
         await mediaLoader?.close()
         gate.close()
         snapshots.finish()
@@ -1026,6 +1034,7 @@ public actor AccountSession {
         snapshots.send(
             AccountSnapshot(account: account, generation: retired, status: .closing, revision: revision + 1))
         let drained = await work.cancelAndDrain(timeout: timing.logoutDrain, clock: clock)
+        await eventChannel?.shutdown()
         await mediaLoader?.close()
         let failed = await logoutRunner.run(account)
         if let refreshToken, let revoker { await revoker.revoke(refreshToken) }

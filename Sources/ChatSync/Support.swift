@@ -48,14 +48,20 @@ public final class WorkRegistry: Sendable {
     /// Starts `body` as a registered task; returns `false` (and runs nothing) once the registry is closed.
     @discardableResult
     public func spawn(_ body: @escaping @Sendable () async -> Void) -> Bool {
+        task(body) != nil
+    }
+
+    /// Like `spawn`, returning the task so its owner can cancel it alone.
+    public func task(_ body: @escaping @Sendable () async -> Void) -> Task<Void, Never>? {
         let id = UUID()
         return state.withLock { state in
-            guard !state.closed else { return false }
-            state.tasks[id] = Task { [weak self] in
+            guard !state.closed else { return nil }
+            let task = Task { [weak self] in
                 await body()
                 self?.remove(id)
             }
-            return true
+            state.tasks[id] = task
+            return task
         }
     }
 
