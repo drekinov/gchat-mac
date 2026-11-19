@@ -5,6 +5,12 @@ extension AccountSession {
     /// Focus suppression only applies while the app is active.
     public func setAppActive(_ active: Bool) {
         appActive = active
+        guard !active, let next = nextSidebar else { return }
+        let due = clock.now().adding(timing.sidebarInterval(appActive: false, liveChannel: liveChannel))
+        if due < next {
+            nextSidebar = due
+            wake()
+        }
     }
 
     func scheduleNotifications(_ spaces: Set<SpaceName>, _ generation: Generation) {

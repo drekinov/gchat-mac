@@ -5,6 +5,9 @@ import GoogleChat
 
 public struct SessionTiming: Sendable {
     public var sidebarInterval: Duration = .seconds(60)
+    public var inactiveSidebarInterval: Duration = .seconds(30)
+    /// While the app is inactive and the event channel delivers new messages.
+    public var liveSidebarInterval: Duration = .seconds(120)
     public var focusInterval: ClosedRange<Double> = 15...20
     public var spacesPerTick = 40
     public var concurrentSpaceSyncs = 8
@@ -20,6 +23,16 @@ public struct SessionTiming: Sendable {
     public var deleteReconcileDelays: [Duration] = [.seconds(3), .seconds(10), .seconds(30)]
 
     public init() {}
+
+    public func sidebarInterval(appActive: Bool, liveChannel: Bool) -> Duration {
+        guard !appActive else { return sidebarInterval }
+        return liveChannel ? liveSidebarInterval : inactiveSidebarInterval
+    }
+}
+
+public enum Connectivity: Sendable, Equatable {
+    case reachable
+    case unreachable
 }
 
 public struct ThreadReadPosition: Equatable, Sendable {
@@ -57,6 +70,16 @@ public actor AccountSession {
     let notifier: Notifier?
 
     var appActive = true
+    var liveChannel = false
+    var reachable = true
+    /// Bumped on every path change; an offline result from an older epoch is stale.
+    var connectivityEpoch: UInt64 = 0
+    var catchUpPending = false
+    var catchUpGeneration: UInt64 = 0
+    var closing = false
+    var blockedDrains: Set<SpaceName> = []
+    var blockedMarkReads: [SpaceName: Timestamp] = [:]
+    var restartEventChannel: (@Sendable () -> Void)?
     var notifyPending: Set<SpaceName> = []
     var notifyRunning = false
     var status: AccountStatus = .starting
@@ -79,8 +102,14 @@ public actor AccountSession {
     var memberFetches: [SpaceName: Task<Result<Bool, SyncError>, Never>] = [:]
     var nextSidebar: Timestamp?
     var nextFocus: Timestamp?
-    var backoffUntil: Timestamp?
+    /// Only `.transport(.offline)`; a reconnect clears it.
+    var offlineUntil: Timestamp?
+    /// Rate limits, server errors and other retryable failures; honored whatever the connectivity.
+    var retryUntil: Timestamp?
     var consecutiveFailures = 0
+    var offlineFailures = 0
+    /// Set whenever admission closes; the next admitted loop pass reruns the work that was turned away.
+    var admissionWasClosed = false
     var reconcileCursor = 0
     var revision: UInt64 = 0
     var changedSinceSnapshot: Set<SpaceName> = []
@@ -151,6 +180,7 @@ public actor AccountSession {
 
     public func searchMessages(_ query: String, pageToken: String?) async throws(SyncError) -> Page<Message> {
         guard let generation = gate.current else { throw .retired }
+        guard admitted else { throw admissionError(.searchMessages) }
         let page = try await engine.call(.searchMessages) { () async throws(ChatAPIError) in
             try await engine.api.searchMessages(query, pageSize: 25, pageToken: pageToken)
         }
@@ -161,6 +191,7 @@ public actor AccountSession {
     /// A small historical window around a search hit, independent of the live conversation's checkpoints.
     public func searchContext(around hit: Message) async throws(SyncError) -> [Message] {
         guard let generation = gate.current else { throw .retired }
+        guard admitted else { throw admissionError(.listMessages) }
         let thread = hit.isThreadReply ? hit.thread : nil
         let before = try await engine.call(.listMessages) { () async throws(ChatAPIError) in
             try await engine.api.listMessages(
@@ -203,14 +234,15 @@ public actor AccountSession {
 
     public func setPaused(_ paused: Bool) {
         self.paused = paused
+        if paused { admissionWasClosed = true }
         wake()
-        if !paused, status == .offline { status = .ok }
+        if !paused, status == .offline, reachable, !isFuture(offlineUntil) { status = .ok }
     }
 
     /// Re-enables polling after a successful re-login.
     public func resumeAfterLogin() {
         guard status == .needsLogin, let generation = gate.current else { return }
-        status = .ok
+        status = reachable ? .ok : .offline
         nextSidebar = nil
         wake()
         work.spawn { [weak self] in await self?.drainAllOutboxes(generation) }
@@ -249,6 +281,7 @@ public actor AccountSession {
             threadReadRetryRequested = true
             return
         }
+        let epoch = connectivityEpoch
         updatingThreadRead = true
         defer {
             updatingThreadRead = false
@@ -268,13 +301,13 @@ public actor AccountSession {
                     guard threadReadRetryRequested else { return }
                 case .retired:
                     return
-                case .api(let error, _) where error.isRetryable:
-                    backOff(after: error, generation)
+                case .api(let apiError, _) where apiError.isRetryable:
+                    handle(error, generation, epoch: epoch)
                     return
                 default:
                     // This position can't be saved, but a newer one for another thread still can.
                     if pendingThreadRead == position { pendingThreadRead = nil }
-                    handle(error, generation)
+                    handle(error, generation, epoch: epoch)
                 }
             }
         }
@@ -282,15 +315,29 @@ public actor AccountSession {
 
     public func markRead(_ space: SpaceName, upTo time: Timestamp) {
         guard let generation = gate.current else { return }
+        guard admitted else { return holdMarkRead(space, upTo: time) }
+        let epoch = connectivityEpoch
         work.spawn { [weak self] in
             guard let self else { return }
             do throws(SyncError) {
                 try await engine.markRead(space, upTo: time, generation)
                 await self.didCommit(space, generation)
             } catch {
-                await self.handle(error, generation)
+                await self.markReadFailed(space, upTo: time, error, generation, epoch: epoch)
             }
         }
+    }
+
+    func markReadFailed(
+        _ space: SpaceName, upTo time: Timestamp, _ error: SyncError, _ generation: Generation, epoch: UInt64
+    ) {
+        handle(error, generation, epoch: epoch)
+        if case .api(let apiError, _) = error, apiError.isRetryable { holdMarkRead(space, upTo: time) }
+    }
+
+    func holdMarkRead(_ space: SpaceName, upTo time: Timestamp) {
+        blockedMarkReads[space] = max(blockedMarkReads[space] ?? time, time)
+        admissionWasClosed = true
     }
 
     // MARK: Sending
@@ -333,11 +380,12 @@ public actor AccountSession {
     /// Adds the reaction, or removes it if it's already the user's.
     public func toggleReaction(_ emoji: Emoji, on message: MessageName) {
         guard let generation = gate.current, admitted else { return }
+        let epoch = connectivityEpoch
         work.spawn { [weak self, reactions] in
             do throws(SyncError) {
                 try await reactions.toggle(emoji, on: message, generation)
             } catch {
-                await self?.handle(error, generation, space: message.space)
+                await self?.handle(error, generation, epoch: epoch, space: message.space)
             }
             await self?.didCommit(message.space, generation)
         }
@@ -346,6 +394,7 @@ public actor AccountSession {
     /// Opens (or creates) the DM with `contact` and returns its space, already in the store.
     public func startDirectMessage(with contact: Contact) async throws(SyncError) -> SpaceName {
         guard let generation = gate.current else { throw .retired }
+        guard admitted else { throw admissionError(.setUpDirectMessage) }
         let space = try await contacts.startDirectMessage(with: contact, generation)
         didCommit(space, generation)
         return space
@@ -354,14 +403,15 @@ public actor AccountSession {
     /// Makes sure the open space's members are cached for @-mention autocomplete; call when its composer appears.
     public func prepareMentions(in space: SpaceName) {
         guard let generation = gate.current, admitted else { return }
-        work.spawn { [weak self] in await self?.refreshMentions(in: space, generation) }
+        let epoch = connectivityEpoch
+        work.spawn { [weak self] in await self?.refreshMentions(in: space, generation, epoch: epoch) }
     }
 
-    private func refreshMentions(in space: SpaceName, _ generation: Generation) async {
+    private func refreshMentions(in space: SpaceName, _ generation: Generation, epoch: UInt64) async {
         do throws(SyncError) {
             if try await fetchMembers(in: space, generation) { didCommit(space, generation) }
         } catch {
-            handle(error, generation, space: space)
+            handle(error, generation, epoch: epoch, space: space)
         }
     }
 
@@ -389,6 +439,7 @@ public actor AccountSession {
     /// fetched now (offline, backing off, or the request failed).
     public func ensureMembers(in space: SpaceName) async -> Bool {
         guard let generation = gate.current else { return false }
+        let epoch = connectivityEpoch
         do throws(SyncError) {
             guard try contacts.needsMembers(in: space) else { return true }
             guard admitted else { return false }
@@ -397,7 +448,7 @@ public actor AccountSession {
         } catch .busy {
             return true
         } catch {
-            handle(error, generation, space: space)
+            handle(error, generation, epoch: epoch, space: space)
             return false
         }
     }
@@ -408,10 +459,11 @@ public actor AccountSession {
         let stale = spaces.lazy.filter { [contacts] in (try? contacts.needsMembers(in: $0)) == true }
         for space in stale.prefix(Contacts.memberRefreshLimit) {
             guard let generation = gate.current, admitted else { return }
+            let epoch = connectivityEpoch
             do throws(SyncError) {
                 _ = try await fetchMembers(in: space, generation)
             } catch {
-                handle(error, generation, space: space)
+                handle(error, generation, epoch: epoch, space: space)
                 return
             }
         }
@@ -420,11 +472,12 @@ public actor AccountSession {
     /// Fills the member cache used by `contacts.fromChats()`; call when the new-message sheet opens.
     public func refreshContacts() {
         guard let generation = gate.current, admitted else { return }
+        let epoch = connectivityEpoch
         work.spawn { [weak self, contacts] in
             do throws(SyncError) {
                 try await contacts.refreshMembers(generation)
             } catch {
-                await self?.handle(error, generation)
+                await self?.handle(error, generation, epoch: epoch)
             }
         }
     }
@@ -450,30 +503,46 @@ public actor AccountSession {
     }
 
     func drainOutbox(_ space: SpaceName, _ generation: Generation) async {
+        guard admitted else { return holdDrain(space, generation) }
+        let epoch = connectivityEpoch
         let outcomes: [UUID: SendOutcome]?
         do {
-            outcomes = try await sends.drain(space, generation)
+            outcomes = try await sends.drain(space, generation) { [weak self] in await self?.admitted ?? false }
         } catch {
-            return handle(error, generation)
+            return handle(error, generation, epoch: epoch)
         }
         guard let outcomes else { return }
         didCommit(space, generation)
         var retryAt: Timestamp?
+        var held = false
         for outcome in outcomes.values {
             switch outcome {
             case .needsLogin:
                 setStatus(.needsLogin, generation)
             case .willRetry(let at):
                 retryAt = min(retryAt ?? at, at)
+            case .offline:
+                handle(.api(.transport(.offline), .createMessage), generation, epoch: epoch)
+                held = true
+            case .notAdmitted:
+                held = true
             case .sent, .failed, .retired:
                 break
             }
         }
+        if held { return holdDrain(space, generation) }
         let awaitingHydration = ((try? store.outbox()) ?? []).contains {
             if case .committed = $0.state { $0.space == space } else { false }
         }
         if awaitingHydration { retryAt = min(retryAt ?? .init(seconds: .max), clock.now().adding(.seconds(30))) }
         if let retryAt { scheduleDrain(space, at: retryAt, generation) }
+    }
+
+    /// Parks the space until admission reopens; if it already has, retries after the usual pause instead.
+    func holdDrain(_ space: SpaceName, _ generation: Generation) {
+        guard !admitted else { return scheduleDrain(space, at: clock.now(), generation) }
+        blockedDrains.insert(space)
+        admissionWasClosed = true
     }
 
     /// At most one pending retry timer per space.
@@ -493,18 +562,28 @@ public actor AccountSession {
 
     func runLoop(_ generation: Generation) async {
         while !Task.isCancelled, gate.isCurrent(generation) {
-            let now = clock.now()
-            let blocked = paused || status == .needsLogin || (backoffUntil.map { $0 > now } ?? false)
-            if !blocked {
-                if nextSidebar.map({ $0 <= now }) ?? true {
+            if admitted {
+                if admissionWasClosed { reopenAdmission(generation) }
+                if nextSidebar.map({ $0 <= clock.now() }) ?? true {
                     sidebarRequested = false
-                    await sidebarTick(generation)
-                    nextSidebar = sidebarRequested ? nil : clock.now().adding(timing.sidebarInterval)
+                    let catchUp = catchUpGeneration
+                    let completed = await sidebarTick(generation)
+                    let reset = catchUpGeneration != catchUp
+                    if reset || sidebarRequested || (catchUpPending && !admitted) {
+                        nextSidebar = nil
+                    } else {
+                        nextSidebar = clock.now().adding(
+                            timing.sidebarInterval(appActive: appActive, liveChannel: liveChannel))
+                    }
                     sidebarRequested = false
+                    if catchUpPending, completed, !reset, admitted { await finishCatchUp(catchUp, generation) }
                 }
                 if let space = focused, nextFocus.map({ $0 <= clock.now() }) ?? true {
+                    let catchUp = catchUpGeneration
                     await focusTick(space, generation)
-                    nextFocus = clock.now().adding(.seconds(Double.random(in: timing.focusInterval)))
+                    nextFocus =
+                        catchUpGeneration == catchUp
+                        ? clock.now().adding(.seconds(Double.random(in: timing.focusInterval))) : nil
                 }
             }
             await sleepUntilNextDeadline()
@@ -516,10 +595,12 @@ public actor AccountSession {
         guard gate.current != nil, !Task.isCancelled else { return }
         let now = clock.now()
         var deadlines: [Timestamp] = []
-        if let until = backoffUntil, until > now { deadlines.append(until) }
-        if !paused, status != .needsLogin, backoffUntil.map({ $0 <= now }) ?? true {
-            deadlines.append(nextSidebar ?? now)
-            if focused != nil { deadlines.append(nextFocus ?? now) }
+        if !standingBlock {
+            for until in [offlineUntil, retryUntil] { if let until, until > now { deadlines.append(until) } }
+            if deadlines.isEmpty {
+                deadlines.append(nextSidebar ?? now)
+                if focused != nil { deadlines.append(nextFocus ?? now) }
+            }
         }
         var wait = timing.idleSleep
         if let next = deadlines.min() {
@@ -537,17 +618,21 @@ public actor AccountSession {
     /// Re-evaluates deadlines now (focus change, resume, login).
     func wake() { sleepTask?.cancel() }
 
-    func sidebarTick(_ generation: Generation) async {
+    /// Returns whether every step ran with admission open.
+    @discardableResult
+    func sidebarTick(_ generation: Generation) async -> Bool {
         setStatus(.syncing, generation)
         let result: SyncEngine.SpacesResult
+        var pathEpoch = connectivityEpoch
         do {
             result = try await engine.syncSpaces(generation)
         } catch {
-            return handle(error, generation)
+            handle(error, generation, epoch: pathEpoch)
+            return false
         }
         changedSinceSnapshot.formUnion(result.changed)
         changedSinceSnapshot.formUnion(result.removed)
-        guard admitted else { return }
+        guard admitted else { return false }
 
         let stored = (try? store.spaces()) ?? []
         let cutoff = clock.now().adding(.zero - timing.activeWindow)
@@ -557,7 +642,7 @@ public actor AccountSession {
         var candidates: [SpaceName] = []
         for name in result.changed + unseeded where !candidates.contains(name) { candidates.append(name) }
         await syncSpaces(Array(candidates.prefix(timing.spacesPerTick)), generation)
-        guard admitted else { return }
+        guard admitted else { return false }
 
         let changed = Set(result.changed)
         let firstSync = (try? store.meta("firstSyncCompleted")) == nil
@@ -571,11 +656,12 @@ public actor AccountSession {
         .sorted { ($0.space.lastActiveTime ?? epoch) > ($1.space.lastActiveTime ?? epoch) }
         .prefix(firstSync ? timing.initialTitles : timing.titlesPerTick)
         for space in needingTitles where admitted {
+            pathEpoch = connectivityEpoch
             do {
                 try await engine.syncMemberTitle(space.space.name, generation)
                 changedSinceSnapshot.insert(space.space.name)
             } catch {
-                handle(error, generation, space: space.space.name)
+                handle(error, generation, epoch: pathEpoch, space: space.space.name)
             }
         }
 
@@ -583,19 +669,21 @@ public actor AccountSession {
             $0.notificationSetting == nil && !unavailable.contains("notification|\($0.space.name)")
         }
         for stored in unsettled.prefix(timing.titlesPerTick * 3) where admitted {
+            pathEpoch = connectivityEpoch
             do {
                 try await engine.syncNotificationSetting(stored.space.name, generation)
                 changedSinceSnapshot.insert(stored.space.name)
             } catch {
-                handle(error, generation, space: stored.space.name)
+                handle(error, generation, epoch: pathEpoch, space: stored.space.name)
             }
         }
 
         if admitted {
+            pathEpoch = connectivityEpoch
             do throws(SyncError) {
                 try await reactions.refreshCustomEmojis(generation)
             } catch {
-                handle(error, generation)
+                handle(error, generation, epoch: pathEpoch)
             }
         }
 
@@ -608,12 +696,14 @@ public actor AccountSession {
             }
         }
         succeeded(generation)
+        return admitted
     }
 
     /// New-message catch-up plus read state for spaces whose activity moved.
     func syncSpaces(_ spaces: [SpaceName], _ generation: Generation) async {
         let engine = engine
         let limit = timing.concurrentSpaceSyncs
+        let epoch = connectivityEpoch
         let failures = await withTaskGroup(of: (SpaceName, SyncError?).self) { group in
             var failures: [(SpaceName, SyncError)] = []
             var iterator = spaces.makeIterator()
@@ -644,7 +734,7 @@ public actor AccountSession {
             return failures
         }
         changedSinceSnapshot.formUnion(spaces)
-        for (space, error) in failures { handle(error, generation, space: space) }
+        for (space, error) in failures { handle(error, generation, epoch: epoch, space: space) }
     }
 
     /// Round-robin over recently active spaces so edits, deletes and read changes made elsewhere arrive.
@@ -652,12 +742,13 @@ public actor AccountSession {
         guard !active.isEmpty else { return }
         for offset in 0..<min(timing.reconcilePerTick, active.count) where admitted {
             let space = active[(reconcileCursor + offset) % active.count]
+            let epoch = connectivityEpoch
             do {
                 try await engine.syncEvents(space, generation)
                 if !unavailable.contains("readState|\(space)") { try await engine.syncReadState(space, generation) }
                 changedSinceSnapshot.insert(space)
             } catch {
-                handle(error, generation, space: space)
+                handle(error, generation, epoch: epoch, space: space)
             }
         }
         reconcileCursor = (reconcileCursor + timing.reconcilePerTick) % active.count
@@ -665,6 +756,7 @@ public actor AccountSession {
 
     func focusTick(_ space: SpaceName, _ generation: Generation) async {
         guard admitted else { return }
+        let epoch = connectivityEpoch
         var committed = false
         var finished = false
         // Ends the tick once. After a commit the space's digest is marked stale before any error is handled, so a
@@ -674,7 +766,7 @@ public actor AccountSession {
             guard !finished else { return }
             finished = true
             if committed { changedSinceSnapshot.insert(space) }
-            if let error { handle(error, generation, space: space) }
+            if let error { handle(error, generation, epoch: epoch, space: space) }
             if committed, changedSinceSnapshot.contains(space) { publish(generation) }
         }
         defer { finish() }
@@ -771,14 +863,25 @@ public actor AccountSession {
 
     // MARK: Errors and status
 
-    /// New network work may start: not paused, not waiting for login, and no retry deadline in the future.
+    /// The one admission predicate: new network work may start only while this holds.
     var admitted: Bool {
-        guard !paused, status != .needsLogin else { return false }
-        if let until = backoffUntil, until > clock.now() { return false }
-        return true
+        guard !standingBlock else { return false }
+        return !isFuture(offlineUntil) && !isFuture(retryUntil)
     }
 
-    func handle(_ error: SyncError, _ generation: Generation, space: SpaceName? = nil) {
+    /// Blocks that only an event (reconnect, login, unpause) lifts, unlike the retry deadlines.
+    var standingBlock: Bool { closing || paused || !reachable || status == .needsLogin }
+
+    func isFuture(_ deadline: Timestamp?) -> Bool { deadline.map { $0 > clock.now() } ?? false }
+
+    func admissionError(_ operation: ChatOperation) -> SyncError {
+        if closing { return .retired }
+        if status == .needsLogin { return .api(.unauthorized, operation) }
+        if !reachable || isFuture(offlineUntil) { return .api(.transport(.offline), operation) }
+        return .busy
+    }
+
+    func handle(_ error: SyncError, _ generation: Generation, epoch: UInt64, space: SpaceName? = nil) {
         guard gate.isCurrent(generation) else { return }
         switch error {
         case .retired, .busy, .incompletePage:
@@ -790,15 +893,11 @@ public actor AccountSession {
             case .unauthorized, .noCredentials:
                 setStatus(.needsLogin, generation)
                 return
-            case .transport(.offline):
-                setStatus(.offline, generation)
-                backOff(after: apiError, generation)
-                return
             default:
                 break
             }
             if apiError.isRetryable {
-                backOff(after: apiError, generation)
+                backOff(after: apiError, generation, epoch: epoch)
                 return
             }
             guard let space else { return }
@@ -816,18 +915,34 @@ public actor AccountSession {
         }
     }
 
-    func backOff(after error: ChatAPIError, _ generation: Generation) {
+    /// An offline result from before the latest path change is stale: it only asks for a fresh catch-up.
+    /// Server retry deadlines always count.
+    func backOff(after error: ChatAPIError, _ generation: Generation, epoch: UInt64) {
+        if case .transport(.offline) = error {
+            guard epoch == connectivityEpoch else { return requestCatchUp() }
+            offlineFailures += 1
+            let until = clock.now().adding(backoff.delay(attempt: offlineFailures - 1))
+            offlineUntil = max(offlineUntil ?? until, until)
+            admissionWasClosed = true
+            wake()
+            return setStatus(.offline, generation)
+        }
         consecutiveFailures += 1
         let until = clock.now().adding(backoff.delay(attempt: consecutiveFailures - 1, after: error))
-        backoffUntil = max(backoffUntil ?? until, until)
-        if status != .offline { setStatus(.backingOff(until: backoffUntil ?? until), generation) }
+        let deadline = max(retryUntil ?? until, until)
+        retryUntil = deadline
+        admissionWasClosed = true
+        wake()
+        if status != .offline { setStatus(.backingOff(until: deadline), generation) }
     }
 
-    /// A success never clears a retry deadline that is still in the future.
+    /// A success never clears a retry deadline that is still in the future, nor reports online while offline.
     func succeeded(_ generation: Generation) {
-        if let until = backoffUntil, until > clock.now() { return publish(generation) }
+        guard reachable, !isFuture(retryUntil), !isFuture(offlineUntil) else { return publish(generation) }
         consecutiveFailures = 0
-        backoffUntil = nil
+        offlineFailures = 0
+        retryUntil = nil
+        offlineUntil = nil
         switch status {
         case .needsLogin, .failed: publish(generation)
         default: setStatus(.ok, generation)
@@ -836,6 +951,7 @@ public actor AccountSession {
 
     func setStatus(_ new: AccountStatus, _ generation: Generation) {
         status = new
+        if new == .needsLogin { admissionWasClosed = true }
         publish(generation)
     }
 
@@ -864,6 +980,7 @@ public actor AccountSession {
     /// Close the old session while preserving the store and outbox for its replacement.
     func retireForReconnect(after saveCredentials: @Sendable () throws -> Void) async throws {
         try gate.retire(after: saveCredentials)
+        closing = true
         wake()
         _ = await work.cancelAndDrain(timeout: timing.logoutDrain, clock: clock)
         await mediaLoader?.close()
@@ -886,6 +1003,7 @@ public actor AccountSession {
         } catch {
             return LogoutReport(aborted: true, drained: false, failedSteps: LogoutStep.allCases)
         }
+        closing = true
         let retired = gate.retire()
         wake()
         status = .closing

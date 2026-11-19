@@ -65,6 +65,9 @@ final class AppModel {
     @ObservationIgnored private var exportSweeper: ExportSweeper?
     @ObservationIgnored private var exportSweeps: Task<Void, Never>?
     @ObservationIgnored private var wakeObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var connectivity: ConnectivityMonitor?
+    /// Keeps App Nap from stretching the poll timers while any account is signed in.
+    @ObservationIgnored private var pollingActivity: (any NSObjectProtocol)?
     private var photoURLs: [AccountID: [UserName: URL]] = [:]
     private(set) var isSigningIn = false
     private(set) var signInError: String?
@@ -156,6 +159,7 @@ final class AppModel {
         let live = LiveAccounts(
             root: LiveAccounts.defaultRoot(), notifications: notificationPoster(isFake: false))
         self.live = live
+        connectivity = ConnectivityMonitor(manager: live.manager)
         AttachmentStaging.prune()
         startExportSweeps(root: LiveAccounts.defaultRoot())
         savedClientProject = live.storedClient.map(Self.projectLabel)
@@ -350,6 +354,7 @@ final class AppModel {
     private func attach(_ info: AccountInfo, _ session: AccountSession) {
         if self.info(info.id) == nil { accounts.append(info) }
         sessions[info.id] = session
+        updatePollingActivity()
         subscriptions[info.id] = Task {
             for await snapshot in session.snapshots.values {
                 guard !Task.isCancelled, sessions[info.id] === session else { return }
@@ -361,6 +366,7 @@ final class AppModel {
     private func detach(_ id: AccountID) {
         subscriptions.removeValue(forKey: id)?.cancel()
         sessions[id] = nil
+        updatePollingActivity()
         snapshots[id] = nil
         photoURLs[id] = nil
         spaceFaces = spaceFaces.filter { $0.key.account != id }
@@ -558,6 +564,22 @@ final class AppModel {
     func shutdown() {
         for task in subscriptions.values { task.cancel() }
         world?.stop()
+        connectivity?.stop()
+        connectivity = nil
+        endPollingActivity()
+    }
+
+    private func updatePollingActivity() {
+        guard !sessions.isEmpty else { return endPollingActivity() }
+        guard pollingActivity == nil else { return }
+        pollingActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep], reason: "Checking for new messages")
+    }
+
+    private func endPollingActivity() {
+        guard let pollingActivity else { return }
+        ProcessInfo.processInfo.endActivity(pollingActivity)
+        self.pollingActivity = nil
     }
 
     // MARK: Inbox

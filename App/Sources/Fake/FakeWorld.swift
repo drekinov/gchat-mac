@@ -84,6 +84,8 @@ final class FakeWorld: Sendable {
     static func timing() -> SessionTiming {
         var timing = SessionTiming()
         timing.sidebarInterval = .seconds(10)
+        timing.inactiveSidebarInterval = .seconds(10)
+        timing.liveSidebarInterval = .seconds(10)
         timing.focusInterval = 4...6
         timing.titlesPerTick = 12
         return timing

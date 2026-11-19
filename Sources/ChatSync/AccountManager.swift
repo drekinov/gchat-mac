@@ -96,6 +96,8 @@ public actor AccountManager {
     public private(set) var sessions: [AccountID: AccountSession] = [:]
     /// Accounts with an add or logout in flight; lifecycle operations on one account never interleave.
     private var reserved: Set<AccountID> = []
+    /// The latest path state, applied to every session including ones created later.
+    public private(set) var connectivity: Connectivity = .reachable
     public nonisolated let accounts = LatestValue<[AccountRecord]>()
 
     public init(
@@ -125,6 +127,7 @@ public actor AccountManager {
             do {
                 let session = try await factory(record)
                 sessions[record.id] = session
+                await applyConnectivity(to: session)
                 await session.start()
                 restored.append(record.id)
             } catch {
@@ -152,6 +155,7 @@ public actor AccountManager {
         sessions[record.id] = session
         records.removeAll { $0.id == record.id }
         records.append(record)
+        await applyConnectivity(to: session)
         await session.start()
         accounts.send(records)
         return session
@@ -174,6 +178,7 @@ public actor AccountManager {
         }
         let session = try await factory(record)
         sessions[id] = session
+        await applyConnectivity(to: session)
         await session.start()
         return session
     }
@@ -207,4 +212,22 @@ public actor AccountManager {
     }
 
     public func session(_ id: AccountID) -> AccountSession? { sessions[id] }
+
+    public func setConnectivity(_ connectivity: Connectivity) async {
+        self.connectivity = connectivity
+        for session in sessions.values { await session.setConnectivity(connectivity) }
+    }
+
+    public func systemDidWake() async {
+        for session in sessions.values { await session.systemDidWake() }
+    }
+
+    /// Repeats until the value it applied is still the latest, since a path change can land during the await.
+    private func applyConnectivity(to session: AccountSession) async {
+        var applied: Connectivity
+        repeat {
+            applied = connectivity
+            await session.setConnectivity(applied)
+        } while applied != connectivity
+    }
 }

@@ -10,6 +10,10 @@ public enum SendOutcome: Sendable, Equatable {
     case failed(reason: String)
     case needsLogin
     case retired
+    /// The request never left the device; the item keeps its state and attempt count.
+    case offline
+    /// Admission closed before the request was sent; the item keeps its state.
+    case notAdmitted
 }
 
 /// Durable sends. One serialized queue per space, writes at least `spacing` apart (1 write/s per space), and the
@@ -85,15 +89,20 @@ public final class SendQueue: Sendable {
         }
     }
 
+    public typealias Admission = @Sendable () async -> Bool
+
     /// Sends due items of `space` in creation order. Stops at the first item that must wait, so order is kept.
     /// Returns the outcome per attempted item; `nil` when another drain of the space is running, in which case
     /// that drain runs another pass before it finishes, so nothing enqueued meanwhile is left behind.
-    public func drain(_ space: SpaceName, _ generation: Generation) async throws(SyncError) -> [UUID: SendOutcome]? {
+    /// `admit` is checked before every outgoing request.
+    public func drain(
+        _ space: SpaceName, _ generation: Generation, admit: @escaping Admission = { true }
+    ) async throws(SyncError) -> [UUID: SendOutcome]? {
         guard drains.begin(space) else { return nil }
         var outcomes: [UUID: SendOutcome] = [:]
         repeat {
             do {
-                outcomes.merge(try await drainOnce(space, generation)) { _, new in new }
+                outcomes.merge(try await drainOnce(space, generation, admit)) { _, new in new }
             } catch {
                 drains.release(space)
                 throw error
@@ -102,18 +111,29 @@ public final class SendQueue: Sendable {
         return outcomes
     }
 
-    func drainOnce(_ space: SpaceName, _ generation: Generation) async throws(SyncError) -> [UUID: SendOutcome] {
+    func drainOnce(
+        _ space: SpaceName, _ generation: Generation, _ admit: Admission
+    ) async throws(SyncError) -> [UUID: SendOutcome] {
         var outcomes: [UUID: SendOutcome] = [:]
         let items = try outbox().filter { $0.space == space }.sorted { $0.created < $1.created }
         for item in items {
-            if case .committed(let name) = item.state { try await hydrate(item, name, generation) }
+            guard case .committed(let name) = item.state else { continue }
+            guard await admit() else {
+                outcomes[item.id] = .notAdmitted
+                return outcomes
+            }
+            try await hydrate(item, name, generation)
         }
         for item in items where !item.state.isTerminal {
             if let next = item.nextAttempt, next > clock.now() {
                 outcomes[item.id] = .willRetry(at: next)
                 break
             }
-            let outcome = try await send(item, generation)
+            guard await admit() else {
+                outcomes[item.id] = .notAdmitted
+                break
+            }
+            let outcome = try await send(item, generation, admit)
             outcomes[item.id] = outcome
             if case .sent = outcome { continue }
             if case .failed = outcome { continue }
@@ -122,7 +142,9 @@ public final class SendQueue: Sendable {
         return outcomes
     }
 
-    func send(_ original: OutboxItem, _ generation: Generation) async throws(SyncError) -> SendOutcome {
+    func send(_ original: OutboxItem, _ generation: Generation, _ admit: Admission) async throws(SyncError)
+        -> SendOutcome
+    {
         var item = original
         item.attempts += 1
         if item.state == .queued { item.state = .sending }
@@ -130,12 +152,13 @@ public final class SendQueue: Sendable {
         try commit(generation) { $0.append(.putOutbox(sending)) }
 
         if item.payload.allUploadTokens == nil {
-            switch try await upload(&item, generation) {
+            switch try await upload(&item, original, generation, admit) {
             case .done: break
             case .stop(let outcome): return outcome
             }
         }
         try await pace(item.space)
+        guard await admit() else { return try unclaim(item, original, .notAdmitted, generation) }
         let request = NewMessage(
             space: item.space, text: item.payload.text, reply: item.payload.thread.map { .thread($0) } ?? .newThread,
             requestID: item.requestID, attachmentUploadTokens: item.payload.allUploadTokens ?? [])
@@ -170,11 +193,14 @@ public final class SendQueue: Sendable {
 
     /// Uploads attachments that have no token yet, saving each token as soon as it arrives. Uploads aren't
     /// idempotent, but an orphaned upload is harmless, so an unknown outcome simply uploads again later.
-    func upload(_ item: inout OutboxItem, _ generation: Generation) async throws(SyncError) -> UploadResult {
+    func upload(
+        _ item: inout OutboxItem, _ original: OutboxItem, _ generation: Generation, _ admit: Admission
+    ) async throws(SyncError) -> UploadResult {
         guard let media else { return .stop(try fail(item, reason: "attachmentsUnsupported", generation)) }
         for index in item.payload.attachments.indices where item.payload.attachments[index].uploadToken == nil {
             let attachment = item.payload.attachments[index]
             try await pace(item.space)
+            guard await admit() else { return .stop(try unclaim(item, original, .notAdmitted, generation)) }
             let result: Result<UploadedAttachment, ChatAPIError>
             do {
                 result = try await files.withFile(attachment.bookmark) { url in
@@ -196,6 +222,8 @@ public final class SendQueue: Sendable {
                 item.payload.attachments[index].uploadToken = uploaded.uploadToken
                 let saved = item
                 try commit(generation) { $0.append(.putOutbox(saved)) }
+            case .failure(.transport(.offline)):
+                return .stop(try unclaim(item, original, .offline, generation))
             case .failure(.transport(.requestBodyUnavailable)):
                 return .stop(try fail(item, reason: "fileUnavailable", generation))
             case .failure(.invalidArgument(let info)) where info.status == "CLIENT_FILE_TOO_LARGE":
@@ -234,6 +262,12 @@ public final class SendQueue: Sendable {
             return .needsLogin
         case .notFound where item.payload.thread != nil, .failedPrecondition where item.payload.thread != nil:
             return try fail(item, reason: "threadGone", generation)
+        case .transport(.offline):
+            item.state = original.state == .unknown ? .unknown : .queued
+            item.attempts -= 1
+            let restored = item
+            try commit(generation) { $0.append(.putOutbox(restored)) }
+            return .offline
         case .transport(.cancelled):
             // Cancellation doesn't prove the request went unprocessed; the same request ID resolves it later.
             item.state = .unknown
@@ -251,6 +285,19 @@ public final class SendQueue: Sendable {
         default:
             return try fail(item, reason: Self.reason(for: error), generation)
         }
+    }
+
+    /// Returns a claimed item to its state before this attempt, keeping any upload tokens it gained.
+    func unclaim(
+        _ item: OutboxItem, _ original: OutboxItem, _ outcome: SendOutcome, _ generation: Generation
+    ) throws(SyncError) -> SendOutcome {
+        var restored = item
+        restored.state = original.state
+        restored.attempts = original.attempts
+        restored.nextAttempt = original.nextAttempt
+        let durable = restored
+        try commit(generation) { $0.append(.putOutbox(durable)) }
+        return outcome
     }
 
     /// Terminal failure: the text goes back into the composer unless the user already started a new draft.
