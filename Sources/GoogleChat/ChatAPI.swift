@@ -133,7 +133,7 @@ extension PeopleDirectoryAPI {
     public func profilePhotos(for users: [UserName]) async throws(ChatAPIError) -> [UserName: URL] { [:] }
 }
 
-/// The Chat REST API surface used by gchat-mac (user auth). One instance per account.
+/// The Chat REST API surface used by Thimble (user auth). One instance per account.
 public protocol ChatAPI: Sendable {
     func listSpaces(pageSize: Int, pageToken: String?) async throws(ChatAPIError) -> Page<Space>
     func getSpace(_ space: SpaceName) async throws(ChatAPIError) -> Space
