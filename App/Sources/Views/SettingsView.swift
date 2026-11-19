@@ -203,9 +203,18 @@ struct AccountsSettings: View {
 struct GeneralSettings: View {
     @State private var status: SMAppService.Status = SMAppService.mainApp.status
     @State private var failure: String?
+    @AppStorage(AppModel.historyLimitKey) private var historyLimit = 2000
 
     var body: some View {
         Form {
+            Picker("Older messages per conversation", selection: $historyLimit) {
+                ForEach(AppModel.historyLimits, id: \.self) { Text($0.formatted()).tag($0) }
+            }
+            Text(
+                "Scrolling up loads earlier messages up to this many. Only the open conversation keeps them in memory."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
             Toggle("Launch at login", isOn: loginBinding)
             if status == .requiresApproval {
                 Text("Approve Thimble in System Settings > General > Login Items.").font(.caption)

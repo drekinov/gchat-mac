@@ -88,6 +88,11 @@ struct MessageList: View {
         let outbox = model.openOutbox.filter { $0.payload.thread == nil || !threaded }
         return ScrollViewReader { proxy in
             List {
+                if !rows.isEmpty {
+                    historyHeader
+                        .frame(maxWidth: .infinity)
+                        .listRowSeparator(.hidden)
+                }
                 ForEach(rows) { row in
                     MessageRow(row: row, context: context, onOpenThread: threaded ? { model.openThread($0) } : nil)
                         .listRowSeparator(.hidden)
@@ -134,6 +139,9 @@ struct MessageList: View {
                 }
             }
             .animation(.easeOut(duration: 0.15), value: pinned)
+            .onChange(of: rows.first?.id) { previous, _ in
+                if let previous, !pinned, !model.history.isEmpty { proxy.scrollTo(previous, anchor: .top) }
+            }
             .onChange(of: model.openMessages.last?.id) { scroll(proxy, animated: true) }
             .onChange(of: model.openOutbox.count) { scroll(proxy, animated: true) }
             .onChange(of: model.scrollCommand) {
@@ -144,6 +152,28 @@ struct MessageList: View {
                 }
             }
             .task { scroll(proxy, animated: false, force: true) }
+        }
+    }
+
+    @ViewBuilder private var historyHeader: some View {
+        if model.loadingHistory {
+            ProgressView().controlSize(.small)
+        } else {
+            switch model.historyEnd {
+            case .open:
+                Button("Load earlier messages") { model.loadOlder() }
+                    .buttonStyle(.link)
+                    .onAppear { if !pinned { model.loadOlder() } }
+            case .beginning:
+                Text("Beginning of conversation").font(.caption).foregroundStyle(.secondary)
+            case .capped:
+                HStack(spacing: 4) {
+                    Text("Earlier messages stop here; the limit is in").font(.caption).foregroundStyle(.secondary)
+                    SettingsLink { Text("Settings").font(.caption) }.buttonStyle(.link)
+                }
+            case .failed:
+                Button("Couldn't load earlier messages. Retry") { model.retryHistory() }.buttonStyle(.link)
+            }
         }
     }
 

@@ -27,6 +27,10 @@ final class AppModel {
     private(set) var openThread: ThreadName?
     private(set) var threadMessages: [Message] = []
     private(set) var isLoading = false
+    /// Messages older than the cached window, fetched on demand for the open space only.
+    private(set) var history: [Message] = []
+    private(set) var historyEnd = HistoryEnd.open
+    private(set) var loadingHistory = false
     private(set) var sendError: String?
     var windowIsKey = true {
         didSet {
@@ -56,6 +60,13 @@ final class AppModel {
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var reloadQueued = false
     @ObservationIgnored private var focusTask: Task<Void, Never>?
+    @ObservationIgnored private var storeWindow: [Message] = []
+    @ObservationIgnored private var historyOpening = UUID()
+    @ObservationIgnored private var historyCursor: (before: Timestamp, token: String?)?
+
+    enum HistoryEnd { case open, beginning, capped, failed }
+    static let historyLimitKey = "historyLimit"
+    static let historyLimits = [1000, 2000, 5000, 10000]
 
     var showsSwitcher = false
     var showsMessageSearch = false
@@ -400,7 +411,7 @@ final class AppModel {
         guard key != selection else { return }
         if let old = selection, loadedKey == old {
             recent.removeAll { $0.key == old }
-            recent.insert((old, openMessages), at: 0)
+            recent.insert((old, storeWindow), at: 0)
             recent = Array(recent.prefix(3))
         }
         selection = key
@@ -412,6 +423,11 @@ final class AppModel {
         openMine = [:]
         visibleThreads = []
         sendError = nil
+        history = []
+        historyEnd = .open
+        loadingHistory = false
+        historyCursor = nil
+        historyOpening = UUID()
         if let key, let cached = recent.first(where: { $0.key == key }) {
             recent.removeAll { $0.key == key }
             openMessages = cached.messages
@@ -420,6 +436,7 @@ final class AppModel {
             openMessages = []
             loadedKey = nil
         }
+        storeWindow = openMessages
         pushFocus()
         if key != nil { requestReload() }
     }
@@ -480,16 +497,94 @@ final class AppModel {
         let thread = openThread
         let loaded = await StoreReader.load(session: session, space: key.space, thread: thread)
         guard selection == key, sessions[key.account] === session else { return }
-        openMessages = loaded.messages
+        if historyCursor != nil, let oldest = loaded.messages.first?.createTime {
+            keepInHistory(openMessages.filter { $0.createTime < oldest })
+        }
+        storeWindow = loaded.messages
+        openMessages = withHistory(loaded.messages)
         loadPhotos(for: loaded.messages + loaded.thread, session: session)
         openOutbox = loaded.outbox
         openMine = loaded.mine
         loadedKey = key
         if openThread == thread {
-            threadMessages = thread == nil ? [] : loaded.thread
+            threadMessages =
+                thread.map { thread in Self.merged(history.filter { $0.thread == thread }, loaded.thread) } ?? []
         }
         updateVisibleThreads(key)
         markReadIfNeeded()
+    }
+
+    // MARK: Older history
+
+    /// Fetches up to five pages older than what's shown, stopping once one adds a visible row.
+    func loadOlder() {
+        guard let key = selection, loadedKey == key, !loadingHistory, historyEnd == .open,
+            let session = sessions[key.account]
+        else { return }
+        if historyCursor == nil {
+            guard let oldest = openMessages.first?.createTime else {
+                historyEnd = .beginning
+                return
+            }
+            historyCursor = (oldest.adding(.microseconds(1)), nil)
+        }
+        let opening = historyOpening
+        let threaded = isThreaded(key)
+        let limit = UserDefaults.standard.integer(forKey: Self.historyLimitKey)
+        loadingHistory = true
+        Task {
+            var end = HistoryEnd.open
+            for _ in 0..<5 {
+                guard let cursor = historyCursor else { break }
+                let page: Page<Message>
+                do {
+                    page = try await session.olderMessages(
+                        in: key.space, before: cursor.before, pageToken: cursor.token)
+                } catch {
+                    end = .failed
+                    break
+                }
+                guard historyOpening == opening else { return }
+                keepInHistory(page.items)
+                openMessages = withHistory(storeWindow)
+                loadPhotos(for: page.items, session: session)
+                historyCursor = (cursor.before, page.nextPageToken)
+                if page.nextPageToken == nil {
+                    end = .beginning
+                    break
+                }
+                if history.count >= (limit > 0 ? limit : 2000) {
+                    end = .capped
+                    break
+                }
+                if page.items.contains(where: { !threaded || !$0.isThreadReply }) { break }
+            }
+            guard historyOpening == opening else { return }
+            historyEnd = end
+            loadingHistory = false
+        }
+    }
+
+    func retryHistory() {
+        guard historyEnd == .failed else { return }
+        historyEnd = .open
+        loadOlder()
+    }
+
+    private func keepInHistory(_ messages: [Message]) {
+        guard !messages.isEmpty else { return }
+        history = Self.merged(history, messages)
+    }
+
+    private func withHistory(_ window: [Message]) -> [Message] {
+        history.isEmpty ? window : Self.merged(history, window)
+    }
+
+    /// Union by name, the later list winning, ordered by creation time.
+    private static func merged(_ older: [Message], _ newer: [Message]) -> [Message] {
+        let names = Set(newer.map(\.name))
+        return (older.filter { !names.contains($0.name) } + newer)
+            .sorted { ($0.createTime, $0.name.rawValue) < ($1.createTime, $1.name.rawValue) }
     }
 
     /// Profile photos for human senders not seen yet; the session caches misses, so repeats cost nothing.
