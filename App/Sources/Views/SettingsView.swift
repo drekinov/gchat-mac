@@ -184,12 +184,12 @@ struct GeneralSettings: View {
         Form {
             Toggle("Launch at login", isOn: loginBinding)
             if status == .requiresApproval {
-                Text("Approve gchat-mac in System Settings > General > Login Items.").font(.caption)
+                Text("Approve Thimble in System Settings > General > Login Items.").font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
             }
             if let failure { Text(failure).font(.caption).foregroundStyle(.red) }
-            Text("gchat-mac keeps running in the menu bar, so notifications arrive while the window is closed.")
+            Text("Thimble keeps running in the menu bar, so notifications arrive while the window is closed.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -235,7 +235,7 @@ struct NotificationsSettings: View {
             Toggle("Enable notifications", isOn: enableBinding)
             if denied || (statusOverride ?? authorization) == .denied {
                 HStack {
-                    Text("Notifications are turned off for gchat-mac in System Settings.").font(.caption)
+                    Text("Notifications are turned off for Thimble in System Settings.").font(.caption)
                         .foregroundStyle(.secondary)
                     Button("Open System Settings") {
                         if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
@@ -263,7 +263,7 @@ struct NotificationsSettings: View {
             .font(.callout)
             Text(
                 "This approximates Google's behaviour. The Chat API does not expose per-thread follow state, so "
-                    + "gchat-mac cannot match it exactly."
+                    + "Thimble cannot match it exactly."
             )
             .font(.caption)
             .foregroundStyle(.secondary)

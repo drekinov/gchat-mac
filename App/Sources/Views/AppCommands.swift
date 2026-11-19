@@ -8,7 +8,7 @@ struct AppCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .windowArrangement) {
-            Button("gchat-mac") { showMainWindow() }
+            Button("Thimble") { showMainWindow() }
                 .keyboardShortcut("1")
         }
         CommandGroup(replacing: .pasteboard) {

@@ -1,4 +1,4 @@
-# gchat-mac user guide
+# Thimble user guide
 
 To connect a real account you need Google Chat enabled for your Google Workspace account and a **Desktop OAuth
 client JSON file** from that organization. If a teammate has already set up the project, ask them for the file
@@ -52,7 +52,7 @@ the console. If your administrator requests the scope list, or you need to enter
 scopes**, use the values below. [Open Data Access](https://console.cloud.google.com/auth/scopes)
 
 <details>
-<summary>OAuth scopes requested by gchat-mac</summary>
+<summary>OAuth scopes requested by Thimble</summary>
 
 The required scopes identify the signed-in account, list spaces and members, read and search messages, send messages
 and attachments, start direct messages, react, sync read state, and read space notification settings and custom emoji.
@@ -100,7 +100,7 @@ for sending messages and updating read state. [Google’s Chat configuration gui
    The Desktop type supports the app’s local browser callback automatically.
 3. Click **Download JSON** in the creation dialog and keep the downloaded file outside your source checkout. The app
    imports the file as downloaded. If you inspect it, its top-level key should be `installed`.
-4. Give that file to the people in **this Workspace organization** who will use gchat-mac through your normal internal
+4. Give that file to the people in **this Workspace organization** who will use Thimble through your normal internal
    sharing channel. Each person signs in with their own Google account. [Google’s desktop credential guide](https://developers.google.com/workspace/guides/create-credentials#desktop-app)
 
 ## Sign in on your Mac
@@ -108,7 +108,7 @@ for sending messages and updating read state. [Google’s Chat configuration gui
 1. Open the live app. Click **Choose client file and sign in…** and select the downloaded JSON. If the app shows a
    saved project, choose **Sign in with Google** for that project or **Use another client file…** to switch.
 2. Your default browser opens Google’s consent screen. Choose the Workspace account that belongs to the project’s
-   organization, grant the required permissions, and continue. Keep gchat-mac running until the browser returns
+   organization, grant the required permissions, and continue. Keep Thimble running until the browser returns
    control to the app.
 3. Back on the Mac, open a familiar space or DM. Seeing its recent messages under the expected account badge confirms
    that sign-in and reading work. To check sending, use a conversation where you intend to post.

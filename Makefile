@@ -1,10 +1,10 @@
 XCODEBUILD = xcodebuild -project App/gchat-mac.xcodeproj -scheme gchat-mac -configuration Debug \
 	-derivedDataPath build/DerivedData -clonedSourcePackagesDirPath build/SourcePackages
-APP = build/DerivedData/Build/Products/Debug/gchat-mac.app
-BIN = $(APP)/Contents/MacOS/gchat-mac
+APP = build/DerivedData/Build/Products/Debug/Thimble.app
+BIN = $(APP)/Contents/MacOS/Thimble
 XCODEBUILD_RELEASE = xcodebuild -project App/gchat-mac.xcodeproj -scheme gchat-mac -configuration Release \
 	-derivedDataPath build/DerivedData -clonedSourcePackagesDirPath build/SourcePackages
-RELEASE_BIN = build/DerivedData/Build/Products/Release/gchat-mac.app/Contents/MacOS/gchat-mac
+RELEASE_BIN = build/DerivedData/Build/Products/Release/Thimble.app/Contents/MacOS/Thimble
 BENCH_SECONDS ?= 240
 BENCH_FLAGS = $(if $(ACCOUNTS),--bench-accounts $(ACCOUNTS)) $(if $(TRAFFIC),--bench-traffic)
 FORMAT_PATHS = Sources Tests App/Sources Package.swift
@@ -48,8 +48,8 @@ fake:
 	open $(APP) --args --fake $(if $(ACCOUNTS),--fake-accounts $(ACCOUNTS))
 
 footprint:
-	@footprint -p gchat-mac || echo "footprint: gchat-mac is not running"
-	@vmmap --summary gchat-mac | tail -40 || echo "vmmap: gchat-mac is not running"
+	@footprint -p Thimble || echo "footprint: Thimble is not running"
+	@vmmap --summary Thimble | tail -40 || echo "vmmap: Thimble is not running"
 
 keychain-probe: build
 	$(BIN) --keychain-probe write
@@ -68,7 +68,7 @@ build-release: gen
 	$(XCODEBUILD_RELEASE) build
 
 bench: build-release
-	scripts/bench.sh build/DerivedData/Build/Products/Release/gchat-mac.app $(BENCH_SECONDS) $(BENCH_FLAGS)
+	scripts/bench.sh build/DerivedData/Build/Products/Release/Thimble.app $(BENCH_SECONDS) $(BENCH_FLAGS)
 
 bench-debug: build
 	scripts/bench.sh $(APP) $(BENCH_SECONDS) $(BENCH_FLAGS)

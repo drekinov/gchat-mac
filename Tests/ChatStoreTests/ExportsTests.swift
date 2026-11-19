@@ -35,7 +35,7 @@ func exportFixture(
         let properties = try #require(
             try URL(fileURLWithPath: url.path).resourceValues(forKeys: [.quarantinePropertiesKey])
                 .quarantineProperties)
-        #expect(properties["LSQuarantineAgentName"] as? String == "gchat-mac")
+        #expect(properties["LSQuarantineAgentName"] as? String == "Thimble")
         _ = f
     }
 

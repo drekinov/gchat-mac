@@ -36,7 +36,7 @@ struct MenuBarContent: View {
             }
         }
         Divider()
-        Button("Open gchat-mac") { showWindow() }
+        Button("Open Thimble") { showWindow() }
         Divider()
         Button("Quit") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
