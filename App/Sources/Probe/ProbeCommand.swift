@@ -5,7 +5,7 @@
     import Network
     import Synchronization
 
-    /// `gchat-mac --keychain-probe <mode>`: checks keychain and loopback behaviour inside the signed, sandboxed app.
+    /// `Thimble --keychain-probe <mode>`: checks keychain and loopback behaviour inside the signed, sandboxed app.
     /// `make keychain-probe` runs the modes in order, re-signing the app between `write` and `verify`.
     enum ProbeCommand {
         static let item = SecretID(service: "io.github.drekinov.gchat-mac.probe", account: "probe")
@@ -20,7 +20,7 @@
             case "foreign": foreign(&report)
             case "loopback": await loopback(&report)
             default:
-                print("usage: gchat-mac --keychain-probe write|verify|foreign|loopback")
+                print("usage: Thimble --keychain-probe write|verify|foreign|loopback")
                 return 64
             }
             return report.finish(mode: mode)

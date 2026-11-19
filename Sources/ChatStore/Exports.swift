@@ -18,7 +18,7 @@ public enum ExportError: Error, Sendable, Equatable {
 /// can't redirect plaintext elsewhere.
 public struct ExportDirectory: Sendable {
     public static let quarantineAttribute = "com.apple.quarantine"
-    static let agentName = "gchat-mac"
+    static let agentName = "Thimble"
     static let maxFilenameBytes = 255
     static let fallbackFilename = "attachment"
 

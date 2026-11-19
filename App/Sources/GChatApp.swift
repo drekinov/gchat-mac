@@ -12,7 +12,7 @@ struct GChatApp: App {
     }
 
     var body: some Scene {
-        Window("gchat-mac", id: "main") {
+        Window("Thimble", id: "main") {
             ContentView(model: model)
         }
         .defaultSize(width: 1180, height: 760)

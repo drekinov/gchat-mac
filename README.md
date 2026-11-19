@@ -1,6 +1,6 @@
-# gchat-mac
+# Thimble
 
-A native macOS client for Google Chat. Keep several Google Workspace accounts in one inbox, reply in threads,
+Thimble is a native Mac app for Google Chat™. Keep several Google Workspace accounts in one inbox, reply in threads,
 share attachments, and search message history. Each conversation shows which account you’re sending from.
 
 ## Getting started
@@ -20,4 +20,9 @@ We used it as an API reference when building this Swift client. [mutter on GitHu
 
 ## License
 
-gchat-mac is available under the [MIT License](LICENSE).
+Thimble is available under the [MIT License](LICENSE).
+
+## Trademarks
+
+Thimble is an independent project. It is not affiliated with or endorsed by Google. Google Chat and Google Workspace
+are trademarks of Google LLC.

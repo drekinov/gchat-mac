@@ -240,8 +240,8 @@ public final class LoopbackListener: Sendable {
     }
 
     private static let successPage = """
-        <!doctype html><meta charset="utf-8"><title>gchat-mac</title>\
-        <p>Signed in. You can close this tab and return to gchat-mac.</p>
+        <!doctype html><meta charset="utf-8"><title>Thimble</title>\
+        <p>Signed in. You can close this tab and return to Thimble.</p>
         """
 
     private func respond(on connection: NWConnection, status: String, body: String = "") {

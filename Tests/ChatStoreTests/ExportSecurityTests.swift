@@ -113,7 +113,7 @@ private func makeVictim(in f: Fixture) throws -> URL {
         let fresh = URL(fileURLWithPath: url.path)
         let properties = try #require(
             try fresh.resourceValues(forKeys: [.quarantinePropertiesKey]).quarantineProperties)
-        #expect(properties["LSQuarantineAgentName"] as? String == "gchat-mac")
+        #expect(properties["LSQuarantineAgentName"] as? String == "Thimble")
         #expect(properties["LSQuarantineType"] != nil)
         let raw = try #require(quarantine(of: url))
         #expect(raw.split(separator: ";", omittingEmptySubsequences: false).count == 4)
@@ -147,7 +147,7 @@ private func makeVictim(in f: Fixture) throws -> URL {
         let url = try exports.export(from: reader, filename: "a.pdf")
         let value = try #require(quarantine(of: url))
         #expect(value.hasPrefix("0083;"))
-        #expect(value.contains(";gchat-mac;"))
+        #expect(value.contains(";Thimble;"))
     }
 
     @Test func unsandboxedFallbackStillFailsClosed() throws {
