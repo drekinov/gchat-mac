@@ -22,13 +22,19 @@ struct ComposerView: View {
     @State private var dropTargeted = false
     @FocusState private var focused: Bool
     private let previewMode: Bool
+    /// A drag is over the conversation's messages, whose drops attach here, so the composer shows its drop outline.
+    private let conversationDropTargeted: Bool
 
-    init(model: AppModel, key: SpaceKey, thread: ThreadName?, previewText: String? = nil) {
+    init(
+        model: AppModel, key: SpaceKey, thread: ThreadName?, previewText: String? = nil,
+        conversationDropTargeted: Bool = false
+    ) {
         self.model = model
         self.key = key
         self.thread = thread
         _text = State(initialValue: previewText ?? "")
         previewMode = previewText != nil
+        self.conversationDropTargeted = conversationDropTargeted
     }
 
     private var composerID: ComposerID { ComposerID(key: key, thread: thread) }
@@ -88,21 +94,20 @@ struct ComposerView: View {
             }
         }
         .padding(12)
-        .dropDestination(for: URL.self) { urls, _ in
-            let files = urls.filter(\.isFileURL)
-            guard !files.isEmpty else { return false }
-            model.addFiles(files, to: composerID)
-            return true
+        .dropDestination(for: DroppedFile.self) { drops, _ in
+            model.addDroppedFiles(drops, to: composerID)
         } isTargeted: {
             dropTargeted = $0
         }
         .overlay {
-            if dropTargeted {
+            if dropTargeted || conversationDropTargeted {
                 RoundedRectangle(cornerRadius: 8).strokeBorder(
                     Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6])
                 )
                 .padding(4)
-                .overlay(Text("Drop files to attach").font(.callout.weight(.medium)).foregroundStyle(Color.accentColor))
+                .overlay(
+                    Text("Drop to add to message").font(.callout.weight(.medium)).foregroundStyle(Color.accentColor)
+                )
                 .background(Color.accentColor.opacity(0.06))
                 .allowsHitTesting(false)
             }
@@ -129,6 +134,7 @@ struct ComposerView: View {
             let draft = await model.loadDraft(key, thread: thread)
             restored = true
             if editRevision == revision, text.isEmpty { text = draft }
+            insertDroppedText()
         }
         .onChange(of: model.snapshots[key.account]?.revision) {
             Task {
@@ -137,6 +143,7 @@ struct ComposerView: View {
             }
         }
         .onChange(of: selection) { refreshTrigger() }
+        .onChange(of: model.droppedText[composerID] ?? []) { insertDroppedText() }
         .onChange(of: focused) {
             refreshTrigger()
             if focused {
@@ -149,6 +156,7 @@ struct ComposerView: View {
 
     private func editor(_ items: [Contact]) -> some View {
         TextEditor(text: editorBinding, selection: $selection)
+            .background(TextOnlyDrops())
             .font(.body)
             .scrollContentBackground(.hidden)
             .focused($focused)
@@ -216,6 +224,16 @@ struct ComposerView: View {
         editRevision += 1
         scheduleSave()
         refreshTrigger()
+    }
+
+    /// Types in text and links that reached a drop destination instead of the text view: dropped beside it, or a
+    /// link offered without a text form. Waits for the draft to load, so a drop can't stand in for it and be saved
+    /// over it.
+    private func insertDroppedText() {
+        guard restored else { return }
+        let texts = model.takeDroppedText(composerID)
+        guard !texts.isEmpty else { return }
+        insert(texts.joined(separator: " "))
     }
 
     /// Inserts at the caret, replacing any selection.

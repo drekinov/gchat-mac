@@ -5,20 +5,23 @@ import SwiftUI
 struct SpaceView: View {
     let model: AppModel
     let key: SpaceKey
+    @State private var dropTargeted = false
 
     var body: some View {
         VStack(spacing: 0) {
             SpaceHeader(model: model, key: key)
             Divider()
+            // Drops on the messages attach to the composer. This destination must not cover the composer: there it
+            // would sit above the text view, which then never gets dragged text, and the composer's own
+            // destination never gets files.
             MessageList(model: model, key: key)
+                .dropDestination(for: DroppedFile.self) { drops, _ in
+                    model.addDroppedFiles(drops, to: ComposerID(key: key, thread: nil))
+                } isTargeted: {
+                    dropTargeted = $0
+                }
             Divider()
-            ComposerView(model: model, key: key, thread: nil)
-        }
-        .dropDestination(for: URL.self) { urls, _ in
-            let files = urls.filter(\.isFileURL)
-            guard !files.isEmpty else { return false }
-            model.addFiles(files, to: ComposerID(key: key, thread: nil))
-            return true
+            ComposerView(model: model, key: key, thread: nil, conversationDropTargeted: dropTargeted)
         }
     }
 }

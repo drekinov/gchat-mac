@@ -63,6 +63,8 @@ final class AppModel {
     var preview: PreviewTarget?
     private(set) var composerAttachments: [ComposerID: [PendingAttachment]] = [:]
     private(set) var attachmentErrors: [ComposerID: String] = [:]
+    /// Text and web links dropped on a conversation, waiting for that composer to type them in.
+    private(set) var droppedText: [ComposerID: [String]] = [:]
     @ObservationIgnored var activeComposer: ComposerID?
     private(set) var openWindowRequest = 0
     var showsNewMessage = false
@@ -91,6 +93,7 @@ final class AppModel {
     ) async {
         guard phase == .idle else { return }
         phase = .starting
+        AttachmentStaging.clearDrops()
         let bench = BenchConfig(arguments: arguments)
         guard arguments.contains("--fake") || bench != nil else {
             await bootLive(promptForNotifications: promptForNotifications)
@@ -218,6 +221,7 @@ final class AppModel {
             recent.removeAll { $0.key.account == id }
             composerAttachments = composerAttachments.filter { $0.key.key.account != id }
             attachmentErrors = attachmentErrors.filter { $0.key.key.account != id }
+            droppedText = droppedText.filter { $0.key.key.account != id }
             guard report.failedSteps.isEmpty else {
                 pendingRemoval.insert(id)
                 signInError = "Local cleanup is incomplete. Retry removal or restart the app."
@@ -696,8 +700,17 @@ final class AppModel {
     func clearAttachmentError(_ id: ComposerID) { attachmentErrors[id] = nil }
 
     func removeAttachment(_ attachment: UUID, from id: ComposerID) {
+        let removed = composerAttachments[id]?.first { $0.id == attachment }
         composerAttachments[id]?.removeAll { $0.id == attachment }
         if composerAttachments[id]?.isEmpty == true { composerAttachments[id] = nil }
+        // A staged copy belongs to its chip alone (sending takes the chips, a failed send gives them back), so it
+        // goes with the chip rather than waiting for the seven-day prune. User-selected originals aren't staged.
+        if let removed {
+            let staged = URL(fileURLWithPath: String(decoding: removed.bookmark, as: UTF8.self))
+            if AttachmentStaging.contains(staged, for: id.key.account) {
+                AttachmentStaging.removeStaged(staged, for: id.key.account)
+            }
+        }
     }
 
     func takeAttachments(_ id: ComposerID) -> [PendingAttachment] {
@@ -711,37 +724,108 @@ final class AppModel {
         composerAttachments[id] = attachments + (composerAttachments[id] ?? [])
     }
 
+    /// Attaches the files among `drops` and passes web links and text on for the composer to type in. `false`
+    /// refuses the drop.
+    func addDroppedFiles(_ drops: [DroppedFile], to id: ComposerID) -> Bool {
+        var candidates: [AttachCandidate] = []
+        var texts: [String] = []
+        var problems: [String] = []
+        for drop in drops {
+            switch drop {
+            case .link(let url) where !url.isFileURL: texts.append(url.absoluteString)
+            case .link(let url): candidates.append(.file(url))
+            case .text(let text): texts.append(text)
+            case .copy(let url): candidates.append(.dropped(url))
+            case .tooLarge(let name): problems.append("\(RemoteText.title(name)) is larger than 200 MB.")
+            case .unusable(let name): problems.append("\(RemoteText.title(name)) can't be attached.")
+            }
+        }
+        // Not for an account that's gone or going: its composer won't be there to take them.
+        let textQueued = !texts.isEmpty && sessions[id.key.account] != nil && removingAccount != id.key.account
+        if textQueued { droppedText[id, default: []] += texts }
+        let attachable = canAttach(to: id)
+        attach(candidates, to: id, problems: problems)
+        return (attachable && !(candidates.isEmpty && problems.isEmpty)) || textQueued
+    }
+
+    /// The text and links dropped on this composer, handed over once.
+    func takeDroppedText(_ id: ComposerID) -> [String] {
+        droppedText.removeValue(forKey: id) ?? []
+    }
+
+    static let attachmentLimitProblem = "A message can have up to \(maxAttachmentsPerMessage) attachments."
+
+    private func canAttach(to id: ComposerID) -> Bool {
+        sessions[id.key.account]?.gate.current != nil && removingAccount != id.key.account
+    }
+
     /// Bookmarks the files and queues them as chips; over-size files and failures become one inline message.
     func addFiles(_ urls: [URL], to id: ComposerID) {
-        guard sessions[id.key.account]?.gate.current != nil, removingAccount != id.key.account else { return }
-        var problems: [String] = []
+        attach(urls.map(AttachCandidate.file), to: id, problems: [])
+    }
+
+    /// A file to attach, or a drop's scratch copy, which moves into staging only once it is next and fits.
+    private enum AttachCandidate {
+        case file(URL)
+        case dropped(URL)
+    }
+
+    private struct AttachProblem: Error {
+        let message: String
+    }
+
+    /// Queues the candidates in order, after any `earlier` problems. Only accepted files take a slot, and every drop
+    /// copy that isn't attached is deleted, so nothing unattached stays on disk.
+    private func attach(_ candidates: [AttachCandidate], to id: ComposerID, problems earlier: [String]) {
+        guard canAttach(to: id) else {
+            for case .dropped(let copy) in candidates { AttachmentStaging.discard(copy) }
+            return
+        }
+        var problems = earlier
         var current = composerAttachments[id] ?? []
-        for url in urls {
+        for (index, candidate) in candidates.enumerated() {
             guard current.count < Self.maxAttachmentsPerMessage else {
-                problems.append("A message can have up to \(Self.maxAttachmentsPerMessage) attachments.")
+                problems.append(Self.attachmentLimitProblem)
+                for case .dropped(let copy) in candidates[index...] { AttachmentStaging.discard(copy) }
                 break
             }
-            let name = url.lastPathComponent
-            let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .contentTypeKey])
-            guard values?.isRegularFile == true, let size = values?.fileSize else {
-                problems.append("\(RemoteText.title(name)) can't be attached.")
-                continue
+            let url: URL
+            switch candidate {
+            case .file(let file): url = file
+            case .dropped(let copy): url = AttachmentStaging.adopt(copy, for: id.key.account)
             }
-            guard size <= MediaLoader.maxFileBytes else {
-                problems.append("\(RemoteText.title(name)) is larger than 200 MB.")
-                continue
+            switch Self.pendingAttachment(for: url, account: id.key.account) {
+            case .success(let attachment):
+                current.append(attachment)
+            case .failure(let problem):
+                problems.append(problem.message)
+                if case .dropped = candidate { AttachmentStaging.removeStaged(url, for: id.key.account) }
             }
-            guard let bookmark = Self.bookmark(for: url, account: id.key.account) else {
-                problems.append("\(RemoteText.title(name)) couldn't be opened for attaching.")
-                continue
-            }
-            let type =
-                values?.contentType?.preferredMIMEType
-                ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-            current.append(PendingAttachment(bookmark: bookmark, filename: name, contentType: type, byteCount: size))
         }
         composerAttachments[id] = current.isEmpty ? nil : current
-        attachmentErrors[id] = problems.isEmpty ? nil : problems.joined(separator: " ")
+        var seen = Set<String>()
+        let unique = problems.filter { seen.insert($0).inserted }
+        attachmentErrors[id] = unique.isEmpty ? nil : unique.joined(separator: " ")
+    }
+
+    private static func pendingAttachment(
+        for url: URL, account: AccountID
+    ) -> Result<PendingAttachment, AttachProblem> {
+        let name = url.lastPathComponent
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .contentTypeKey])
+        guard values?.isRegularFile == true, let size = values?.fileSize else {
+            return .failure(AttachProblem(message: "\(RemoteText.title(name)) can't be attached."))
+        }
+        guard size <= MediaLoader.maxFileBytes else {
+            return .failure(AttachProblem(message: "\(RemoteText.title(name)) is larger than 200 MB."))
+        }
+        guard let bookmark = bookmark(for: url, account: account) else {
+            return .failure(AttachProblem(message: "\(RemoteText.title(name)) couldn't be opened for attaching."))
+        }
+        let type =
+            values?.contentType?.preferredMIMEType
+            ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+        return .success(PendingAttachment(bookmark: bookmark, filename: name, contentType: type, byteCount: size))
     }
 
     /// A security-scoped bookmark when the sandbox grants one, otherwise a path to a staged copy.
