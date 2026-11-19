@@ -37,6 +37,27 @@ login-url.txt
 
 # Local development sessions
 .swiftpm/
+.idea/
+.vscode/
+
+# AI agents: local settings, sessions and instructions
 .claude/
 .codex/
 .agents/
+.cursor/
+.windsurf/
+.gemini/
+.opencode/
+.continue/
+.aider*
+.serena/
+.mcp.json
+CLAUDE.local.md
+*.local.md
+*.local.json
+
+# Working notes kept out of the public repository
+docs/plans/
+docs/research/
+docs/decisions/
+HANDOFF.md
