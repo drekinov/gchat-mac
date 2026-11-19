@@ -79,6 +79,9 @@ final class NotificationCenterPoster: NotificationPoster {
         if settings.alertStyle == .none || settings.alertSetting == .disabled {
             notes.append("the alert style for Thimble is None, so it only lands in Notification Centre")
         }
+        if settings.badgeSetting != .enabled {
+            notes.append("Badge application icon is off, so the Dock shows no unread count")
+        }
         if !UserDefaults.standard.bool(forKey: enabledKey) {
             notes.append("Enable notifications is off here, so chat messages aren't posted")
         }
