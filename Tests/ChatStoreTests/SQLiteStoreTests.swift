@@ -25,7 +25,7 @@ private func fileModes(of directory: AccountDirectory) throws -> [String: Int] {
     return modes
 }
 
-private func storeBytes(_ directory: AccountDirectory) -> Data {
+func storeBytes(_ directory: AccountDirectory) -> Data {
     var all = Data()
     for suffix in ["", "-wal", "-shm"] {
         all.append((try? Data(contentsOf: URL(fileURLWithPath: directory.storeURL.path + suffix))) ?? Data())
@@ -33,7 +33,7 @@ private func storeBytes(_ directory: AccountDirectory) -> Data {
     return all
 }
 
-private func withRawConnection<T>(_ f: Fixture, _ body: (Connection) throws -> T) throws -> T {
+func withRawConnection<T>(_ f: Fixture, _ body: (Connection) throws -> T) throws -> T {
     f.closeSQLite()
     let raw = try Connection(path: f.directory.storeURL.path)
     defer { raw.close() }

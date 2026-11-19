@@ -82,6 +82,12 @@ public actor AccountSession {
     var restartEventChannel: (@Sendable () -> Void)?
     var notifyPending: Set<SpaceName> = []
     var notifyRunning = false
+    var notifyForced = false
+    var notifyRetryArmed = false
+    var notifyRetryAttempts = 0
+    var owedSyncWanted = false
+    var owedSyncArmed = false
+    var owedFirstRequest: Timestamp?
     var status: AccountStatus = .starting
     var paused = false
     var focused: SpaceName?
@@ -228,6 +234,7 @@ public actor AccountSession {
         guard let generation = gate.current else { return }
         try? sends.recoverInterrupted(generation)
         publish(generation)
+        scheduleNotifications([], generation, force: true)
         work.spawn { [weak self] in await self?.runLoop(generation) }
         work.spawn { [weak self] in await self?.drainAllOutboxes(generation) }
     }
@@ -639,9 +646,12 @@ public actor AccountSession {
         let active = stored.filter { !$0.isHidden && ($0.space.lastActiveTime ?? .init(seconds: 0)) > cutoff }
             .sorted { ($0.space.lastActiveTime ?? .init(seconds: 0)) > ($1.space.lastActiveTime ?? .init(seconds: 0)) }
         let unseeded = active.filter { (try? store.checkpoint($0.space.name, .messages)) == nil }.map(\.space.name)
+        let owed = owedPlan(limit: timing.spacesPerTick / 2)
         var candidates: [SpaceName] = []
-        for name in result.changed + unseeded where !candidates.contains(name) { candidates.append(name) }
+        for name in owed.due + result.changed + unseeded where !candidates.contains(name) { candidates.append(name) }
         await syncSpaces(Array(candidates.prefix(timing.spacesPerTick)), generation)
+        guard admitted else { return false }
+        await probeUnknownOwed(owed.unknown, generation)
         guard admitted else { return false }
 
         let changed = Set(result.changed)
@@ -691,7 +701,7 @@ public actor AccountSession {
 
         if (try? store.meta("firstSyncCompleted")) == nil {
             let now = clock.now()
-            try? store.write(gate: gate, generation: generation) {
+            _ = try? store.write(gate: gate, generation: generation) {
                 $0.append(.setMeta(key: "firstSyncCompleted", value: now.rfc3339))
             }
         }
@@ -704,6 +714,7 @@ public actor AccountSession {
         let engine = engine
         let limit = timing.concurrentSpaceSyncs
         let epoch = connectivityEpoch
+        let revisions = ((try? engine.owedRecords()) ?? [:]).mapValues(\.revision)
         let failures = await withTaskGroup(of: (SpaceName, SyncError?).self) { group in
             var failures: [(SpaceName, SyncError)] = []
             var iterator = spaces.makeIterator()
@@ -734,7 +745,12 @@ public actor AccountSession {
             return failures
         }
         changedSinceSnapshot.formUnion(spaces)
-        for (space, error) in failures { handle(error, generation, epoch: epoch, space: space) }
+        for (space, error) in failures {
+            handle(error, generation, epoch: epoch, space: space)
+            if let revision = revisions[space], error.countsAsOwedAttempt {
+                try? engine.deferOwed(space, revision: revision, generation)
+            }
+        }
     }
 
     /// Round-robin over recently active spaces so edits, deletes and read changes made elsewhere arrive.

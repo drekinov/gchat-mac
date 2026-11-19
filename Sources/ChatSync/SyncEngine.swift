@@ -100,9 +100,11 @@ public struct SyncEngine: Sendable {
         public var removed: [SpaceName]
     }
 
-    /// Lists every page; only a complete listing can confirm a membership loss.
+    /// Lists every page; only a complete listing can confirm a membership loss. Spaces whose activity moved get an
+    /// owed row in the same commit, so a crash before their messages are fetched loses nothing.
     public func syncSpaces(_ generation: Generation) async throws(SyncError) -> SpacesResult {
         try await exclusive("spaces") { () async throws(SyncError) -> SpacesResult in
+            let relistVersion = try read { () throws(StoreError) in try store.relist().requested }
             var listed: [Space] = []
             var skipped = 0
             var token: String?
@@ -125,8 +127,19 @@ public struct SyncEngine: Sendable {
                 guard let old = storedByName[space.name] else { return true }
                 return old.space.lastActiveTime != space.lastActiveTime || old.isHidden
             }
+            let moved = listed.compactMap { space -> (SpaceName, Timestamp)? in
+                guard let old = storedByName[space.name], let time = space.lastActiveTime,
+                    old.space.lastActiveTime != time
+                else { return nil }
+                return (space.name, time)
+            }
             let removed =
                 complete ? stored.filter { !$0.isHidden && !listedNames.contains($0.space.name) }.map(\.space.name) : []
+            let omitted =
+                complete
+                ? try read { () throws(StoreError) in try store.owedRecords() }.keys.filter {
+                    !listedNames.contains($0) && !removed.contains($0)
+                }.sorted() : []
 
             var hiddenAnonymous: Set<SpaceName> = []
             for stored in stored where stored.isHidden {
@@ -141,7 +154,13 @@ public struct SyncEngine: Sendable {
                         batch.append(.setSpaceHidden(space.name, false))
                     }
                 }
-                for name in removed { batch.append(.setSpaceHidden(name, true)) }
+                for (name, time) in moved { batch.append(.mergeOwed(name, boundary: time, messages: [])) }
+                for name in removed {
+                    batch.append(.setSpaceHidden(name, true))
+                    batch.append(.clearOwed(name))
+                }
+                for name in omitted { batch.append(.owedOmitted(name)) }
+                batch.append(.resolveRelist(relistVersion))
             }
             let sorted = changed.sorted {
                 ($0.lastActiveTime ?? .init(seconds: 0)) > ($1.lastActiveTime ?? .init(seconds: 0))
@@ -152,14 +171,16 @@ public struct SyncEngine: Sendable {
 
     // MARK: Messages
 
-    /// Catches up `messages` from the checkpoint to a frozen end, or seeds the newest window on first sync.
+    /// Catches up `messages` from the checkpoint to a frozen end, or seeds the newest window on first sync. Resolves
+    /// the space's owed row in the same commit and then fetches owed messages the listing didn't return.
     public func syncMessages(_ space: SpaceName, _ generation: Generation) async throws(SyncError) {
         try await exclusive("space|\(space)") { () async throws(SyncError) in
+            let revision = try read { () throws(StoreError) in try store.owed(space)?.revision } ?? 0
             let end = frozenEnd()
             guard let checkpoint = try read({ () throws(StoreError) in try store.checkpoint(space, .messages) }),
                 try read({ () throws(StoreError) in try store.meta(Self.formatKey(space)) }) == Self.messageFormat
             else {
-                return try await seedWindow(space, end: end, generation)
+                return try await seedWindow(space, end: end, revision: revision, generation)
             }
             let start = checkpoint.adding(.zero - Self.overlap)
             guard start < end else { return }
@@ -181,22 +202,31 @@ public struct SyncEngine: Sendable {
             } while token != nil && pages < Self.maxCatchUpPages
 
             if token != nil {
-                return try await seedWindow(space, end: end, generation)
+                return try await seedWindow(space, end: end, revision: revision, generation)
             }
             try checkComplete(skipped, "messages|\(space)", .listMessages)
             let resolved = try resolvedSends(fetched)
+            let candidates = try notifyCandidates(space, fetched)
             try commit(generation) { batch in
+                if !candidates.isEmpty { batch.append(.addNotifyCandidates(space, candidates)) }
                 if !fetched.isEmpty { batch.append(.upsertMessages(fetched)) }
                 for id in resolved { batch.append(.deleteOutbox(id)) }
+                batch.append(.resolveOwed(space, revision: revision, coveredUpTo: end, fetched: []))
                 batch.append(.setCheckpoint(space, .messages, end))
                 batch.append(.pruneMessages(space, keep: Self.keptMessagesPerSpace))
             }
+            try await recoverOwed(space, revision: revision, coveredUpTo: end, generation)
         }
     }
 
     /// Fetches the newest messages and sets both the message and event checkpoints to `end`. Used on first sync,
     /// when catch-up would be too long, and when the event checkpoint is older than the event window.
-    func seedWindow(_ space: SpaceName, end: Timestamp, _ generation: Generation) async throws(SyncError) {
+    func seedWindow(
+        _ space: SpaceName, end: Timestamp, revision: UInt64? = nil, _ generation: Generation
+    ) async throws(SyncError) {
+        let stored = try read { () throws(StoreError) in try store.owed(space)?.revision }
+        let revision = revision ?? stored ?? 0
+        let previous = try read { () throws(StoreError) in try store.checkpoint(space, .messages) }
         let page = try await call(.listMessages) { () async throws(ChatAPIError) in
             try await api.listMessages(
                 in: space, window: CreateTimeWindow(before: end), thread: nil, order: .descending,
@@ -204,14 +234,25 @@ public struct SyncEngine: Sendable {
         }
         try checkComplete(page.skipped, "seed|\(space)", .listMessages)
         let resolved = try resolvedSends(page.items)
+        let candidates = try notifyCandidates(space, page.items)
+        let oldest = page.items.map(\.createTime).min()
+        let skippedUnfetched =
+            page.items.count >= Self.initialMessages
+            && previous.map { old in oldest.map { $0 > old } ?? false } ?? false
+        let gap = skippedUnfetched ? try gapIsNotifiable(space) : false
+        let covered = page.items.map(\.createTime).max().map { $0.adding(.nanoseconds(1)) }
         // Replacing, not merging: older cached rows can't be kept current once the event window is lost.
         try commit(generation) { batch in
+            if !candidates.isEmpty { batch.append(.addNotifyCandidates(space, candidates)) }
+            if gap { batch.append(.flagNotifyGap(space)) }
             batch.append(.replaceMessages(space, page.items, coveredBefore: end))
             for id in resolved { batch.append(.deleteOutbox(id)) }
+            batch.append(.resolveOwed(space, revision: revision, coveredUpTo: covered, fetched: []))
             batch.append(.setCheckpoint(space, .messages, end))
             batch.append(.setCheckpoint(space, .events, end))
             batch.append(.setMeta(key: Self.formatKey(space), value: Self.messageFormat))
         }
+        try await recoverOwed(space, revision: revision, coveredUpTo: covered, generation)
     }
 
     static func formatKey(_ space: SpaceName) -> String { "messageFormat|\(space.rawValue)" }
@@ -246,11 +287,15 @@ public struct SyncEngine: Sendable {
             try checkComplete(skipped, "events|\(space)", .listSpaceEvents)
 
             var messages: [Message] = []
+            var created: [Message] = []
             var reacted: [MessageName] = []
             var spaceUpdate: Space?
             for timed in events {
                 switch timed.event {
-                case .messageCreated(let message), .messageUpdated(let message), .messageDeleted(let message):
+                case .messageCreated(let message):
+                    messages.append(message)
+                    created.append(message)
+                case .messageUpdated(let message), .messageDeleted(let message):
                     messages.append(message)
                 case .reactionsChanged(let name):
                     if !reacted.contains(name) { reacted.append(name) }
@@ -280,7 +325,12 @@ public struct SyncEngine: Sendable {
             {
                 staleMembers = (try read { () throws(StoreError) in try store.members(in: space) }, stored.memberTitle)
             }
+            // Catch-up already decided on messages before its checkpoint, including ones pruned since.
+            let caughtUp = try read { () throws(StoreError) in try store.checkpoint(space, .messages) }
+            let candidates = try notifyCandidates(
+                space, created.filter { message in caughtUp.map { message.createTime >= $0 } ?? true })
             try commit(generation) { batch in
+                if !candidates.isEmpty { batch.append(.addNotifyCandidates(space, candidates)) }
                 if let spaceUpdate { batch.append(.mergeSpace(spaceUpdate)) }
                 if !messages.isEmpty { batch.append(.upsertMessages(messages)) }
                 for (name, summary) in reactions { batch.append(.updateReactions(name, summary)) }
