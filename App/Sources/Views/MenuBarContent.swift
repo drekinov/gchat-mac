@@ -12,6 +12,9 @@ struct MenuBarLabel: View {
             if unread > 0 { Text("\(unread)") }
         }
         .onChange(of: model.openWindowRequest) { openWindow(id: "main") }
+        .onChange(of: unread, initial: true) { _, count in
+            NSApp.dockTile.badgeLabel = count > 0 ? String(count) : nil
+        }
         .task {
             if BenchConfig(arguments: CommandLine.arguments) != nil || CommandLine.arguments.contains("--repro-thread")
             {
