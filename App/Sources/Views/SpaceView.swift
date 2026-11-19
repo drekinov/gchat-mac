@@ -118,6 +118,22 @@ struct MessageList: View {
             .overlay {
                 if rows.isEmpty && outbox.isEmpty { Text("No messages yet").foregroundStyle(.secondary) }
             }
+            .overlay(alignment: .bottomTrailing) {
+                if !pinned {
+                    Button {
+                        pinned = true
+                        withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
+                    } label: {
+                        Image(systemName: "arrow.down").font(.body.weight(.semibold)).frame(width: 30, height: 30)
+                    }
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .help("Jump to the newest message")
+                    .padding(14)
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeOut(duration: 0.15), value: pinned)
             .onChange(of: model.openMessages.last?.id) { scroll(proxy, animated: true) }
             .onChange(of: model.openOutbox.count) { scroll(proxy, animated: true) }
             .onChange(of: model.scrollCommand) {
