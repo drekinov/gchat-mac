@@ -128,10 +128,12 @@ struct ComposerView: View {
         .task(id: key) {
             model.prepareMentions(for: key)
             candidates = await model.mentionCandidates(for: key)
+            guard !Task.isCancelled else { return }
             refreshTrigger()
             guard !restored else { return }
             let revision = editRevision
             let draft = await model.loadDraft(key, thread: thread)
+            guard !Task.isCancelled else { return }
             restored = true
             if editRevision == revision, text.isEmpty { text = draft }
             insertDroppedText()
@@ -143,7 +145,7 @@ struct ComposerView: View {
             }
         }
         .onChange(of: selection) { refreshTrigger() }
-        .onChange(of: model.droppedText[composerID] ?? []) { insertDroppedText() }
+        .onChange(of: model.droppedTextRevision) { insertDroppedText() }
         .onChange(of: focused) {
             refreshTrigger()
             if focused {
