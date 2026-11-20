@@ -55,6 +55,47 @@ struct ReactionSyncTests {
         #expect(h.server.message(message.name)?.reactions.first { $0.emoji == .unicode("👍") }?.count == 2)
     }
 
+    @Test func reactorsListEveryoneByEmojiAndRereadWhenCountsChange() async throws {
+        let (h, _, message, reactions) = try await rig()
+        h.server.react(message.name, emoji: .unicode("👍"), by: .account(h.bob))
+        h.server.react(message.name, emoji: .unicode("👍"), by: .account(h.alice))
+        h.server.react(message.name, emoji: .unicode("🎉"), by: .account(h.bob))
+        let summaries = [
+            ReactionSummary(emoji: .unicode("👍"), count: 2), ReactionSummary(emoji: .unicode("🎉"), count: 1),
+        ]
+
+        let users = try await reactions.reactors(on: message.name, matching: summaries, h.generation).users
+        #expect(Set(users[.unicode("👍")] ?? []) == [h.alice.user.name, h.bob.user.name])
+        #expect(users[.unicode("🎉")] == [h.bob.user.name])
+        #expect(Set(reactions.mine(on: message.name).keys) == [.unicode("👍")])
+
+        // Kept while the counts match, read again once they change.
+        h.server.react(message.name, emoji: .unicode("🎉"), by: .account(h.alice))
+        let cached = try await reactions.reactors(on: message.name, matching: summaries, h.generation).users
+        #expect(cached[.unicode("🎉")] == [h.bob.user.name])
+        let changed = [
+            ReactionSummary(emoji: .unicode("👍"), count: 2), ReactionSummary(emoji: .unicode("🎉"), count: 2),
+        ]
+        let fresh = try await reactions.reactors(on: message.name, matching: changed, h.generation)
+        #expect(Set(fresh.users[.unicode("🎉")] ?? []) == [h.alice.user.name, h.bob.user.name])
+        #expect(fresh.names[h.bob.user.name] == h.bob.user.displayName)
+    }
+
+    @Test func reactorsAreReadAgainOnceOldEvenWhenCountsMatch() async throws {
+        let (h, _, message, reactions) = try await rig()
+        let bobs = h.server.react(message.name, emoji: .unicode("👍"), by: .account(h.bob))
+        let summaries = [ReactionSummary(emoji: .unicode("👍"), count: 1)]
+        let first = try await reactions.reactors(on: message.name, matching: summaries, h.generation)
+        #expect(first.users[.unicode("👍")] == [h.bob.user.name])
+
+        // Bob's reaction is replaced by Alice's: the count is still one.
+        h.server.removeReaction(bobs)
+        h.server.react(message.name, emoji: .unicode("👍"), by: .account(h.alice))
+        h.server.advance(Reactions.refreshAfter + .seconds(1))
+        let later = try await reactions.reactors(on: message.name, matching: summaries, h.generation)
+        #expect(later.users[.unicode("👍")] == [h.alice.user.name])
+    }
+
     @Test func duplicateCreateLearnsTheExistingReaction() async throws {
         let (h, _, message, reactions) = try await rig()
         h.server.react(message.name, emoji: .unicode("👍"), by: .account(h.alice))

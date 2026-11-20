@@ -8,6 +8,19 @@ struct ReactionActions {
     var isMine: @MainActor (Emoji, MessageName) -> Bool
     var toggle: @MainActor (Emoji, MessageName) -> Void
     var customEmojis: @MainActor () -> [CustomEmoji]
+    /// Everyone who reacted to a message, by emoji, given its current reaction counts; nil when it can't be loaded.
+    var reactors: @MainActor (MessageName, [ReactionSummary]) async -> [Emoji: [Reactor]]? = { _, _ in nil }
+    var media: MediaLoader?
+}
+
+/// One person who reacted, as the reaction card shows them.
+struct Reactor: Identifiable, Hashable {
+    let id: UserName
+    /// "You" for the signed-in person.
+    let label: String
+    /// Their full name, for the avatar's initials.
+    let name: String
+    let photoURL: URL?
 }
 
 private struct ForcedHoverKey: EnvironmentKey {

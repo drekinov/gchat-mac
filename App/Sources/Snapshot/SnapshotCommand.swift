@@ -131,6 +131,16 @@
                 model.select(entry.id)
                 await model.waitUntilSettled(timeout: .seconds(3))
                 if let target = model.openMessages.last(where: { $0.text.hasPrefix("Release 4.2") }) {
+                    if let rocket = target.reactions.first {
+                        await window(
+                            "31-reactors.png",
+                            ReactorsCard(
+                                reaction: rocket, summaries: target.reactions, message: target.name,
+                                actions: model.reactionActions(for: entry.id)
+                            )
+                            .background(Color(nsColor: .windowBackgroundColor)),
+                            NSSize(width: 260, height: 300))
+                    }
                     await mainWindow("12-hover-action-bar.png", model, wide, hovering: target.name)
                     await reactionRoundTrip(model, entry.id, target.name)
                     await mainWindow("16-after-toggle.png", model, wide, hovering: target.name)

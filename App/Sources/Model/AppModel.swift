@@ -1094,7 +1094,46 @@ final class AppModel {
             canReact: canReact(key.account),
             isMine: { [self] emoji, message in ownReaction(emoji, on: message) != nil },
             toggle: { [self] emoji, message in Task { await toggleReaction(emoji, on: message, key: key) } },
-            customEmojis: { [self] in customEmojis(for: key.account) })
+            customEmojis: { [self] in customEmojis(for: key.account) },
+            reactors: { [self] message, summaries in await reactors(on: message, key: key, summaries: summaries) },
+            media: mediaLoader(for: key.account))
+    }
+
+    /// Everyone who reacted to a message, by emoji: you first, then in the order Google lists them, each person
+    /// once. Names come from the conversation's members, then from the senders loaded in it.
+    func reactors(on message: MessageName, key: SpaceKey, summaries: [ReactionSummary]) async -> [Emoji: [Reactor]]? {
+        guard let session = sessions[key.account],
+            let list = await session.reactors(on: message, matching: summaries)
+        else { return nil }
+        let members = await StoreReader.memberships(session: session, space: key.space)
+        var names: [UserName: String] = [:]
+        for membership in members {
+            if let name = membership.member.displayName, !name.isEmpty { names[membership.member.name] = name }
+        }
+        names.merge(list.names) { known, _ in known }
+        if list.users.values.joined().contains(where: { names[$0] == nil }) {
+            for contact in await StoreReader.contacts(session: session) {
+                guard let user = contact.user, names[user] == nil, !contact.displayName.isEmpty else { continue }
+                names[user] = contact.displayName
+            }
+        }
+        for sent in openMessages + threadMessages where names[sent.sender.name] == nil {
+            if let name = sent.sender.displayName, !name.isEmpty { names[sent.sender.name] = name }
+        }
+        let users = list.users
+        let me = info(key.account)?.me
+        let photos = photoURLs[key.account] ?? [:]
+        return users.mapValues { list in
+            var seen = Set<UserName>()
+            let unique = list.filter { seen.insert($0).inserted }
+            let ordered = unique.filter { $0 == me } + unique.filter { $0 != me }
+            return ordered.map { user in
+                let name = RemoteText.title(names[user] ?? (user == me ? info(key.account)?.name ?? "" : ""))
+                return Reactor(
+                    id: user, label: user == me ? "You" : (name.isEmpty ? "Unknown" : name), name: name,
+                    photoURL: photos[user])
+            }
+        }
     }
 
     func toggleReaction(_ emoji: Emoji, on message: MessageName, key: SpaceKey) async {

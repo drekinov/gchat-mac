@@ -291,6 +291,12 @@ public actor AccountSession {
         didCommit(item.space, generation)
     }
 
+    /// Everyone who reacted to `message`, by emoji; nil when Google can't be asked right now.
+    public func reactors(on message: MessageName, matching summaries: [ReactionSummary]) async -> ReactorList? {
+        guard let generation = gate.current, admitted else { return nil }
+        return try? await reactions.reactors(on: message, matching: summaries, generation)
+    }
+
     /// Adds the reaction, or removes it if it's already the user's.
     public func toggleReaction(_ emoji: Emoji, on message: MessageName) {
         guard let generation = gate.current, admitted else { return }

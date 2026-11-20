@@ -279,6 +279,8 @@ struct ReactionPills: View {
     let reactions: [ReactionSummary]
     let message: MessageName
     var actions: ReactionActions?
+    @State private var hovered: Emoji?
+    @State private var shown: Emoji?
 
     var body: some View {
         FlowLayout(spacing: 4) {
@@ -286,16 +288,26 @@ struct ReactionPills: View {
                 pill(reaction)
             }
         }
+        // Who reacted shows after a short rest on a pill, so passing over a row of them doesn't flash cards.
+        .task(id: hovered) {
+            guard let hovered else {
+                shown = nil
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(450))
+            if !Task.isCancelled { shown = hovered }
+        }
     }
 
     private func pill(_ reaction: ReactionSummary) -> some View {
         let mine = actions?.isMine(reaction.emoji, message) ?? false
         let enabled = actions?.canReact ?? false
         return Button {
+            shown = nil
             actions?.toggle(reaction.emoji, message)
         } label: {
             HStack(spacing: 4) {
-                emoji(reaction.emoji)
+                ReactionEmoji(emoji: reaction.emoji)
                 Text("\(reaction.count)").font(.caption.monospacedDigit())
                     .foregroundStyle(mine ? Color.accentColor : .secondary)
             }
@@ -308,20 +320,39 @@ struct ReactionPills: View {
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
-        .help(tooltip(reaction, mine: mine))
+        .onHover { inside in
+            if inside {
+                hovered = reaction.emoji
+            } else if hovered == reaction.emoji {
+                hovered = nil
+            }
+        }
+        .popover(isPresented: showing(reaction.emoji), arrowEdge: .top) {
+            if let actions {
+                ReactorsCard(reaction: reaction, summaries: reactions, message: message, actions: actions)
+            }
+        }
         .accessibilityLabel(
             "\(reaction.count) \(reaction.count == 1 ? "reaction" : "reactions")\(mine ? ", including yours" : "")"
         )
         .accessibilityAddTraits(mine ? .isSelected : [])
+        .accessibilityAction(named: "Show who reacted") { shown = reaction.emoji }
     }
 
-    private func tooltip(_ reaction: ReactionSummary, mine: Bool) -> String {
-        let count = "\(reaction.count) \(reaction.count == 1 ? "reaction" : "reactions")"
-        return mine ? "\(count). You reacted; click to remove." : count
+    private func showing(_ emoji: Emoji) -> Binding<Bool> {
+        Binding(
+            get: { shown == emoji },
+            set: { isShown in
+                if !isShown, shown == emoji { shown = nil }
+            })
     }
+}
 
-    @ViewBuilder
-    private func emoji(_ emoji: Emoji) -> some View {
+/// A reaction's emoji as the pills show it: the character, or a custom emoji's shortcode.
+struct ReactionEmoji: View {
+    let emoji: Emoji
+
+    var body: some View {
         switch emoji {
         case .unicode(let text):
             Text(RemoteText.title(text))
@@ -329,6 +360,61 @@ struct ReactionPills: View {
             Text(":\(EmojiPick.bareShortcode(shortcode ?? "emoji")):")
                 .font(.caption.monospaced())
                 .foregroundStyle(Color(red: 0.50, green: 0.30, blue: 0.80))
+        }
+    }
+}
+
+/// Who reacted with one emoji: you first, then up to eight people, then how many more.
+struct ReactorsCard: View {
+    let reaction: ReactionSummary
+    /// All of the message's reactions, so a cached list is reused only while none of them has changed.
+    let summaries: [ReactionSummary]
+    let message: MessageName
+    let actions: ReactionActions
+    @State private var people: [Reactor]?
+    @State private var failed = false
+
+    static let shownLimit = 8
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                ReactionEmoji(emoji: reaction.emoji).font(.title3)
+                Text(reaction.count == 1 ? "1 reaction" : "\(reaction.count) reactions")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            if let people {
+                ForEach(people.prefix(Self.shownLimit)) { person in
+                    HStack(spacing: 8) {
+                        PhotoAvatar(name: person.name, url: person.photoURL, media: actions.media, size: 22)
+                        Text(person.label).lineLimit(1)
+                    }
+                }
+                let others = reaction.count - min(people.count, Self.shownLimit)
+                if others > 0 {
+                    Text("and \(others) \(others == 1 ? "other" : "others")")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            } else if failed {
+                Text("Couldn't load who reacted.").font(.callout).foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading…").foregroundStyle(.secondary)
+                }
+                .font(.callout)
+            }
+        }
+        .padding(12)
+        .frame(minWidth: 170, maxWidth: 260, alignment: .leading)
+        .task(id: reaction) {
+            if let all = await actions.reactors(message, summaries) {
+                people = all[reaction.emoji] ?? []
+            } else {
+                failed = true
+            }
         }
     }
 }
