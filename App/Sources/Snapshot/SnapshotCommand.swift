@@ -343,9 +343,16 @@
                 if let attachment = model.openMessages.flatMap(\.attachments).first(where: {
                     $0.contentName == "screenshot-onboarding.png"
                 }) {
-                    let target = PreviewTarget(attachment: attachment, media: loader)
+                    let target = PreviewTarget(
+                        attachment: attachment, media: loader, messages: [model.openMessages],
+                        space: model.summary(for: releases.id))
+                    let size = NSSize(width: 900, height: 640)
                     await window(
-                        "25-image-preview.png", ImagePreviewSheet(target: target) {}, NSSize(width: 900, height: 640))
+                        "25-image-preview.png",
+                        ImagePreviewSheet(target: target) {}.environment(\.isSnapshotMode, true), size)
+                    await window(
+                        "25-image-preview-zoomed.png",
+                        ImagePreviewSheet(target: target, startZoom: 2) {}.environment(\.isSnapshotMode, true), size)
                 }
             }
 
