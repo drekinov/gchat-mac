@@ -121,9 +121,11 @@ and an encrypted message cache for each account.
 
 | To | Use |
 | --- | --- |
-| Switch conversations or accounts | **⌘K** opens the conversation switcher. **⌥⌘1** through **⌥⌘9** filter by account. **⌥⌘0** restores the merged inbox. |
+| Switch conversations or accounts | **⌘K** opens the conversation switcher. The menu beside the sidebar's search field, or **⌥⌘1** through **⌥⌘9**, shows one account; **⌥⌘0** shows all of them again. With all accounts showing, each conversation carries its account's badge. |
 | Find an older message | **⌘F** searches one or all workspaces. Select a match for surrounding messages. |
-| Send or reply | Check **Sending as** above the composer. **Return** sends and **Shift-Return** inserts a line break. Open a thread to reply there. |
+| Send or reply | The badge at the start of the message field shows which account sends. **Return** sends and **Shift-Return** inserts a line break. Click a message's replies to open its thread in place and reply there. |
+| See who's in a conversation | Click the conversation's name at the top. Hover a person to message them or mention them in your reply. |
+| Look at an image | Click it. Zoom with **⌘+** and **⌘−**, a pinch or **⌘**-scroll; **⌘0** shows actual size and **⌘9** fits it. **←** and **→** step through the conversation's images. |
 | Renew account access | In **Settings → Accounts**, use the account’s **… → Reconnect to Google…**. Drafts and queued sends stay on the Mac. |
 | Remove an account | Choose **… → Remove from this Mac…**. This clears the local cache, drafts, and queued messages. Messages already sent stay in Google Chat. |
 
