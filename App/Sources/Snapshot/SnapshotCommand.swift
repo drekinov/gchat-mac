@@ -90,7 +90,7 @@
             let members = await model.memberships(for: threaded.id)
             print("snapshot: members of the threaded space: \(members.count)")
             await window(
-                "27-members.png",
+                "28-members.png",
                 MembersPopover(model: model, key: threaded.id, members: members) {}
                     .background(Color(nsColor: .windowBackgroundColor)),
                 NSSize(width: 340, height: 520))
