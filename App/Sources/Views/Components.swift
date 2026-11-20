@@ -14,11 +14,15 @@ extension EnvironmentValues {
     }
 }
 
+/// Account badge colours. None is close to the Slate accent, and each keeps white letters readable.
 enum AccountPalette {
     static let colors: [Color] = [
-        Color(red: 0.20, green: 0.45, blue: 0.85), Color(red: 0.85, green: 0.45, blue: 0.10),
-        Color(red: 0.12, green: 0.58, blue: 0.50), Color(red: 0.55, green: 0.32, blue: 0.80),
-        Color(red: 0.78, green: 0.28, blue: 0.42), Color(red: 0.35, green: 0.50, blue: 0.62),
+        Color(red: 0x2E / 255, green: 0x7A / 255, blue: 0x4F / 255),  // green
+        Color(red: 0xC0 / 255, green: 0x44 / 255, blue: 0x2C / 255),  // red
+        Color(red: 0x8C / 255, green: 0x61 / 255, blue: 0x14 / 255),  // ochre
+        Color(red: 0x7A / 255, green: 0x4F / 255, blue: 0x8C / 255),  // plum
+        Color(red: 0x1F / 255, green: 0x7F / 255, blue: 0x86 / 255),  // teal
+        Color(red: 0xA3 / 255, green: 0x40 / 255, blue: 0x5F / 255),  // rose
     ]
 
     static func color(_ index: Int) -> Color { colors[index % colors.count] }
@@ -30,12 +34,22 @@ struct AccountBadge: View {
 
     var body: some View {
         let color = AccountPalette.color(info?.colorIndex ?? 0)
-        Text(String((info?.name ?? "?").split(separator: " ").last?.prefix(1) ?? "?").uppercased())
-            .font(.system(size: size * 0.6, weight: .bold))
+        Text(Self.letter(info?.name))
+            .font(.system(size: size * 0.56, weight: .heavy))
             .foregroundStyle(.white)
             .frame(width: size, height: size)
-            .background(color, in: RoundedRectangle(cornerRadius: size * 0.28))
-            .accessibilityLabel(info?.name ?? "Unknown account")
+            .background(color, in: Circle())
+            .accessibilityLabel(info.map { "\(RemoteText.title($0.name)) account" } ?? "Unknown account")
+    }
+
+    /// The first letter of the name's last word, so "Org B" and "Org C" stay apart. An account still named by
+    /// its email uses the domain's first letter, so addresses at different organizations don't share a letter.
+    static func letter(_ name: String?) -> String {
+        let name = (name ?? "").trimmingCharacters(in: .whitespaces)
+        let source =
+            name.split(separator: "@").dropFirst().first.map(String.init)
+            ?? name.split(separator: " ").last.map(String.init) ?? name
+        return source.first(where: \.isLetter).map { String($0).uppercased() } ?? "?"
     }
 }
 

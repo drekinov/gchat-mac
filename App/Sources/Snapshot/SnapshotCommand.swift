@@ -13,7 +13,7 @@
         static func run(directory: String) async -> Int32 {
             let app = NSApplication.shared
             app.setActivationPolicy(.accessory)
-            app.appearance = NSAppearance(named: .aqua)
+            app.appearance = NSAppearance(named: CommandLine.arguments.contains("--dark") ? .darkAqua : .aqua)
             let requested = URL(fileURLWithPath: directory, isDirectory: true)
             let rig = SnapshotCommand(requested: requested, output: writableDirectory(requested: requested))
             let status = await rig.runAll()
