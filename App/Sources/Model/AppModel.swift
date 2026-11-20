@@ -118,7 +118,7 @@ final class AppModel {
         let world = await FakeWorld.build(
             accounts: bench?.accounts ?? Self.fakeAccountCount(arguments: arguments),
             traffic: bench?.traffic ?? fakeTraffic, trafficRange: bench.map { _ in 10...20 },
-            notifications: NotificationCenterPoster(isFake: true),
+            notifications: notificationPoster(isFake: true),
             timing: bench == nil ? FakeWorld.timing() : SessionTiming())
         self.world = world
         for entry in world.entries { attach(entry.info, entry.session) }
@@ -129,7 +129,7 @@ final class AppModel {
     private func bootLive(promptForNotifications: Bool) async {
         if promptForNotifications { await NotificationCenterPoster.requestOnFirstLaunch() }
         let live = LiveAccounts(
-            root: LiveAccounts.defaultRoot(), notifications: NotificationCenterPoster(isFake: false))
+            root: LiveAccounts.defaultRoot(), notifications: notificationPoster(isFake: false))
         self.live = live
         AttachmentStaging.prune()
         savedClientProject = live.storedClient.map(Self.projectLabel)

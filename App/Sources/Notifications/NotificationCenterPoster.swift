@@ -11,8 +11,13 @@ final class NotificationCenterPoster: NotificationPoster {
     static let fakeKey = "fakeNotifications"
 
     let isFake: Bool
+    /// The account's name for the subtitle, or nil when it goes without (a single account).
+    let subtitle: @MainActor @Sendable (AccountID) -> String?
 
-    init(isFake: Bool) { self.isFake = isFake }
+    init(isFake: Bool, subtitle: @escaping @MainActor @Sendable (AccountID) -> String? = { _ in nil }) {
+        self.isFake = isFake
+        self.subtitle = subtitle
+    }
 
     /// Fake worlds only notify when the Developer setting is on, so traffic never spams by default.
     private var allowed: Bool {
@@ -28,6 +33,7 @@ final class NotificationCenterPoster: NotificationPoster {
         guard status == .authorized || status == .provisional else { return }
         let content = UNMutableNotificationContent()
         content.title = RemoteText.title(request.title)
+        if let subtitle = await subtitle(request.account) { content.subtitle = subtitle }
         content.body = RemoteText.clean(request.body, limit: 200, keepLineBreaks: false)
         content.threadIdentifier = request.threadIdentifier
         content.userInfo = ["account": request.account.description, "space": request.space.rawValue]
@@ -110,6 +116,19 @@ final class NotificationCenterPoster: NotificationPoster {
             ?? false
         UserDefaults.standard.set(granted, forKey: enabledKey)
         return granted
+    }
+}
+
+extension AppModel {
+    /// A poster that reads account names from this model.
+    func notificationPoster(isFake: Bool) -> NotificationCenterPoster {
+        NotificationCenterPoster(isFake: isFake) { [weak self] account in self?.notificationSubtitle(for: account) }
+    }
+
+    /// With more than one account signed in, a notification names its account so people know which one it's for.
+    func notificationSubtitle(for account: AccountID) -> String? {
+        guard accounts.count > 1, let info = info(account) else { return nil }
+        return RemoteText.title(info.name)
     }
 }
 

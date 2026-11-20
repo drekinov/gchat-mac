@@ -44,6 +44,9 @@ struct SettingsView: View {
     let model: AppModel
     @State private var tab: SettingsTab
 
+    /// One size for every tab, so the window doesn't jump while switching.
+    static let size = NSSize(width: 620, height: 480)
+
     init(model: AppModel, initialTab: SettingsTab = .general) {
         self.model = model
         _tab = State(initialValue: initialTab)
@@ -61,7 +64,7 @@ struct SettingsView: View {
                 .tabItem { Label("Notifications", systemImage: "bell") }
                 .tag(SettingsTab.notifications)
             AppearanceSettings()
-                .tabItem { Label("Appearance", systemImage: "paintbrush") }
+                .tabItem { Label("Appearance", systemImage: "circle.lefthalf.filled") }
                 .tag(SettingsTab.appearance)
             #if DEBUG
                 DeveloperSettings(model: model)
@@ -69,7 +72,7 @@ struct SettingsView: View {
                     .tag(SettingsTab.developer)
             #endif
         }
-        .frame(width: 580, height: 440)
+        .frame(width: Self.size.width, height: Self.size.height)
     }
 }
 
@@ -82,92 +85,29 @@ struct AccountsSettings: View {
     private var accountOperationInProgress: Bool { model.isSigningIn || model.removingAccount != nil }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if model.accounts.isEmpty {
-                ContentUnavailableView("No accounts", systemImage: "person.crop.circle")
-            } else {
-                List(model.accounts) { info in
-                    HStack(spacing: 10) {
-                        AccountBadge(info: info, size: 22)
-                        if editing == info.id {
-                            TextField("Name", text: $draft, prompt: Text(info.email ?? "Name"))
-                                .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: 220)
-                                .onSubmit { commit(info.id) }
-                                .onExitCommand { editing = nil }
-                        } else {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(RemoteText.title(info.name)).font(.body.weight(.medium))
-                                if let email = info.email, email != info.name {
-                                    Text(email).font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        Spacer()
-                        Circle().fill(statusColor(model.status(info.id))).frame(width: 8, height: 8)
-                        Text(model.status(info.id).label).foregroundStyle(.secondary)
-                        Button {
-                            if editing == info.id {
-                                commit(info.id)
-                            } else {
-                                draft = info.name == info.email ? "" : info.name
-                                editing = info.id
-                            }
-                        } label: {
-                            Image(systemName: editing == info.id ? "checkmark" : "pencil")
-                        }
-                        .buttonStyle(.borderless)
-                        .help(editing == info.id ? "Save name" : "Rename")
-                        if model.live != nil {
-                            Menu {
-                                if !model.pendingRemoval.contains(info.id) {
-                                    Button("Reconnect to Google…") { model.startReconnect(info) }
-                                    Button("Reconnect using a client file…") {
-                                        model.startReconnect(info, newClient: true)
-                                    }
-                                }
-                                Button("Remove from this Mac…", role: .destructive) { removal = info }
-                            } label: {
-                                Image(systemName: "ellipsis.circle")
-                            }
-                            .menuStyle(.borderlessButton)
-                            .fixedSize()
-                            .accessibilityLabel("Manage \(RemoteText.title(info.name))")
-                            .disabled(accountOperationInProgress)
-                        }
-                    }
-                    .padding(.vertical, 3)
+        Form {
+            Section {
+                if model.accounts.isEmpty {
+                    Label("No accounts yet", systemImage: "person.crop.circle").foregroundStyle(.secondary)
                 }
-                .listStyle(.bordered)
-            }
-            HStack {
-                if model.isSigningIn {
-                    ProgressView().controlSize(.small)
-                    Text("Waiting for the browser…")
-                    Button("Cancel") { model.cancelSignIn() }
-                } else {
-                    Menu("+ Add account") {
-                        if let project = model.savedClientProject {
-                            Button("Using the saved client (\(project))") { model.startAddAccount() }
-                        }
-                        Button("Using a client file…") { model.startAddAccount(newClient: true) }
-                    }
-                    .fixedSize()
-                    .disabled(model.live == nil || accountOperationInProgress)
+                ForEach(model.accounts) { info in
+                    row(info)
                 }
-                if model.removingAccount != nil {
-                    ProgressView().controlSize(.small)
-                    Text("Removing account…")
+            } footer: {
+                VStack(alignment: .leading, spacing: 12) {
+                    addAccountBar
+                    Text(
+                        "Each account has a letter and colour. They mark its chats in the sidebar when you show all "
+                            + "accounts, and the account you send from."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer()
-                if let error = model.signInError {
-                    Text(error).font(.caption).foregroundStyle(.red)
-                } else if model.isFake {
-                    Text("Sample data mode").font(.caption).foregroundStyle(.secondary)
-                }
+                .padding(.top, 4)
             }
         }
-        .padding(20)
+        .formStyle(.grouped)
         .confirmationDialog(
             "Remove this account from this Mac?",
             isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }),
@@ -185,49 +125,175 @@ struct AccountsSettings: View {
         }
     }
 
+    private func row(_ info: AccountInfo) -> some View {
+        let status = model.status(info.id)
+        let canReconnect = model.live != nil && !model.pendingRemoval.contains(info.id)
+        let isEditing = editing == info.id
+        return HStack(spacing: 12) {
+            AccountBadge(info: info, size: 28)
+            if isEditing {
+                TextField("Name", text: $draft, prompt: Text(info.email ?? "Name"))
+                    .textFieldStyle(.roundedBorder)
+                    .labelsHidden()
+                    .frame(maxWidth: 220)
+                    .onSubmit { commit(info.id) }
+                    .onExitCommand { editing = nil }
+            } else {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(RemoteText.title(info.name)).fontWeight(.medium).lineLimit(1)
+                    if let email = info.email, email != info.name {
+                        Text(RemoteText.title(email)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+            }
+            Spacer(minLength: 8)
+            HStack(spacing: 6) {
+                Circle().fill(status.dotColor).frame(width: 8, height: 8)
+                Text(status.settingsLabel).font(.callout).foregroundStyle(status.labelColor).lineLimit(1)
+            }
+            .accessibilityElement(children: .combine)
+            if status == .needsLogin, canReconnect {
+                Button("Sign in again…") { model.startReconnect(info) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(accountOperationInProgress)
+            }
+            Button {
+                if isEditing {
+                    commit(info.id)
+                } else {
+                    draft = info.name == info.email ? "" : info.name
+                    editing = info.id
+                }
+            } label: {
+                Image(systemName: isEditing ? "checkmark" : "pencil").frame(width: 14)
+            }
+            .help(isEditing ? "Save name" : "Rename")
+            .accessibilityLabel(isEditing ? "Save name" : "Rename \(RemoteText.title(info.name))")
+            if model.live != nil {
+                Menu {
+                    if canReconnect {
+                        Button("Reconnect to Google…") { model.startReconnect(info) }
+                        Button("Reconnect using a client file…") {
+                            model.startReconnect(info, newClient: true)
+                        }
+                    }
+                    Button("Remove from this Mac…", role: .destructive) { removal = info }
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuStyle(.button)
+                .buttonStyle(.bordered)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("More")
+                .accessibilityLabel("Manage \(RemoteText.title(info.name))")
+                .disabled(accountOperationInProgress)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var addAccountBar: some View {
+        HStack(spacing: 8) {
+            if model.isSigningIn {
+                ProgressView().controlSize(.small)
+                Text("Waiting for the browser…")
+                Button("Cancel") { model.cancelSignIn() }
+            } else {
+                Menu {
+                    if let project = model.savedClientProject {
+                        Button("Using the saved client (\(project))") { model.startAddAccount() }
+                    }
+                    Button("Using a client file…") { model.startAddAccount(newClient: true) }
+                } label: {
+                    Label("Add Account", systemImage: "plus")
+                }
+                .fixedSize()
+                .disabled(model.live == nil || accountOperationInProgress)
+            }
+            if model.removingAccount != nil {
+                ProgressView().controlSize(.small)
+                Text("Removing account…")
+            }
+            Spacer(minLength: 8)
+            if let error = model.signInError {
+                Text(error).font(.caption).foregroundStyle(Theme.error).fixedSize(horizontal: false, vertical: true)
+            } else if model.isFake {
+                Text("Sample data mode").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .foregroundStyle(.primary)
+    }
+
     private func commit(_ id: AccountID) {
         model.rename(id, to: draft)
         editing = nil
     }
+}
 
-    private func statusColor(_ status: AccountStatus) -> Color {
-        switch status {
-        case .ok, .syncing: .green
-        case .starting, .closing: .gray
-        case .offline, .backingOff: .orange
-        case .needsLogin, .failed: .red
+extension AccountStatus {
+    /// Plain words for the Accounts tab; the sidebar and debug panel keep their shorter labels.
+    fileprivate var settingsLabel: String {
+        switch self {
+        case .starting: "Connecting…"
+        case .ok: "Up to date"
+        case .syncing: "Syncing…"
+        case .offline: "Offline"
+        case .backingOff: "Retrying soon"
+        case .needsLogin: "Needs sign-in"
+        case .failed(let reason): "Not working (\(reason))"
+        case .closing: "Signing out…"
         }
     }
+
+    fileprivate var dotColor: Color {
+        switch self {
+        case .ok, .syncing: Self.okColor
+        case .starting, .closing: Color.secondary
+        case .offline, .backingOff, .needsLogin: Theme.warning
+        case .failed: Theme.error
+        }
+    }
+
+    fileprivate var labelColor: Color {
+        switch self {
+        case .needsLogin: Theme.warning
+        case .failed: Theme.error
+        default: Color.secondary
+        }
+    }
+
+    private static let okColor = Theme.dynamic(light: 0x2E_7A4F, dark: 0x7C_C49A)
 }
 
 struct GeneralSettings: View {
     @State private var status: SMAppService.Status = SMAppService.mainApp.status
     @State private var failure: String?
-    @AppStorage(AppModel.historyLimitKey) private var historyLimit = 2000
 
     var body: some View {
         Form {
-            Picker("Older messages per conversation", selection: $historyLimit) {
-                ForEach(AppModel.historyLimits, id: \.self) { Text($0.formatted()).tag($0) }
-            }
-            Text(
-                "Scrolling up loads earlier messages up to this many. Only the open conversation keeps them in memory."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            Toggle("Launch at login", isOn: loginBinding)
-            if status == .requiresApproval {
-                Text("Approve Thimble in System Settings > General > Login Items.").font(.caption)
+            Section {
+                Toggle("Launch at login", isOn: loginBinding)
+                if let failure {
+                    Text(failure).foregroundStyle(Theme.error)
+                }
+            } footer: {
+                Text("Thimble keeps running in the menu bar, so notifications arrive while the window is closed.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
             }
-            if let failure { Text(failure).font(.caption).foregroundStyle(.red) }
-            Text("Thimble keeps running in the menu bar, so notifications arrive while the window is closed.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if status == .requiresApproval {
+                Section {
+                    WarningRow(
+                        title: "macOS needs your approval to open Thimble at login.",
+                        detail: "Approve Thimble in System Settings, General, Login Items."
+                    ) {
+                        Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
-        .padding(20)
         .onAppear { status = SMAppService.mainApp.status }
     }
 
@@ -246,6 +312,30 @@ struct GeneralSettings: View {
     }
 }
 
+/// A form row that needs the person to act somewhere else: warning sign, explanation, one button.
+private struct WarningRow<Action: View>: View {
+    let title: String
+    var detail: String?
+    @ViewBuilder var action: Action
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.warning)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                if let detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            action
+        }
+    }
+}
+
 struct NotificationsSettings: View {
     @AppStorage(NotificationCenterPoster.enabledKey) private var enabled = false
     @State private var authorization: UNAuthorizationStatus?
@@ -257,63 +347,67 @@ struct NotificationsSettings: View {
         self.statusOverride = statusOverride
     }
 
+    /// Google's space settings ALL, MAIN_CONVERSATIONS, FOR_YOU and OFF (or muted), in plain words.
     private let rows: [(setting: String, behaviour: String)] = [
-        ("ALL", "Every message from others."),
-        ("MAIN_CONVERSATIONS", "Top-level messages, plus replies in threads where I posted or was mentioned."),
-        ("FOR_YOU", "@mentions of me or @all, plus all direct messages."),
-        ("OFF / muted", "Nothing."),
+        ("All messages", "Every message from others."),
+        ("Main conversations", "Top-level messages, plus replies in threads where you posted or were mentioned."),
+        ("For you", "@mentions of you or @all, plus all direct messages."),
+        ("Off or muted", "Nothing."),
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Toggle("Enable notifications", isOn: enableBinding)
-            if denied || (statusOverride ?? authorization) == .denied {
-                HStack {
-                    Text("Notifications are turned off for Thimble in System Settings.").font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button("Open System Settings") {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
-                        {
-                            NSWorkspace.shared.open(url)
+        Form {
+            Section {
+                Toggle("Enable notifications", isOn: enableBinding)
+                if denied || (statusOverride ?? authorization) == .denied {
+                    WarningRow(title: "Notifications are turned off for Thimble in System Settings.") {
+                        Button("Open System Settings") {
+                            if let url = URL(
+                                string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+                            {
+                                NSWorkspace.shared.open(url)
+                            }
                         }
                     }
-                    .controlSize(.small)
                 }
-            }
-            HStack(alignment: .firstTextBaseline) {
-                Button("Send Test Notification") {
-                    Task { testResult = await NotificationCenterPoster.sendTest() }
-                }
-                if let testResult {
-                    Text(testResult).font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            Divider()
-            Text("What each space setting will notify for").font(.headline)
-            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 16, verticalSpacing: 8) {
-                ForEach(rows, id: \.setting) { row in
-                    GridRow {
-                        Text(row.setting).font(.callout.monospaced())
-                        Text(row.behaviour).font(.callout).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Send a test notification")
+                        if let testResult {
+                            Text(testResult).font(.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    Button("Send Test") {
+                        Task { testResult = await NotificationCenterPoster.sendTest() }
                     }
                 }
             }
-            Text(
-                "Never notified: silent messages, my own messages, the space that is open, and messages from before "
-                    + "the first sync of an account."
-            )
-            .font(.callout)
-            Text(
-                "This approximates Google's behaviour. The Chat API does not expose per-thread follow state, so "
-                    + "Thimble cannot match it exactly."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            Spacer()
+            Section {
+                ForEach(rows, id: \.setting) { row in
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text(row.setting).fontWeight(.medium).frame(width: 140, alignment: .leading)
+                        Text(row.behaviour).font(.callout).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            } header: {
+                Text("What each space setting notifies you about")
+            } footer: {
+                Text(
+                    "You're never notified about silent messages, your own messages, the conversation you have open, "
+                        + "or messages from before an account's first sync. This follows Google's rules as closely as "
+                        + "the Chat API allows; it can't see which threads you follow."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .padding(20)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .formStyle(.grouped)
         .task {
             authorization = await NotificationCenterPoster.authorizationStatus()
         }
@@ -349,31 +443,43 @@ struct AppearanceSettings: View {
     @AppStorage(AppAppearance.key) private var appearance = AppAppearance.system
     @AppStorage("sidebarDensity") private var density = SidebarDensity.comfortable
     @AppStorage("inlineImagePreviews") private var inlinePreviews = false
+    @AppStorage(AppModel.historyLimitKey) private var historyLimit = 2000
 
     var body: some View {
         Form {
-            Picker("Appearance", selection: $appearance) {
-                ForEach(AppAppearance.allCases) { Text($0.title).tag($0) }
+            Section {
+                Picker(selection: $appearance) {
+                    ForEach(AppAppearance.allCases) { Text($0.title).tag($0) }
+                } label: {
+                    Text("Appearance")
+                    Text("Auto follows the system setting.")
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: appearance) { _, new in new.apply() }
+                Picker(selection: $density) {
+                    ForEach(SidebarDensity.allCases) { Text($0.title).tag($0) }
+                } label: {
+                    Text("Sidebar")
+                    Text("Compact hides the message preview and tightens the rows.")
+                }
+                .pickerStyle(.segmented)
             }
-            .pickerStyle(.segmented)
-            .onChange(of: appearance) { _, new in new.apply() }
-            Text("Auto follows the system setting.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Toggle("Show image previews inline", isOn: $inlinePreviews)
-            Text("Off shows images and GIFs as small file chips; click one to preview it. On loads them in the thread.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Picker("Sidebar density", selection: $density) {
-                ForEach(SidebarDensity.allCases) { Text($0.title).tag($0) }
+            Section {
+                Toggle(isOn: $inlinePreviews) {
+                    Text("Show images in the conversation")
+                    Text("Off shows images and GIFs as small file chips. Click one to preview it.")
+                }
+                Picker(selection: $historyLimit) {
+                    ForEach(AppModel.historyLimits, id: \.self) { Text($0.formatted()).tag($0) }
+                } label: {
+                    Text("Older messages per conversation")
+                    Text(
+                        "Scrolling up loads earlier messages up to this many. Only the open conversation keeps "
+                            + "them in memory.")
+                }
             }
-            .pickerStyle(.segmented)
-            Text("Compact hides the last-message preview and tightens the rows. It applies immediately.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
-        .padding(20)
     }
 }
 
@@ -388,26 +494,33 @@ struct AppearanceSettings: View {
 
         var body: some View {
             Form {
-                Section("Fake accounts") {
-                    Stepper("Accounts: \(accountCount)", value: $accountCount, in: 1...FakeScript.maxAccounts)
-                    Text(
-                        "Applies on relaunch. A --fake-accounts N launch argument overrides this. "
-                            + (model.isFake ? "Fake mode is active." : "Fake mode is not active in this launch.")
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    Button("Relaunch now") { Self.relaunch() }
+                Section {
+                    Stepper(value: $accountCount, in: 1...FakeScript.maxAccounts) {
+                        Text("Accounts: \(accountCount)")
+                        Text(
+                            "Applies on relaunch. A --fake-accounts N launch argument overrides this. "
+                                + (model.isFake ? "Sample data is active." : "Sample data isn't active in this launch.")
+                        )
+                    }
+                    LabeledContent("Relaunch with sample data") {
+                        Button("Relaunch Now") { Self.relaunch() }
+                    }
+                } header: {
+                    Text("Sample data")
                 }
-                Section("Background traffic") {
-                    Toggle("Post new messages", isOn: $trafficEnabled)
+                Section {
+                    Toggle(isOn: $trafficEnabled) {
+                        Text("Post new messages")
+                        Text("Takes effect on the next message.")
+                    }
                     Stepper("Shortest gap: \(Int(trafficMin)) s", value: $trafficMin, in: 1...300, step: 5)
                     Stepper("Longest gap: \(Int(trafficMax)) s", value: $trafficMax, in: 1...300, step: 5)
-                    Text("Takes effect on the next message.").font(.caption).foregroundStyle(.secondary)
-                    Toggle("Fake notifications", isOn: $fakeNotifications)
-                    Text("Posts real system notifications for fake traffic. Needs Notifications enabled.").font(
-                        .caption
-                    )
-                    .foregroundStyle(.secondary)
+                    Toggle(isOn: $fakeNotifications) {
+                        Text("Fake notifications")
+                        Text("Posts real system notifications for sample traffic. Needs Notifications enabled.")
+                    }
+                } header: {
+                    Text("Background traffic")
                 }
             }
             .formStyle(.grouped)
