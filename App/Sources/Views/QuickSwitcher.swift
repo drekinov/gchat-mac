@@ -127,27 +127,8 @@ private struct ConversationIcon: View {
             .padding(.trailing, 2)
     }
 
-    @ViewBuilder
+    /// The sidebar's picture for the conversation, so a chat looks the same in both places.
     private var picture: some View {
-        switch kind {
-        case .directMessage:
-            Avatar(name: title, size: size)
-        case .space, .group, .bot:
-            Image(systemName: symbol)
-                .font(.system(size: size * 0.42, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: size, height: size)
-                .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: size * 0.28))
-                .accessibilityHidden(true)
-        }
-    }
-
-    private var symbol: String {
-        switch kind {
-        case .space: "number"
-        case .group: "person.2.fill"
-        case .bot: "cpu"
-        case .directMessage: "person.fill"
-        }
+        SpaceAvatar(title: title, kind: kind, size: size)
     }
 }
