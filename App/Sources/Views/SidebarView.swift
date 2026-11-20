@@ -84,12 +84,13 @@ struct SidebarHeader: View {
 
 struct SidebarSearchField: View {
     @Binding var text: String
+    var prompt = "Search"
 
     var body: some View {
         HStack(spacing: 5) {
             Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            TextField("Search", text: $text)
+            TextField(prompt, text: $text)
                 .textFieldStyle(.plain)
                 .onExitCommand { text = "" }
             if !text.isEmpty {

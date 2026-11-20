@@ -85,6 +85,16 @@
             }
             model.accountFilter = nil
 
+            model.prepareMentions(for: threaded.id)
+            await model.waitUntilSettled(timeout: .seconds(3))
+            let members = await model.memberships(for: threaded.id)
+            print("snapshot: members of the threaded space: \(members.count)")
+            await window(
+                "27-members.png",
+                MembersPopover(model: model, key: threaded.id, members: members) {}
+                    .background(Color(nsColor: .windowBackgroundColor)),
+                NSSize(width: 340, height: 520))
+
             await window(
                 "26-message-search.png", MessageSearchSheet(model: model, initialQuery: "release"),
                 NSSize(width: 650, height: 490))

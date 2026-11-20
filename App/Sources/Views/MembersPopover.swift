@@ -28,7 +28,7 @@ struct MembersPopover: View {
             .padding(.bottom, 10)
             .padding(.horizontal, 16)
 
-            SidebarSearchField(text: $query)
+            SidebarSearchField(text: $query, prompt: "Find a member")
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
 
