@@ -272,6 +272,8 @@ struct MessageList: View {
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .background(Color(nsColor: .textBackgroundColor))
+            // The stronger edge effect hides messages that scroll under the toolbar, so its title stays readable.
+            .scrollEdgeEffectStyle(.hard, for: .top)
             .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in
                 let atBottom = new.contentOffset.y + new.containerSize.height >= new.contentSize.height - 24
                 if new.contentSize.height == old.contentSize.height {

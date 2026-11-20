@@ -45,10 +45,13 @@ struct MessageSearchSheet: View {
                 .padding(.trailing, 16)
                 .padding(.bottom, 12)
             Divider()
+            // The empty states fill the space below the search field, so the field stays at the top of the sheet.
             if query.isEmpty {
                 ContentUnavailableView("Search your messages", systemImage: "magnifyingglass")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if query.unicodeScalars.count > 1000 {
                 ContentUnavailableView("Use 1,000 characters or fewer", systemImage: "text.magnifyingglass")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 HStack(spacing: 0) {
                     results.frame(width: 330)
@@ -64,7 +67,7 @@ struct MessageSearchSheet: View {
                 }
             }
         }
-        .frame(width: Self.size.width, height: Self.size.height)
+        .frame(width: Self.size.width, height: Self.size.height, alignment: .top)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { focused = true }
         .onChange(of: model.accounts.map(\.id)) {

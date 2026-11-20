@@ -320,6 +320,8 @@ final class AppModel {
         sessions[id] = nil
         snapshots[id] = nil
         photoURLs[id] = nil
+        spaceFaces = spaceFaces.filter { $0.key.account != id }
+        facesWarmed.remove(id)
         lastMarked = lastMarked.filter { $0.key.account != id }
     }
 
@@ -414,10 +416,53 @@ final class AppModel {
         let previous = snapshots[id]
         if let previous, snapshot.generation < previous.generation { return }
         snapshots[id] = snapshot
+        warmFaces(id)
 
         guard let key = selection, key.account == id else { return }
         let skipped = previous.map { snapshot.revision > $0.revision + 1 } ?? false
         if snapshot.changedSpaces.contains(key.space) || skipped || !openOutbox.isEmpty { requestReload() }
+    }
+
+    // MARK: Sidebar faces
+
+    /// Two other members of each space and group chat, for the sidebar's overlapping faces.
+    private(set) var spaceFaces: [SpaceKey: [User]] = [:]
+    @ObservationIgnored private var facesWarmed: Set<AccountID> = []
+
+    func photoURL(_ user: UserName, account: AccountID) -> URL? { photoURLs[account]?[user] }
+
+    /// Once per account: shows the faces already cached, fills the cache for spaces in the background (newest first,
+    /// one at a time, skipping lists younger than the cache's two weeks), then shows the rest.
+    private func warmFaces(_ account: AccountID) {
+        guard !facesWarmed.contains(account), let session = sessions[account], let snapshot = snapshots[account],
+            !snapshot.spaces.isEmpty
+        else { return }
+        facesWarmed.insert(account)
+        let epoch = Timestamp(seconds: 0)
+        let recent = snapshot.spaces.sorted { ($0.lastActiveTime ?? epoch) > ($1.lastActiveTime ?? epoch) }
+        let shown = recent.filter { $0.type == .space || $0.type == .groupChat }.map(\.name)
+        let spaces = recent.filter { $0.type == .space }.map(\.name)
+        Task {
+            await refreshFaces(account, session: session, spaces: shown)
+            await session.prepareMembers(in: spaces)
+            await refreshFaces(account, session: session, spaces: shown)
+        }
+    }
+
+    private func refreshFaces(_ account: AccountID, session: AccountSession, spaces: [SpaceName]) async {
+        let found = await StoreReader.faces(session: session, spaces: spaces)
+        guard sessions[account] === session, !found.isEmpty else { return }
+        for (space, users) in found { spaceFaces[SpaceKey(account: account, space: space)] = users }
+        let cached = photoURLs[account] ?? [:]
+        var missing: [UserName] = []
+        for user in found.values.joined() where cached[user.name] == nil && !missing.contains(user.name) {
+            missing.append(user.name)
+        }
+        guard !missing.isEmpty else { return }
+        let photos = await session.photos.load(missing)
+        if !photos.isEmpty, sessions[account] === session {
+            photoURLs[account, default: [:]].merge(photos) { $1 }
+        }
     }
 
     // MARK: Selection

@@ -325,6 +325,20 @@ public actor AccountSession {
         }
     }
 
+    /// Fills the member cache for `spaces`, one at a time and only where it is missing or stale, for the sidebar's
+    /// pictures. Returns when done; the first error ends the pass, so a rate limit isn't hit again and again.
+    public func prepareMembers(in spaces: [SpaceName]) async {
+        for space in spaces {
+            guard let generation = gate.current, admitted else { return }
+            do throws(SyncError) {
+                try await contacts.ensureMembers(in: space, generation)
+            } catch {
+                handle(error, generation, space: space)
+                return
+            }
+        }
+    }
+
     /// Fills the member cache used by `contacts.fromChats()`; call when the new-message sheet opens.
     public func refreshContacts() {
         guard let generation = gate.current, admitted else { return }

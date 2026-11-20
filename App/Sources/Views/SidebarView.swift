@@ -80,7 +80,9 @@ struct SidebarView: View {
             } label: {
                 InboxRow(
                     entry: entry, account: model.info(entry.account), kind: model.kind(of: entry),
-                    showsBadge: showsBadges, isSelected: selected, density: density
+                    showsBadge: showsBadges, isSelected: selected, density: density,
+                    faces: model.spaceFaces[entry.id], media: model.mediaLoader(for: entry.account),
+                    photoURL: { model.photoURL($0, account: entry.account) }
                 )
                 .padding(.horizontal, 4)
                 .padding(.vertical, 3)
@@ -270,6 +272,10 @@ struct InboxRow: View {
     let showsBadge: Bool
     let isSelected: Bool
     var density = SidebarDensity.comfortable
+    /// Two members, drawn overlapping in place of a space's letter once its member list is cached.
+    var faces: [User]?
+    var media: MediaLoader?
+    var photoURL: (UserName) -> URL? = { _ in nil }
 
     var body: some View {
         let summary = entry.summary
@@ -310,7 +316,7 @@ struct InboxRow: View {
     }
 
     private func avatar(_ title: String, size: CGFloat) -> some View {
-        SpaceAvatar(title: title, kind: kind, size: size)
+        picture(title, size: size)
             .overlay(alignment: .bottomTrailing) {
                 if showsBadge {
                     AccountBadge(info: account, size: size > 30 ? 16 : 13)
@@ -319,6 +325,15 @@ struct InboxRow: View {
                         .offset(x: 4, y: 4)
                 }
             }
+    }
+
+    @ViewBuilder
+    private func picture(_ title: String, size: CGFloat) -> some View {
+        if let faces, faces.count >= 2, kind == .space || kind == .group {
+            FaceStack(users: faces, media: media, photoURL: photoURL, size: size)
+        } else {
+            SpaceAvatar(title: title, kind: kind, size: size)
+        }
     }
 
     private func preview(_ summary: SpaceSummary) -> String {
@@ -333,6 +348,33 @@ struct InboxRow: View {
         if entry.hasUnread { parts.append("\(entry.unread) unread") }
         if entry.isMuted { parts.append("muted") }
         return parts.joined(separator: ", ")
+    }
+}
+
+/// Two people's pictures, one up and to the left, the other overlapping it down and to the right.
+struct FaceStack: View {
+    let users: [User]
+    var media: MediaLoader?
+    var photoURL: (UserName) -> URL?
+    var size: CGFloat = 38
+
+    var body: some View {
+        let small = (size * 0.66).rounded()
+        ZStack {
+            face(users[0], small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            face(users[1], small)
+                .padding(1.5)
+                .background(Color(nsColor: .windowBackgroundColor), in: Circle())
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+
+    private func face(_ user: User, _ size: CGFloat) -> some View {
+        PhotoAvatar(
+            name: RemoteText.title(user.displayName ?? ""), url: photoURL(user.name), media: media, size: size)
     }
 }
 
