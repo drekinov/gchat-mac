@@ -240,15 +240,7 @@ struct MessageRow: View {
                     } else if context.showsAvatars {
                         avatar
                     }
-                    bubbleStack(message, mine: mine)
-                        .overlay(alignment: mine ? .topLeading : .topTrailing) {
-                            if showsBar {
-                                actionBar(message)
-                                    .alignmentGuide(mine ? .leading : .trailing) {
-                                        mine ? $0[.trailing] + 6 : $0[.leading] - 6
-                                    }
-                            }
-                        }
+                    bubbleStack(message, mine: mine, showsBar: showsBar)
                     if !mine { Spacer(minLength: 56) }
                 }
                 extras(message, mine: mine).padding(.leading, indent)
@@ -289,7 +281,7 @@ struct MessageRow: View {
 
     /// The bubble and what belongs to it: cards, GIFs and attachments.
     @ViewBuilder
-    private func bubbleStack(_ message: Message, mine: Bool) -> some View {
+    private func bubbleStack(_ message: Message, mine: Bool, showsBar: Bool) -> some View {
         VStack(alignment: mine ? .trailing : .leading, spacing: 4) {
             if message.isDeleted {
                 Text("Message deleted").italic().foregroundStyle(.secondary)
@@ -298,6 +290,13 @@ struct MessageRow: View {
                     .overlay(Bubble().strokeBorder(Color.secondary.opacity(0.35), style: StrokeStyle(dash: [4])))
             } else {
                 liveContent(message, mine: mine)
+            }
+        }
+        // The actions sit just outside the bubble, so they attach before the width limit widens the stack.
+        .overlay(alignment: mine ? .topLeading : .topTrailing) {
+            if showsBar {
+                actionBar(message)
+                    .alignmentGuide(mine ? .leading : .trailing) { mine ? $0[.trailing] + 6 : $0[.leading] - 6 }
             }
         }
         .frame(maxWidth: 580, alignment: mine ? .trailing : .leading)
