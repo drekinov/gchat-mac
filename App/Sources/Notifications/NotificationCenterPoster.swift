@@ -54,6 +54,41 @@ final class NotificationCenterPoster: NotificationPoster {
         center.removePendingNotificationRequests(withIdentifiers: identifiers)
     }
 
+    /// Posts a sample notification past every in-app rule and explains what could still hide it.
+    static func sendTest() async -> String {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional:
+            break
+        case .notDetermined:
+            return "Thimble hasn't asked for permission yet. Turn on Enable notifications first."
+        default:
+            return "Notifications are off for Thimble in System Settings › Notifications."
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Thimble"
+        content.body = "Test notification"
+        content.sound = .default
+        do {
+            try await center.add(UNNotificationRequest(identifier: "test|\(UUID())", content: content, trigger: nil))
+        } catch {
+            return "macOS refused the notification: \(error.localizedDescription)"
+        }
+        var notes: [String] = []
+        if settings.alertStyle == .none || settings.alertSetting == .disabled {
+            notes.append("the alert style for Thimble is None, so it only lands in Notification Centre")
+        }
+        if settings.badgeSetting != .enabled {
+            notes.append("Badge application icon is off, so the Dock shows no unread count")
+        }
+        if !UserDefaults.standard.bool(forKey: enabledKey) {
+            notes.append("Enable notifications is off here, so chat messages aren't posted")
+        }
+        let tail = "If nothing appeared, check Focus or Do Not Disturb in Control Centre."
+        return notes.isEmpty ? "Sent. \(tail)" : "Sent, but \(notes.joined(separator: "; ")). \(tail)"
+    }
+
     // MARK: Authorization
 
     static func authorizationStatus() async -> UNAuthorizationStatus {

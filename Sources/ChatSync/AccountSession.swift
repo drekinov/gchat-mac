@@ -159,6 +159,20 @@ public actor AccountSession {
         return before.items.reversed() + [hit] + after.items
     }
 
+    /// A page of messages older than `before`, newest last, for display only; nothing is stored.
+    public func olderMessages(
+        in space: SpaceName, before: Timestamp, pageToken: String?
+    ) async throws(SyncError) -> Page<Message> {
+        guard let generation = gate.current else { throw .retired }
+        let page = try await engine.call(.listMessages) { () async throws(ChatAPIError) in
+            try await engine.api.listMessages(
+                in: space, window: .init(before: before), thread: nil, order: .descending, pageSize: 50,
+                showDeleted: false, pageToken: pageToken)
+        }
+        guard gate.isCurrent(generation), !Task.isCancelled else { throw .retired }
+        return Page(items: page.items.reversed(), nextPageToken: page.nextPageToken)
+    }
+
     // MARK: Lifecycle
 
     public func start() {

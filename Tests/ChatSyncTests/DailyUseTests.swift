@@ -137,4 +137,20 @@ struct DailyUseTests {
         #expect(rig.server.requests.allSatisfy { $0.method != "PATCH" })
         #expect(try rig.session.messages(in: rig.space).isEmpty)
     }
+
+    @Test func olderMessagesPageBackFromAFixedBoundaryWithoutStoringAnything() async throws {
+        let rig = try LogoutRig()
+        let posted = (0..<120).map { rig.server.post("message \($0)", in: rig.space, from: .account(rig.user)) }
+        let boundary = posted[100].createTime.adding(.microseconds(1))
+        let first = try await rig.session.olderMessages(in: rig.space, before: boundary, pageToken: nil)
+        #expect(first.items.map(\.name) == posted[51...100].map(\.name))
+        let token = try #require(first.nextPageToken)
+        let second = try await rig.session.olderMessages(in: rig.space, before: boundary, pageToken: token)
+        #expect(second.items.map(\.name) == posted[1...50].map(\.name))
+        let last = try await rig.session.olderMessages(
+            in: rig.space, before: boundary, pageToken: try #require(second.nextPageToken))
+        #expect(last.items.last?.name == posted[0].name)
+        #expect(last.nextPageToken == nil)
+        #expect(try rig.session.messages(in: rig.space).isEmpty)
+    }
 }

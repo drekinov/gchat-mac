@@ -12,6 +12,30 @@ enum SidebarDensity: String, CaseIterable, Identifiable {
     var title: String { rawValue.capitalized }
 }
 
+enum AppAppearance: String, CaseIterable, Identifiable {
+    case system, light, dark
+
+    static let key = "appearance"
+
+    var id: String { rawValue }
+    var title: String { self == .system ? "Auto" : rawValue.capitalized }
+
+    @MainActor
+    func apply() {
+        NSApplication.shared.appearance =
+            switch self {
+            case .system: nil
+            case .light: NSAppearance(named: .aqua)
+            case .dark: NSAppearance(named: .darkAqua)
+            }
+    }
+
+    @MainActor
+    static func applyStored() {
+        (UserDefaults.standard.string(forKey: key).flatMap(AppAppearance.init) ?? .system).apply()
+    }
+}
+
 enum SettingsTab: String, CaseIterable {
     case general, accounts, notifications, appearance, developer
 }
@@ -179,9 +203,18 @@ struct AccountsSettings: View {
 struct GeneralSettings: View {
     @State private var status: SMAppService.Status = SMAppService.mainApp.status
     @State private var failure: String?
+    @AppStorage(AppModel.historyLimitKey) private var historyLimit = 2000
 
     var body: some View {
         Form {
+            Picker("Older messages per conversation", selection: $historyLimit) {
+                ForEach(AppModel.historyLimits, id: \.self) { Text($0.formatted()).tag($0) }
+            }
+            Text(
+                "Scrolling up loads earlier messages up to this many. Only the open conversation keeps them in memory."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
             Toggle("Launch at login", isOn: loginBinding)
             if status == .requiresApproval {
                 Text("Approve Thimble in System Settings > General > Login Items.").font(.caption)
@@ -217,6 +250,7 @@ struct NotificationsSettings: View {
     @AppStorage(NotificationCenterPoster.enabledKey) private var enabled = false
     @State private var authorization: UNAuthorizationStatus?
     @State private var denied = false
+    @State private var testResult: String?
     private let statusOverride: UNAuthorizationStatus?
 
     init(statusOverride: UNAuthorizationStatus? = nil) {
@@ -244,6 +278,15 @@ struct NotificationsSettings: View {
                         }
                     }
                     .controlSize(.small)
+                }
+            }
+            HStack(alignment: .firstTextBaseline) {
+                Button("Send Test Notification") {
+                    Task { testResult = await NotificationCenterPoster.sendTest() }
+                }
+                if let testResult {
+                    Text(testResult).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Divider()
@@ -303,11 +346,20 @@ struct NotificationsSettings: View {
 }
 
 struct AppearanceSettings: View {
+    @AppStorage(AppAppearance.key) private var appearance = AppAppearance.system
     @AppStorage("sidebarDensity") private var density = SidebarDensity.comfortable
     @AppStorage("inlineImagePreviews") private var inlinePreviews = false
 
     var body: some View {
         Form {
+            Picker("Appearance", selection: $appearance) {
+                ForEach(AppAppearance.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: appearance) { _, new in new.apply() }
+            Text("Auto follows the system setting.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Toggle("Show image previews inline", isOn: $inlinePreviews)
             Text("Off shows images and GIFs as small file chips; click one to preview it. On loads them in the thread.")
                 .font(.caption)
