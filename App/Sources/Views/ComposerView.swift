@@ -49,6 +49,12 @@ struct ComposerView: View {
             if let problem = model.attachmentError(for: composerID) {
                 Text(problem).font(.caption).foregroundStyle(Theme.error)
             }
+            // Google Chat's per-conversation history setting; the org's retention rules apply only while it's on.
+            if thread == nil, model.summary(for: key)?.historyOn == false {
+                Label("History is off. Messages are deleted after about 24 hours.", systemImage: "timer")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             HStack(alignment: .bottom, spacing: 8) {
                 Button(action: chooseFiles) {
                     Image(systemName: "plus").font(.system(size: 14, weight: .semibold)).foregroundStyle(.secondary)

@@ -108,6 +108,7 @@
                 ("05-reactions-and-emoji.png", "Engineering", wide),
                 ("06-attachments.png", "Releases", NSSize(width: 1280, height: 1500)),
                 ("07-quoted-card-mention.png", "Design Reviews", wide),
+                ("30-history-off.png", "On-call Handover", wide),
             ]
             for item in showcases {
                 if let entry = model.inbox.first(where: { $0.summary.title == item.title }) {

@@ -140,7 +140,7 @@ struct SpaceTitle: View {
     }
 }
 
-/// The conversation's toolbar buttons: its history setting, message search and its details.
+/// The conversation's toolbar buttons: message search and its details.
 struct SpaceActions: View {
     let model: AppModel
     let key: SpaceKey
@@ -148,9 +148,6 @@ struct SpaceActions: View {
     @State private var showsDetails = false
 
     var body: some View {
-        if let historyOn = model.summary(for: key)?.historyOn, !historyOn {
-            HistoryBadge(historyOn: historyOn)
-        }
         Button {
             model.showsMessageSearch = true
         } label: {
@@ -180,22 +177,6 @@ struct GlassCapsule: ViewModifier {
         } else {
             content.glassEffect(.regular, in: .capsule)
         }
-    }
-}
-
-/// Google Chat's per-conversation history setting; the org's retention rules apply only while it's on.
-struct HistoryBadge: View {
-    let historyOn: Bool
-
-    var body: some View {
-        Label(historyOn ? "History on" : "History off", systemImage: historyOn ? "clock.arrow.circlepath" : "timer")
-            .labelStyle(.iconOnly)
-            .font(.callout)
-            .foregroundStyle(historyOn ? Color.secondary : Theme.warning)
-            .help(
-                historyOn
-                    ? "History is on: messages are kept according to your organization's retention policy."
-                    : "History is off: messages are deleted after about 24 hours.")
     }
 }
 

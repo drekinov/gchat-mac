@@ -19,6 +19,7 @@ extension State {
         if !space.displayName.isEmpty { out["displayName"] = space.displayName }
         if space.isSingleUserBotDM { out["singleUserBotDm"] = true }
         if space.isExternalUserAllowed { out["externalUserAllowed"] = true }
+        if let historyOn = space.historyOn { out["spaceHistoryState"] = historyOn ? "HISTORY_ON" : "HISTORY_OFF" }
         if let time = space.lastActiveTime { out["lastActiveTime"] = time.rfc3339 }
         if let time = space.createTime { out["createTime"] = time.rfc3339 }
         return out
