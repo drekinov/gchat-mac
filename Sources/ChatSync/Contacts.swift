@@ -97,6 +97,12 @@ public final class Contacts: Sendable {
         }
     }
 
+    /// Everyone in `space` as cached, including me, apps, invited people and deleted users, for the members list.
+    /// Reads the cache only; `ensureMembers` refreshes it.
+    public func memberships(in space: SpaceName) throws(StoreError) -> [Membership] {
+        try store.members(in: space)
+    }
+
     /// People who can be @-mentioned in `space`: its joined human members other than me, by name.
     public func mentionCandidates(in space: SpaceName) throws(StoreError) -> [Contact] {
         try store.members(in: space)

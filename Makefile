@@ -9,7 +9,7 @@ BENCH_SECONDS ?= 240
 BENCH_FLAGS = $(if $(ACCOUNTS),--bench-accounts $(ACCOUNTS)) $(if $(TRAFFIC),--bench-traffic)
 FORMAT_PATHS = Sources Tests App/Sources Package.swift
 
-.PHONY: icon signing gen build build-release test run fake footprint keychain-probe keychain-acl-check snapshots bench bench-debug format lint clean
+.PHONY: icon signing gen build build-release test run fake footprint keychain-probe keychain-acl-check snapshots snapshots-dark bench bench-debug format lint clean
 
 ICONSET = App/Sources/Assets.xcassets/AppIcon.appiconset
 
@@ -63,6 +63,9 @@ keychain-probe: build
 
 snapshots: build
 	set -o pipefail; $(BIN) --snapshot build/snapshots | python3 -I scripts/decode_snapshots.py build/snapshots
+
+snapshots-dark: build
+	set -o pipefail; $(BIN) --snapshot build/snapshots-dark --dark | python3 -I scripts/decode_snapshots.py build/snapshots-dark
 
 build-release: gen
 	$(XCODEBUILD_RELEASE) build

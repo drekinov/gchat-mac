@@ -128,7 +128,8 @@ extension Wire.ReactionDTO {
             throw .decoding(path: "user.name")
         }
         guard let emoji = emoji?.domain() else { throw .decoding(path: "emoji") }
-        return Reaction(name: name, user: user, emoji: emoji)
+        let displayName = self.user?.displayName.flatMap { $0.isEmpty ? nil : $0 }
+        return Reaction(name: name, user: user, emoji: emoji, userDisplayName: displayName)
     }
 }
 

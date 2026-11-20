@@ -11,6 +11,7 @@ enum FakeScript {
         let messages: Int
         let unread: Int
         var muted = false
+        var historyOff = false
     }
 
     struct Direct {
@@ -45,7 +46,7 @@ enum FakeScript {
                 NamedSpace(title: "Releases", threaded: true, messages: 22, unread: 0),
                 NamedSpace(title: "Design Reviews", threaded: false, messages: 17, unread: 3),
                 NamedSpace(title: "Random", threaded: false, messages: 31, unread: 9, muted: true),
-                NamedSpace(title: "On-call Handover", threaded: false, messages: 8, unread: 0),
+                NamedSpace(title: "On-call Handover", threaded: false, messages: 8, unread: 0, historyOff: true),
                 NamedSpace(title: "Studio Lounge", threaded: false, messages: 4, unread: 1),
             ],
             directs: [

@@ -34,6 +34,13 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("n")
         }
+        CommandGroup(replacing: .sidebar) {
+            Button(model.showsSidebar ? "Hide Sidebar" : "Show Sidebar") {
+                showMainWindow()
+                withAnimation(.smooth(duration: 0.25)) { model.showsSidebar.toggle() }
+            }
+            .keyboardShortcut("s", modifiers: [.control, .command])
+        }
         CommandMenu("Go") {
             Button("Search Messages…") {
                 showMainWindow()

@@ -43,57 +43,86 @@ struct ComposerView: View {
         let items = mentionItems
         let pending = model.attachments(for: composerID)
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                AccountBadge(info: model.info(key.account), size: 14)
-                Text("Sending as \(RemoteText.title(model.info(key.account)?.name ?? "Unknown"))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if let error = model.sendError {
-                    Text(error).font(.caption).foregroundStyle(.red)
-                }
-                Spacer()
-                Text("Return to send, Shift-Return for a new line").font(.caption2).foregroundStyle(.tertiary)
-            }
-            if !pending.isEmpty {
-                PendingAttachmentChips(attachments: pending) { model.removeAttachment($0, from: composerID) }
+            if let error = model.sendError {
+                Text(error).font(.caption).foregroundStyle(Theme.error)
             }
             if let problem = model.attachmentError(for: composerID) {
-                Text(problem).font(.caption).foregroundStyle(.red)
+                Text(problem).font(.caption).foregroundStyle(Theme.error)
+            }
+            // Google Chat's per-conversation history setting; the org's retention rules apply only while it's on.
+            if thread == nil, model.summary(for: key)?.historyOn == false {
+                Label("History is off. Messages are deleted after about 24 hours.", systemImage: "timer")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             HStack(alignment: .bottom, spacing: 8) {
-                editor(items)
                 Button(action: chooseFiles) {
-                    Image(systemName: "paperclip").font(.system(size: 19)).foregroundStyle(.secondary)
+                    Image(systemName: "plus").font(.system(size: 14, weight: .semibold)).foregroundStyle(.secondary)
+                        .frame(width: Self.attachSize, height: Self.attachSize)
+                        .background(Color.primary.opacity(0.07), in: Circle())
+                        .frame(height: Self.rowHeight)
                 }
                 .buttonStyle(.plain)
                 .help("Attach files")
                 .accessibilityLabel("Attach files")
-                Button {
-                    pickerOpen = true
-                } label: {
-                    Image(systemName: "face.smiling").font(.system(size: 20)).foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Add emoji")
-                .accessibilityLabel("Add emoji")
-                .popover(isPresented: $pickerOpen, arrowEdge: .top) {
-                    EmojiPicker(customEmojis: model.customEmojis(for: key.account)) { pick in
-                        insert(pick.insertionText)
-                    } onClose: {
-                        pickerOpen = false
-                        focused = true
+                VStack(alignment: .leading, spacing: 6) {
+                    if !pending.isEmpty {
+                        PendingAttachmentChips(attachments: pending) { model.removeAttachment($0, from: composerID) }
+                            .padding(.top, 6)
+                    }
+                    HStack(alignment: .bottom, spacing: 6) {
+                        if model.accounts.count > 1 {
+                            let account = RemoteText.title(model.info(key.account)?.name ?? "")
+                            AccountBadge(info: model.info(key.account), size: 18)
+                                .frame(height: Self.rowHeight)
+                                .help("Sending from \(account)")
+                                .accessibilityLabel("Sending from \(account)")
+                        }
+                        editor(items)
+                        Button {
+                            pickerOpen = true
+                        } label: {
+                            Image(systemName: "face.smiling").font(.system(size: 17)).foregroundStyle(.secondary)
+                                .frame(width: 26, height: Self.rowHeight)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Add emoji")
+                        .accessibilityLabel("Add emoji")
+                        .popover(isPresented: $pickerOpen, arrowEdge: .top) {
+                            EmojiPicker(customEmojis: model.customEmojis(for: key.account)) { pick in
+                                insert(pick.insertionText)
+                            } onClose: {
+                                pickerOpen = false
+                                focused = true
+                            }
+                        }
+                        Button(action: submit) {
+                            Image(systemName: "arrow.up").font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(canSend ? Theme.onAccent : Color.secondary)
+                                .frame(width: Self.sendSize, height: Self.sendSize)
+                                .background(canSend ? Theme.accent : Color.primary.opacity(0.08), in: Circle())
+                                .frame(height: Self.rowHeight)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!canSend)
+                        .help("Send (Return). Shift-Return adds a new line.")
+                        .accessibilityLabel("Send")
                     }
                 }
-                Button(action: submit) {
-                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(canSend ? Color.accentColor : Color.secondary.opacity(0.5))
-                .disabled(!canSend)
-                .accessibilityLabel("Send")
+                .padding(.leading, 8)
+                .padding(.trailing, Self.sendInset)
+                .background(
+                    Color(nsColor: .textBackgroundColor),
+                    in: RoundedRectangle(cornerRadius: Self.rowHeight / 2)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: Self.rowHeight / 2)
+                        .strokeBorder(Color.secondary.opacity(0.28)))
             }
         }
-        .padding(12)
+        .padding(.horizontal, thread == nil ? 16 : 0)
+        .padding(.top, 6)
+        .padding(.bottom, thread == nil ? 14 : 2)
         .dropDestination(for: DroppedFile.self) { drops, _ in
             model.addDroppedFiles(drops, to: composerID)
         } isTargeted: {
@@ -101,21 +130,20 @@ struct ComposerView: View {
         }
         .overlay {
             if dropTargeted || conversationDropTargeted {
-                RoundedRectangle(cornerRadius: 8).strokeBorder(
-                    Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6])
+                RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(
+                    Theme.accentText, style: StrokeStyle(lineWidth: 2, dash: [6])
                 )
-                .padding(4)
                 .overlay(
-                    Text("Drop to add to message").font(.callout.weight(.medium)).foregroundStyle(Color.accentColor)
+                    Text("Drop to add to message").font(.callout.weight(.medium)).foregroundStyle(Theme.accentText)
                 )
-                .background(Color.accentColor.opacity(0.06))
+                .background(Theme.selection, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .allowsHitTesting(false)
             }
         }
         .overlay(alignment: .topLeading) {
             if !items.isEmpty {
                 MentionPopup(items: items, highlight: popupHighlight, onPick: pickMention)
-                    .padding(.leading, 12)
+                    .padding(.leading, thread == nil ? 60 : 44)
                     .frame(height: 0, alignment: .bottom)
             }
         }
@@ -146,6 +174,7 @@ struct ComposerView: View {
         }
         .onChange(of: selection) { refreshTrigger() }
         .onChange(of: model.droppedTextRevision) { insertDroppedText() }
+        .onChange(of: model.mentionRequestRevision) { insertRequestedMention() }
         .onChange(of: focused) {
             refreshTrigger()
             if focused {
@@ -161,21 +190,22 @@ struct ComposerView: View {
             .background(TextOnlyDrops())
             .font(.body)
             .scrollContentBackground(.hidden)
+            .scrollIndicators(.never)
             .focused($focused)
             .frame(height: editorHeight)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.3)))
             .overlay(alignment: .topLeading) {
                 if text.isEmpty {
-                    Text(thread == nil ? "Message" : "Reply")
+                    Text(placeholder)
                         .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 8)
+                        .lineLimit(1)
+                        .padding(.horizontal, 5)
                         .allowsHitTesting(false)
                 }
             }
+            // The text view draws its first line at its very top, so this centres one line in the row; the
+            // buttons beside it stay level with the last line as the text grows.
+            .padding(.top, (Self.rowHeight - Self.lineHeight) / 2)
+            .padding(.bottom, (Self.rowHeight - Self.lineHeight) / 2 - Self.editorSlack)
             .onKeyPress(.return, phases: .down) { press in
                 if let pick = items[safe: popupHighlight] {
                     pickMention(pick)
@@ -205,6 +235,12 @@ struct ComposerView: View {
                 dismissedAt = trigger.at
                 return .handled
             }
+    }
+
+    private var placeholder: String {
+        guard thread == nil else { return "Reply" }
+        let title = RemoteText.title(model.summary(for: key)?.title ?? "")
+        return title.isEmpty ? "Message" : "Message \(title)"
     }
 
     // MARK: Editing
@@ -290,6 +326,17 @@ struct ComposerView: View {
         selection = TextSelection(insertionPoint: String.Index(utf16Offset: result.caret, in: text))
     }
 
+    /// The members list asked for this person to be mentioned: types "@" at the caret and picks them.
+    private func insertRequestedMention() {
+        guard let contact = model.takeMentionRequest(composerID) else { return }
+        let before = text.last
+        insert(before == nil || before?.isWhitespace == true ? "@" : " @")
+        guard let caret = caretOffset(), let found = mentionEditor.trigger(in: text, caret: caret) else { return }
+        trigger = found
+        pickMention(contact)
+        focused = true
+    }
+
     private var mentionNames: [UserName: String] {
         Dictionary(candidates.compactMap { contact in contact.user.map { ($0, contact.displayName) } }) { first, _ in
             first
@@ -311,9 +358,21 @@ struct ComposerView: View {
         model.addFiles(panel.urls, to: composerID)
     }
 
+    /// The height of one row of the composer: the field with a single line, and the slot each button sits in.
+    static let rowHeight: CGFloat = 40
+    /// The attach button, the same size as the window's glass buttons.
+    static let attachSize: CGFloat = 36
+    static let sendSize: CGFloat = 26
+    /// Space between the send button and the field's right edge.
+    static let sendInset: CGFloat = 8
+    /// The text view's line height for the body font, emoji included.
+    static let lineHeight: CGFloat = 16
+    /// Room below the last line so the text view never needs to scroll by a fraction of a point.
+    static let editorSlack: CGFloat = 2
+
     private var editorHeight: CGFloat {
         let lines = max(1, min(6, text.split(separator: "\n", omittingEmptySubsequences: false).count))
-        return CGFloat(lines) * 18 + 8
+        return CGFloat(lines) * Self.lineHeight + Self.editorSlack
     }
 
     private func scheduleSave() {
@@ -371,17 +430,17 @@ struct MentionPopup: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
                 .background(
-                    index == highlight ? Color.accentColor.opacity(0.22) : .clear, in: RoundedRectangle(cornerRadius: 5)
+                    index == highlight ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 6)
                 )
                 .contentShape(Rectangle())
                 .onTapGesture { onPick(contact) }
             }
         }
-        .padding(4)
+        .padding(5)
         .frame(width: 300)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.35)))
-        .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.secondary.opacity(0.25)))
+        .shadow(color: .black.opacity(0.15), radius: 10, y: 4)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Mention suggestions")
     }

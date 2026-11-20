@@ -78,9 +78,13 @@ final class AppModel {
     private(set) var droppedText: [ComposerID: [String]] = [:]
     /// Bumped on every queued drop, so a second identical drop still reaches the composer.
     private(set) var droppedTextRevision = 0
+    @ObservationIgnored private var mentionRequests: [ComposerID: Contact] = [:]
+    private(set) var mentionRequestRevision = 0
     @ObservationIgnored var activeComposer: ComposerID?
     private(set) var openWindowRequest = 0
     var showsNewMessage = false
+    /// Whether the sidebar island is showing. View > Hide Sidebar and the island's own button change it.
+    var showsSidebar = true
     private(set) var newMessageAccount: AccountID?
     private(set) var pendingComposerFocus: SpaceKey?
 
@@ -116,7 +120,7 @@ final class AppModel {
         let world = await FakeWorld.build(
             accounts: bench?.accounts ?? Self.fakeAccountCount(arguments: arguments),
             traffic: bench?.traffic ?? fakeTraffic, trafficRange: bench.map { _ in 10...20 },
-            notifications: NotificationCenterPoster(isFake: true),
+            notifications: notificationPoster(isFake: true),
             timing: bench == nil ? FakeWorld.timing() : SessionTiming())
         self.world = world
         for entry in world.entries { attach(entry.info, entry.session) }
@@ -127,7 +131,7 @@ final class AppModel {
     private func bootLive(promptForNotifications: Bool) async {
         if promptForNotifications { await NotificationCenterPoster.requestOnFirstLaunch() }
         let live = LiveAccounts(
-            root: LiveAccounts.defaultRoot(), notifications: NotificationCenterPoster(isFake: false))
+            root: LiveAccounts.defaultRoot(), notifications: notificationPoster(isFake: false))
         self.live = live
         AttachmentStaging.prune()
         savedClientProject = live.storedClient.map(Self.projectLabel)
@@ -318,11 +322,26 @@ final class AppModel {
         sessions[id] = nil
         snapshots[id] = nil
         photoURLs[id] = nil
+        spaceFaces = spaceFaces.filter { $0.key.account != id }
+        facesWarmed.remove(id)
         lastMarked = lastMarked.filter { $0.key.account != id }
     }
 
     func scrollOpenSpace(toTop: Bool) {
         scrollCommand = ScrollCommand(sequence: scrollCommand.sequence + 1, toTop: toTop)
+    }
+
+    /// A message the open conversation should scroll to, from the image preview's Show in Chat.
+    private(set) var revealedMessage: MessageName?
+    private(set) var revealSequence = 0
+
+    /// Closes the preview and scrolls to `message`, opening its thread first when it's a reply.
+    func showInConversation(_ message: MessageName) {
+        preview = nil
+        let loaded = openMessages.first { $0.name == message } ?? threadMessages.first { $0.name == message }
+        if let loaded, loaded.isThreadReply, let thread = loaded.thread { openThread(thread) }
+        revealedMessage = message
+        revealSequence += 1
     }
 
     func mediaLoader(for account: AccountID) -> MediaLoader? {
@@ -399,10 +418,53 @@ final class AppModel {
         let previous = snapshots[id]
         if let previous, snapshot.generation < previous.generation { return }
         snapshots[id] = snapshot
+        warmFaces(id)
 
         guard let key = selection, key.account == id else { return }
         let skipped = previous.map { snapshot.revision > $0.revision + 1 } ?? false
         if snapshot.changedSpaces.contains(key.space) || skipped || !openOutbox.isEmpty { requestReload() }
+    }
+
+    // MARK: Sidebar faces
+
+    /// Two other members of each space and group chat, for the sidebar's overlapping faces.
+    private(set) var spaceFaces: [SpaceKey: [User]] = [:]
+    @ObservationIgnored private var facesWarmed: Set<AccountID> = []
+
+    func photoURL(_ user: UserName, account: AccountID) -> URL? { photoURLs[account]?[user] }
+
+    /// Once per account: shows the faces already cached, fills the cache for spaces in the background (newest first,
+    /// one at a time, skipping lists younger than the cache's two weeks), then shows the rest.
+    private func warmFaces(_ account: AccountID) {
+        guard !facesWarmed.contains(account), let session = sessions[account], let snapshot = snapshots[account],
+            !snapshot.spaces.isEmpty
+        else { return }
+        facesWarmed.insert(account)
+        let epoch = Timestamp(seconds: 0)
+        let recent = snapshot.spaces.sorted { ($0.lastActiveTime ?? epoch) > ($1.lastActiveTime ?? epoch) }
+        let shown = recent.filter { $0.type == .space || $0.type == .groupChat }.map(\.name)
+        let spaces = recent.filter { $0.type == .space }.map(\.name)
+        Task {
+            await refreshFaces(account, session: session, spaces: shown)
+            await session.prepareMembers(in: spaces)
+            await refreshFaces(account, session: session, spaces: shown)
+        }
+    }
+
+    private func refreshFaces(_ account: AccountID, session: AccountSession, spaces: [SpaceName]) async {
+        let found = await StoreReader.faces(session: session, spaces: spaces)
+        guard sessions[account] === session, !found.isEmpty else { return }
+        for (space, users) in found { spaceFaces[SpaceKey(account: account, space: space)] = users }
+        let cached = photoURLs[account] ?? [:]
+        var missing: [UserName] = []
+        for user in found.values.joined() where cached[user.name] == nil && !missing.contains(user.name) {
+            missing.append(user.name)
+        }
+        guard !missing.isEmpty else { return }
+        let photos = await session.photos.load(missing)
+        if !photos.isEmpty, sessions[account] === session {
+            photoURLs[account, default: [:]].merge(photos) { $1 }
+        }
     }
 
     // MARK: Selection
@@ -694,6 +756,28 @@ final class AppModel {
     func mentionCandidates(for key: SpaceKey) async -> [Contact] {
         guard let session = sessions[key.account] else { return [] }
         return await StoreReader.mentionCandidates(session: session, space: key.space)
+    }
+
+    /// The space's cached memberships, for the members list. `prepareMentions` refreshes a stale cache.
+    /// The conversation's stored record, for its details: when it was made, guests, notifications.
+    func storedSpace(for key: SpaceKey) async -> StoredSpace? {
+        guard let session = sessions[key.account] else { return nil }
+        return await StoreReader.storedSpace(session: session, space: key.space)
+    }
+
+    func memberships(for key: SpaceKey) async -> [Membership] {
+        guard let session = sessions[key.account] else { return [] }
+        return await StoreReader.memberships(session: session, space: key.space)
+    }
+
+    /// Asks a composer to insert an @-mention, for the members list's Mention button.
+    func requestMention(_ contact: Contact, in id: ComposerID) {
+        mentionRequests[id] = contact
+        mentionRequestRevision += 1
+    }
+
+    func takeMentionRequest(_ id: ComposerID) -> Contact? {
+        mentionRequests.removeValue(forKey: id)
     }
 
     // MARK: New message
@@ -989,13 +1073,17 @@ final class AppModel {
         var context = MessageContext(me: info(key.account)?.me, messages: openMessages)
         context.actions = reactionActions(for: key)
         context.media = mediaLoader(for: key.account)
+        // The thread's messages come second: a reply loaded only for the open thread isn't in the conversation's.
         context.openPreview = { [self] attachment in
             guard let media = mediaLoader(for: key.account) else { return }
-            preview = PreviewTarget(attachment: attachment, media: media)
+            preview = PreviewTarget(
+                attachment: attachment, media: media, messages: [openMessages, threadMessages], space: summary(for: key)
+            )
         }
         context.openGifPreview = { [self] url in
             guard let media = mediaLoader(for: key.account) else { return }
-            preview = PreviewTarget(gifURL: url, media: media)
+            preview = PreviewTarget(
+                gifURL: url, media: media, messages: [openMessages, threadMessages], space: summary(for: key))
         }
         context.photoURL = { [self] in photoURLs[key.account]?[$0] }
         return context
@@ -1006,7 +1094,46 @@ final class AppModel {
             canReact: canReact(key.account),
             isMine: { [self] emoji, message in ownReaction(emoji, on: message) != nil },
             toggle: { [self] emoji, message in Task { await toggleReaction(emoji, on: message, key: key) } },
-            customEmojis: { [self] in customEmojis(for: key.account) })
+            customEmojis: { [self] in customEmojis(for: key.account) },
+            reactors: { [self] message, summaries in await reactors(on: message, key: key, summaries: summaries) },
+            media: mediaLoader(for: key.account))
+    }
+
+    /// Everyone who reacted to a message, by emoji: you first, then in the order Google lists them, each person
+    /// once. Names come from the conversation's members, then from the senders loaded in it.
+    func reactors(on message: MessageName, key: SpaceKey, summaries: [ReactionSummary]) async -> [Emoji: [Reactor]]? {
+        guard let session = sessions[key.account],
+            let list = await session.reactors(on: message, matching: summaries)
+        else { return nil }
+        let members = await StoreReader.memberships(session: session, space: key.space)
+        var names: [UserName: String] = [:]
+        for membership in members {
+            if let name = membership.member.displayName, !name.isEmpty { names[membership.member.name] = name }
+        }
+        names.merge(list.names) { known, _ in known }
+        if list.users.values.joined().contains(where: { names[$0] == nil }) {
+            for contact in await StoreReader.contacts(session: session) {
+                guard let user = contact.user, names[user] == nil, !contact.displayName.isEmpty else { continue }
+                names[user] = contact.displayName
+            }
+        }
+        for sent in openMessages + threadMessages where names[sent.sender.name] == nil {
+            if let name = sent.sender.displayName, !name.isEmpty { names[sent.sender.name] = name }
+        }
+        let users = list.users
+        let me = info(key.account)?.me
+        let photos = photoURLs[key.account] ?? [:]
+        return users.mapValues { list in
+            var seen = Set<UserName>()
+            let unique = list.filter { seen.insert($0).inserted }
+            let ordered = unique.filter { $0 == me } + unique.filter { $0 != me }
+            return ordered.map { user in
+                let name = RemoteText.title(names[user] ?? (user == me ? info(key.account)?.name ?? "" : ""))
+                return Reactor(
+                    id: user, label: user == me ? "You" : (name.isEmpty ? "Unknown" : name), name: name,
+                    photoURL: photos[user])
+            }
+        }
     }
 
     func toggleReaction(_ emoji: Emoji, on message: MessageName, key: SpaceKey) async {

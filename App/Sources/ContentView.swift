@@ -15,7 +15,7 @@ struct ContentView: View {
             case .needsLogin:
                 SignInView(model: model)
             case .running:
-                RootSplitView(model: model)
+                MainLayout(model: model)
             }
         }
         .frame(minWidth: 860, minHeight: 520)
@@ -39,105 +39,145 @@ struct ContentView: View {
     }
 }
 
-struct RootSplitView: View {
+/// The main window: the sidebar as a rounded island inset from the window, and the conversation beside it on the
+/// same surface. It's laid out side by side rather than with a split view: the system split view draws its own
+/// glass edge and shadow between the columns, and macOS has no way to turn them off.
+struct MainLayout: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView(model: model)
-                .navigationSplitViewColumnWidth(min: 270, ideal: 330, max: 440)
-                .toolbar {
-                    ToolbarItem {
-                        Button {
-                            model.showsMessageSearch = true
-                        } label: {
-                            Label("Search messages", systemImage: "magnifyingglass")
-                        }
-                        .help("Search messages (Cmd-F)")
-                    }
-                    ToolbarItem {
-                        Button {
-                            model.openNewMessage()
-                        } label: {
-                            Label("New message", systemImage: "square.and.pencil")
-                        }
-                        .help("New message (Cmd-N)")
-                    }
-                }
-        } detail: {
-            // The thread pane is a plain HStack column: SwiftUI's split-view inspector renegotiates column
-            // minimums as messages re-wrap and can loop until AppKit throws.
+        GeometryReader { proxy in
+            // The toolbar's strip. It's transparent; it's there so the traffic lights sit in the island's corner,
+            // and it holds the conversation's buttons. Offscreen snapshots have no toolbar, so they get the same
+            // strip.
+            let top = proxy.safeAreaInsets.top > 0 ? proxy.safeAreaInsets.top : 52
             HStack(spacing: 0) {
-                detail.frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-                if let key = model.selection, let thread = model.openThread {
-                    Divider()
-                    ThreadInspector(model: model, key: key, thread: thread)
-                        .id(ComposerID(key: key, thread: thread))
-                        .frame(width: 360)
+                if model.showsSidebar {
+                    island(top: top)
+                        .padding(.horizontal, Island.gap)
+                        .padding(.top, Island.top)
+                        .padding(.bottom, Island.gap)
+                        .frame(width: Island.width)
+                        .transition(.move(edge: .leading).combined(with: .opacity))
                 }
+                detail(top: top)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-            .toolbar(removing: .title)
-            .sheet(item: $model.preview) { target in
-                ImagePreviewSheet(target: target) { model.preview = nil }
-            }
-            .sheet(isPresented: $model.showsNewMessage) {
-                NewMessageSheet(model: model)
-            }
-            .sheet(isPresented: $model.showsSwitcher) {
-                QuickSwitcher(model: model) { model.showsSwitcher = false }
-            }
-            .sheet(isPresented: $model.showsMessageSearch) {
-                MessageSearchSheet(model: model)
+            .environment(\.titlebarHeight, top)
+            .ignoresSafeArea(.container, edges: .top)
+        }
+        // One surface for the whole window: the island sits on it, and so does the conversation.
+        .background(Color(nsColor: .textBackgroundColor))
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .toolbar(removing: .title)
+        .toolbar {
+            // Keeps the toolbar, and with it the traffic lights' place, when no conversation is open, and keeps
+            // the conversation's buttons at the trailing edge.
+            ToolbarSpacer(.flexible)
+            if !model.showsSidebar {
+                ToolbarItem(placement: .navigation) {
+                    Button(action: toggleSidebar) {
+                        Label("Show sidebar", systemImage: "sidebar.left")
+                    }
+                    .help("Show the sidebar (Control-Cmd-S)")
+                }
             }
         }
+        .sheet(item: $model.preview) { target in
+            ImagePreviewSheet(target: target, onShowInChat: { model.showInConversation($0) }) {
+                model.preview = nil
+            }
+        }
+        .sheet(isPresented: $model.showsNewMessage) {
+            NewMessageSheet(model: model)
+        }
+        .sheet(isPresented: $model.showsSwitcher) {
+            QuickSwitcher(model: model) { model.showsSwitcher = false }
+        }
+        .sheet(isPresented: $model.showsMessageSearch) {
+            MessageSearchSheet(model: model)
+        }
+    }
+
+    /// The sidebar panel. The traffic lights sit in its top left; its two buttons sit in its top right, centred
+    /// on the same line and the same size as the toolbar's buttons.
+    private func island(top: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: Island.buttonSpacing) {
+                Spacer(minLength: 0)
+                GlassIconButton("New message", systemImage: "square.and.pencil", help: "New message (Cmd-N)") {
+                    model.openNewMessage()
+                }
+                GlassIconButton("Hide sidebar", systemImage: "sidebar.left", help: "Hide the sidebar (Control-Cmd-S)") {
+                    toggleSidebar()
+                }
+            }
+            .padding(.trailing, Island.buttonInset)
+            .padding(.top, top / 2 - GlassIconButton.size / 2 - Island.top)
+            .frame(height: top - Island.top, alignment: .top)
+            .background { WindowDragArea() }
+            SidebarView(model: model)
+        }
+        .background(Theme.island, in: Island.shape)
+        .overlay(Island.shape.strokeBorder(Theme.islandEdge))
+        .clipShape(Island.shape)
     }
 
     @ViewBuilder
-    private var detail: some View {
+    private func detail(top: CGFloat) -> some View {
         if let key = model.selection {
             SpaceView(model: model, key: key).id(key)
         } else {
-            ContentUnavailableView("Select a conversation", systemImage: "bubble.left.and.bubble.right")
+            VStack(spacing: 0) {
+                WindowDragArea().frame(height: top)
+                ContentUnavailableView("Select a conversation", systemImage: "bubble.left.and.bubble.right")
+                    .frame(maxHeight: .infinity)
+            }
         }
+    }
+
+    private func toggleSidebar() {
+        withAnimation(.smooth(duration: 0.25)) { model.showsSidebar.toggle() }
     }
 }
 
-struct SignInView: View {
-    let model: AppModel
+private enum Island {
+    static let width: CGFloat = 330
+    /// Space between the island and the window's left and bottom edges, and between it and the conversation.
+    static let gap: CGFloat = 8
+    /// Space above the island. Smaller than the others so the toolbar-sized buttons, centred on the traffic
+    /// lights, still have room inside it.
+    static let top: CGFloat = 4
+    /// From the island's right edge to its buttons, the same as the room above them.
+    static let buttonInset: CGFloat = 4
+    /// The toolbar's own gap between separate buttons.
+    static let buttonSpacing: CGFloat = 8
+    static let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+}
 
+extension EnvironmentValues {
+    /// The height of the window's toolbar strip, where the conversation's title sits.
+    @Entry var titlebarHeight: CGFloat = 52
+}
+
+/// Empty header space that behaves like a title bar: drag it to move the window, double-click it to do what the
+/// title bar setting in System Settings says (zoom by default).
+struct WindowDragArea: View {
     var body: some View {
-        ContentUnavailableView {
-            Label("Add a Google account", systemImage: "person.crop.circle.badge.plus")
-        } description: {
-            Text(
-                "Sign-in opens in your browser. Pick the account that belongs to the client's organization and leave "
-                    + "every permission ticked.")
-        } actions: {
-            VStack(spacing: 10) {
-                if model.isSigningIn {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Waiting for the browser…")
-                        Button("Cancel") { model.cancelSignIn() }
-                    }
-                } else {
-                    if let project = model.savedClientProject {
-                        Button("Sign in with Google") { model.startAddAccount() }
-                            .buttonStyle(.borderedProminent)
-                        Text("Client: \(project)").font(.caption).foregroundStyle(.secondary)
-                    }
-                    if model.savedClientProject == nil {
-                        Button("Choose client file and sign in…") { model.startAddAccount(newClient: true) }
-                            .buttonStyle(.borderedProminent)
-                    } else {
-                        Button("Use another client file…") { model.startAddAccount(newClient: true) }
-                    }
-                }
-                if let error = model.signInError {
-                    Text(error).font(.callout).foregroundStyle(.red)
-                }
-            }
+        Color.clear
+            .contentShape(Rectangle())
+            .gesture(WindowDragGesture())
+            .simultaneousGesture(TapGesture(count: 2).onEnded { Self.titleBarDoubleClick() })
+            .allowsWindowActivationEvents(true)
+    }
+
+    @MainActor
+    static func titleBarDoubleClick() {
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
+        switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
+        case "Minimize": window.performMiniaturize(nil)
+        case "None": break
+        default: window.performZoom(nil)
         }
     }
 }

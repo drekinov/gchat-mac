@@ -75,6 +75,7 @@ enum FakeSeeder {
                     at: Timestamp(end.addingTimeInterval(5)))
             }
             setReadState(server, account, space, unread: spec.unread)
+            if spec.historyOff { server.setHistory(on: false, in: space) }
             if spec.muted {
                 server.setNotificationSetting(
                     account, space: space, SpaceNotificationSetting(level: .off, isMuted: true))

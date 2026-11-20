@@ -4,12 +4,20 @@ import Foundation
 import GoogleChat
 import Synchronization
 
+/// Who reacted to one message: each emoji's users in the order Google lists them, and the names Google sent along.
+public struct ReactorList: Sendable, Equatable {
+    public var users: [Emoji: [UserName]]
+    public var names: [UserName: String]
+}
+
 /// The user's own reactions and custom emoji for one account. "Mine" isn't in reaction summaries, so it's learned
 /// per message via `listReactions(user: me)` and kept in memory only.
 public final class Reactions: Sendable {
     /// Google allows 5 reaction writes per second per space.
     public static let spacing = Duration.milliseconds(250)
     static let maxTracked = 2000
+    /// Who-reacted lists kept in memory; they're read only on hover, so a few dozen covers a reading session.
+    static let maxReactorLists = 50
     static let refreshAfter = Duration.seconds(60)
     static let emojiRefresh = Duration.seconds(6 * 3600)
 
@@ -24,8 +32,15 @@ public final class Reactions: Sendable {
         var checked: Timestamp
     }
 
+    private struct CachedReactors {
+        var list: ReactorList
+        var summaries: [ReactionSummary]
+        var fetched: Timestamp
+    }
+
     private struct State {
         var tracked: [MessageName: Tracked] = [:]
+        var reactors: [MessageName: CachedReactors] = [:]
         var lastWrite: [SpaceName: Timestamp] = [:]
         var customEmojis: [CustomEmoji] = []
         var emojisFetched: Timestamp?
@@ -79,6 +94,52 @@ public final class Reactions: Sendable {
             }
         }
         try await refreshSummary(message, generation)
+    }
+
+    /// Everyone who reacted to `message`, by emoji, in the order Google lists them. Read only when someone asks
+    /// (hovering a reaction) and kept for a minute while the message's reaction counts stay the same; the age
+    /// limit catches one person's reaction replacing another's, which leaves the counts unchanged. It also
+    /// refreshes which of them are the user's.
+    public func reactors(
+        on message: MessageName, matching summaries: [ReactionSummary], _ generation: Generation
+    ) async throws(SyncError) -> ReactorList {
+        if let cached = state.withLock({ $0.reactors[message] }), cached.summaries == summaries,
+            clock.now() < cached.fetched.adding(Self.refreshAfter)
+        {
+            return cached.list
+        }
+        var users: [Emoji: [UserName]] = [:]
+        var names: [UserName: String] = [:]
+        var mine: [Emoji: ReactionName] = [:]
+        var token: String?
+        var pages = 0
+        repeat {
+            let page: Page<Reaction>
+            do throws(ChatAPIError) {
+                page = try await api.listReactions(on: message, user: nil, pageToken: token)
+            } catch .notFound {
+                break
+            } catch {
+                throw .api(error, .listReactions)
+            }
+            for reaction in page.items {
+                users[reaction.emoji, default: []].append(reaction.user)
+                if let name = reaction.userDisplayName { names[reaction.user] = name }
+                if reaction.user == me { mine[reaction.emoji] = reaction.name }
+            }
+            token = page.nextPageToken
+            pages += 1
+        } while token != nil && pages < 5
+        guard gate.isCurrent(generation) else { throw .retired }
+        let complete = token == nil
+        let checked = clock.now()
+        let list = ReactorList(users: users, names: names)
+        state.withLock { state in
+            if state.reactors.count >= Self.maxReactorLists { state.reactors.removeAll() }
+            state.reactors[message] = CachedReactors(list: list, summaries: summaries, fetched: checked)
+            if complete { state.tracked[message] = Tracked(mine: mine, checked: checked) }
+        }
+        return list
     }
 
     /// Learns which reactions are the user's for messages that have any, skipping recently checked ones.

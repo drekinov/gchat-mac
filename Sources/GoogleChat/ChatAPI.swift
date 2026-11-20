@@ -78,11 +78,14 @@ public struct Reaction: Hashable, Sendable {
     public var name: ReactionName
     public var user: UserName
     public var emoji: Emoji
+    /// The reacting user's name, when Google includes it.
+    public var userDisplayName: String?
 
-    public init(name: ReactionName, user: UserName, emoji: Emoji) {
+    public init(name: ReactionName, user: UserName, emoji: Emoji, userDisplayName: String? = nil) {
         self.name = name
         self.user = user
         self.emoji = emoji
+        self.userDisplayName = userDisplayName
     }
 }
 

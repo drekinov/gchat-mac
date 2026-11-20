@@ -1,4 +1,5 @@
 import ChatModel
+import ChatStore
 import ChatSync
 import Foundation
 
@@ -27,6 +28,43 @@ enum StoreReader {
     @concurrent
     static func mentionCandidates(session: AccountSession, space: SpaceName) async -> [Contact] {
         (try? session.contacts.mentionCandidates(in: space)) ?? []
+    }
+
+    @concurrent
+    static func storedSpace(session: AccountSession, space: SpaceName) async -> StoredSpace? {
+        (try? session.storedSpace(space)) ?? nil
+    }
+
+    @concurrent
+    static func memberships(session: AccountSession, space: SpaceName) async -> [Membership] {
+        (try? session.contacts.memberships(in: space)) ?? []
+    }
+
+    /// Two other joined people per conversation from the member cache, picked by a shuffle seeded with the
+    /// conversation's name: stable from launch to launch, and not the same alphabetically first person everywhere.
+    /// A conversation with fewer is left out and keeps its own picture.
+    /// FNV-1a over both names: the same pair always gives the same number, unlike `hashValue`.
+    private static func seeded(_ space: SpaceName, _ user: UserName) -> UInt64 {
+        (space.rawValue + "|" + user.rawValue).utf8.reduce(0xcbf2_9ce4_8422_2325) {
+            ($0 ^ UInt64($1)) &* 0x100_0000_01b3
+        }
+    }
+
+    @concurrent
+    static func faces(session: AccountSession, spaces: [SpaceName]) async -> [SpaceName: [User]] {
+        let me = session.me
+        var faces: [SpaceName: [User]] = [:]
+        for space in spaces {
+            let people = ((try? session.contacts.memberships(in: space)) ?? [])
+                .filter {
+                    $0.state == .joined && $0.member.type == .human && !$0.member.isAnonymous && $0.member.name != me
+                        && !($0.member.displayName ?? "").isEmpty
+                }
+                .map(\.member)
+                .sorted { seeded(space, $0.name) < seeded(space, $1.name) }
+            if people.count >= 2 { faces[space] = Array(people.prefix(2)) }
+        }
+        return faces
     }
 
     @concurrent

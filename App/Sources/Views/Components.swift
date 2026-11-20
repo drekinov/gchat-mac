@@ -14,11 +14,66 @@ extension EnvironmentValues {
     }
 }
 
+/// A round Liquid Glass icon button the size of the toolbar's buttons, for buttons that live outside the toolbar:
+/// the island's and the sheets' close buttons. Offscreen snapshots can't draw glass, so they get a flat circle.
+struct GlassIconButton: View {
+    static let size: CGFloat = 36
+    let title: String
+    let systemImage: String
+    let help: String
+    var role: ButtonRole?
+    let action: () -> Void
+    @Environment(\.isSnapshotMode) private var snapshotMode
+
+    init(
+        _ title: String, systemImage: String, help: String, role: ButtonRole? = nil, action: @escaping () -> Void
+    ) {
+        self.title = title
+        self.systemImage = systemImage
+        self.help = help
+        self.role = role
+        self.action = action
+    }
+
+    var body: some View {
+        let button = Button(role: role, action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13))
+                .imageScale(.large)
+                .frame(width: Self.size, height: Self.size)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(title)
+        if snapshotMode {
+            button.background(Color.primary.opacity(0.06), in: Circle())
+        } else {
+            button.glassEffect(.regular.interactive(), in: .circle)
+        }
+    }
+}
+
+/// The close button every sheet shows in its top-left corner, where a window's close button sits: an × in the same
+/// glass as the window's buttons, with the close role so it reads as Close. Esc does the same.
+struct SheetCloseButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        GlassIconButton("Close", systemImage: "xmark", help: "Close (Esc)", role: .close, action: action)
+            .keyboardShortcut(.cancelAction)
+    }
+}
+
+/// Account badge colours. None is close to the Slate accent, and each keeps white letters readable.
 enum AccountPalette {
     static let colors: [Color] = [
-        Color(red: 0.20, green: 0.45, blue: 0.85), Color(red: 0.85, green: 0.45, blue: 0.10),
-        Color(red: 0.12, green: 0.58, blue: 0.50), Color(red: 0.55, green: 0.32, blue: 0.80),
-        Color(red: 0.78, green: 0.28, blue: 0.42), Color(red: 0.35, green: 0.50, blue: 0.62),
+        Color(red: 0x2E / 255, green: 0x7A / 255, blue: 0x4F / 255),  // green
+        Color(red: 0xC0 / 255, green: 0x44 / 255, blue: 0x2C / 255),  // red
+        Color(red: 0x8C / 255, green: 0x61 / 255, blue: 0x14 / 255),  // ochre
+        Color(red: 0x7A / 255, green: 0x4F / 255, blue: 0x8C / 255),  // plum
+        Color(red: 0x1F / 255, green: 0x7F / 255, blue: 0x86 / 255),  // teal
+        Color(red: 0xA3 / 255, green: 0x40 / 255, blue: 0x5F / 255),  // rose
     ]
 
     static func color(_ index: Int) -> Color { colors[index % colors.count] }
@@ -30,12 +85,22 @@ struct AccountBadge: View {
 
     var body: some View {
         let color = AccountPalette.color(info?.colorIndex ?? 0)
-        Text(String((info?.name ?? "?").split(separator: " ").last?.prefix(1) ?? "?").uppercased())
-            .font(.system(size: size * 0.6, weight: .bold))
+        Text(Self.letter(info?.name))
+            .font(.system(size: size * 0.56, weight: .heavy))
             .foregroundStyle(.white)
             .frame(width: size, height: size)
-            .background(color, in: RoundedRectangle(cornerRadius: size * 0.28))
-            .accessibilityLabel(info?.name ?? "Unknown account")
+            .background(color, in: Circle())
+            .accessibilityLabel(info.map { "\(RemoteText.title($0.name)) account" } ?? "Unknown account")
+    }
+
+    /// The first letter of the name's last word, so "Org B" and "Org C" stay apart. An account still named by
+    /// its email uses the domain's first letter, so addresses at different organizations don't share a letter.
+    static func letter(_ name: String?) -> String {
+        let name = (name ?? "").trimmingCharacters(in: .whitespaces)
+        let source =
+            name.split(separator: "@").dropFirst().first.map(String.init)
+            ?? name.split(separator: " ").last.map(String.init) ?? name
+        return source.first(where: \.isLetter).map { String($0).uppercased() } ?? "?"
     }
 }
 
