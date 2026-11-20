@@ -149,43 +149,55 @@ struct AccountMenu: View {
     }
 }
 
-/// Account badges rendered to images for places that only take an image, such as a menu button. Cached, since
-/// the menu's label is rebuilt whenever unread counts change.
+/// Account badges drawn as images for places that only take an image, such as a menu button. They're drawn with
+/// AppKit: SwiftUI's ImageRenderer would start an offscreen renderer that briefly costs tens of megabytes.
 @MainActor
 enum BadgeImages {
     private static var cache: [String: NSImage] = [:]
 
     static func image(for account: AccountInfo?, all accounts: [AccountInfo]) -> NSImage? {
         if let account {
-            let key = "\(account.colorIndex)|\(AccountBadge.letter(account.name))"
-            return cached(key) { AccountBadge(info: account, size: 14) }
+            let letter = AccountBadge.letter(account.name)
+            return cached("\(account.colorIndex)|\(letter)") { badge(letter, color(account.colorIndex)) }
         }
-        let key = "all|" + accounts.prefix(2).map { "\($0.colorIndex)" }.joined(separator: ",")
-        return cached(key) { AccountDots(accounts: accounts) }
+        let indexes = accounts.prefix(2).map(\.colorIndex)
+        return cached("all|" + indexes.map(String.init).joined(separator: ",")) { dots(indexes.map(color)) }
     }
 
-    private static func cached<V: View>(_ key: String, _ view: () -> V) -> NSImage? {
+    private static func color(_ index: Int) -> NSColor { NSColor(AccountPalette.color(index)) }
+
+    private static func cached(_ key: String, _ make: () -> NSImage) -> NSImage {
         if let hit = cache[key] { return hit }
-        let renderer = ImageRenderer(content: view())
-        renderer.scale = 2
-        guard let image = renderer.nsImage else { return nil }
-        image.isTemplate = false
+        let image = make()
         cache[key] = image
         return image
     }
-}
 
-/// Two overlapping account colours: the "all accounts" mark.
-struct AccountDots: View {
-    let accounts: [AccountInfo]
-
-    var body: some View {
-        HStack(spacing: -3) {
-            ForEach(accounts.prefix(2)) { info in
-                Circle().fill(AccountPalette.color(info.colorIndex)).frame(width: 9, height: 9)
-            }
+    private static func badge(_ letter: String, _ fill: NSColor, size: CGFloat = 14) -> NSImage {
+        NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            fill.setFill()
+            NSBezierPath(ovalIn: rect).fill()
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: size * 0.56, weight: .heavy), .foregroundColor: NSColor.white,
+            ]
+            let text = letter as NSString
+            let measured = text.size(withAttributes: attributes)
+            text.draw(
+                at: NSPoint(x: rect.midX - measured.width / 2, y: rect.midY - measured.height / 2),
+                withAttributes: attributes)
+            return true
         }
-        .accessibilityHidden(true)
+    }
+
+    private static func dots(_ fills: [NSColor], size: CGFloat = 9) -> NSImage {
+        let width = size + CGFloat(max(fills.count - 1, 0)) * (size - 3)
+        return NSImage(size: NSSize(width: width, height: size), flipped: false) { _ in
+            for (index, fill) in fills.enumerated() {
+                fill.setFill()
+                NSBezierPath(ovalIn: NSRect(x: CGFloat(index) * (size - 3), y: 0, width: size, height: size)).fill()
+            }
+            return true
+        }
     }
 }
 
