@@ -12,14 +12,17 @@ struct PreviewTarget: Identifiable {
     struct Origin {
         var sender: String?
         var time: Timestamp?
+        /// The message the image came with, for Show in Chat.
+        var message: MessageName?
 
-        init(sender: String? = nil, time: Timestamp? = nil) {
+        init(sender: String? = nil, time: Timestamp? = nil, message: MessageName? = nil) {
             self.sender = sender
             self.time = time
+            self.message = message
         }
 
         init(_ message: Message) {
-            self.init(sender: message.sender.displayName, time: message.createTime)
+            self.init(sender: message.sender.displayName, time: message.createTime, message: message.name)
         }
     }
 
@@ -111,6 +114,8 @@ struct ImagePreviewSheet: View {
     let target: PreviewTarget
     /// Opens the first image at this magnification instead of fitting it (for snapshots).
     var startZoom: CGFloat?
+    /// Closes the preview and scrolls the conversation to the image's message.
+    var onShowInChat: ((MessageName) -> Void)?
     var onClose: () -> Void
 
     @Environment(\.displayScale) private var displayScale
@@ -131,9 +136,13 @@ struct ImagePreviewSheet: View {
     /// A little darker than the window in light mode, so a white screenshot's edges still show.
     private static let stageColor = Theme.dynamic(light: 0xE2_E5E9, dark: 0x15_171A)
 
-    init(target: PreviewTarget, startZoom: CGFloat? = nil, onClose: @escaping () -> Void) {
+    init(
+        target: PreviewTarget, startZoom: CGFloat? = nil, onShowInChat: ((MessageName) -> Void)? = nil,
+        onClose: @escaping () -> Void
+    ) {
         self.target = target
         self.startZoom = startZoom
+        self.onShowInChat = onShowInChat
         self.onClose = onClose
         _index = State(initialValue: target.start)
     }
@@ -210,6 +219,14 @@ struct ImagePreviewSheet: View {
                     }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
                     .help("Save As… (⇧⌘S)")
+                    if let onShowInChat, let message = current?.origin.message {
+                        Button {
+                            onShowInChat(message)
+                        } label: {
+                            Label("Show in Chat", systemImage: "bubble.left")
+                        }
+                        .help("Close the preview and scroll to this message")
+                    }
                 }
                 .labelStyle(.titleAndIcon)
             }

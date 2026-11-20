@@ -327,6 +327,19 @@ final class AppModel {
         scrollCommand = ScrollCommand(sequence: scrollCommand.sequence + 1, toTop: toTop)
     }
 
+    /// A message the open conversation should scroll to, from the image preview's Show in Chat.
+    private(set) var revealedMessage: MessageName?
+    private(set) var revealSequence = 0
+
+    /// Closes the preview and scrolls to `message`, opening its thread first when it's a reply.
+    func showInConversation(_ message: MessageName) {
+        preview = nil
+        let loaded = openMessages.first { $0.name == message } ?? threadMessages.first { $0.name == message }
+        if let loaded, loaded.isThreadReply, let thread = loaded.thread { openThread(thread) }
+        revealedMessage = message
+        revealSequence += 1
+    }
+
     func mediaLoader(for account: AccountID) -> MediaLoader? {
         sessions[account]?.mediaLoader
     }

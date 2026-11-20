@@ -254,6 +254,20 @@ struct MessageList: View {
                     withAnimation { reveal(thread, proxy) }
                 }
             }
+            .onChange(of: model.revealSequence) {
+                guard let name = model.revealedMessage else { return }
+                let reply = model.openMessages.first { $0.name == name }.map(\.isThreadReply) ?? true
+                pinned = false
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(150))
+                    // A reply lives inside its open thread, which is reached through the thread's first message.
+                    if reply, let thread = model.openThread {
+                        reveal(thread, proxy)
+                    } else {
+                        withAnimation { proxy.scrollTo(name, anchor: .center) }
+                    }
+                }
+            }
             .onChange(of: model.scrollCommand) {
                 if model.scrollCommand.toTop, let first = rows.first {
                     proxy.scrollTo(first.id, anchor: .top)

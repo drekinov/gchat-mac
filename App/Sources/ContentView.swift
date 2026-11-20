@@ -70,7 +70,9 @@ struct RootSplitView: View {
                 .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
                 .toolbar(removing: .title)
                 .sheet(item: $model.preview) { target in
-                    ImagePreviewSheet(target: target) { model.preview = nil }
+                    ImagePreviewSheet(target: target, onShowInChat: { model.showInConversation($0) }) {
+                        model.preview = nil
+                    }
                 }
                 .sheet(isPresented: $model.showsNewMessage) {
                     NewMessageSheet(model: model)
