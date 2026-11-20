@@ -5,38 +5,69 @@ import SwiftUI
 struct SpaceView: View {
     let model: AppModel
     let key: SpaceKey
+    @Environment(\.isSnapshotMode) private var snapshotMode
     @State private var dropTargeted = false
+    @State private var members: [Membership] = []
 
     var body: some View {
         VStack(spacing: 0) {
-            SpaceHeader(model: model, key: key)
+            // Offscreen snapshots have no window toolbar, so they show the title and buttons above the messages.
+            if snapshotMode {
+                SpaceTitle(model: model, key: key, members: members)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .overlay(alignment: .trailing) {
+                        HStack(spacing: 2) { SpaceActions(model: model, key: key, members: members) }
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.borderless)
+                            .padding(.horizontal, 4)
+                            .modifier(GlassCapsule(flat: true))
+                            .padding(.trailing, 14)
+                    }
+            }
             MessageList(model: model, key: key, dropTargeted: $dropTargeted)
             ComposerView(model: model, key: key, thread: nil, conversationDropTargeted: dropTargeted)
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .toolbar {
+            if !snapshotMode {
+                ToolbarItem(placement: .principal) {
+                    SpaceTitle(model: model, key: key, members: members)
+                }
+                .sharedBackgroundVisibility(.hidden)
+                ToolbarItemGroup(placement: .primaryAction) {
+                    SpaceActions(model: model, key: key, members: members).labelStyle(.iconOnly)
+                }
+            }
+        }
+        .task(id: key) {
+            model.prepareMentions(for: key)
+            members = await model.memberships(for: key)
+        }
+        .onChange(of: model.snapshots[key.account]?.revision) {
+            Task { members = await model.memberships(for: key) }
+        }
     }
 }
 
-/// The conversation's name in the middle, with a few members' faces and the account it belongs to. Clicking it
-/// shows the members.
-struct SpaceHeader: View {
+/// The conversation's name in the middle of the toolbar, with a few members' faces and the account it belongs to.
+/// Clicking it shows the members.
+struct SpaceTitle: View {
     let model: AppModel
     let key: SpaceKey
-    @Environment(\.isSnapshotMode) private var snapshotMode
+    let members: [Membership]
     @State private var showsMembers = false
-    @State private var members: [Membership] = []
 
     var body: some View {
         let summary = model.summary(for: key)
         let title = RemoteText.title(summary?.title ?? "")
         let account = model.info(key.account)
-        HStack {
-            Spacer(minLength: 0)
-            Button {
-                showsMembers.toggle()
-            } label: {
-                VStack(spacing: 2) {
-                    faces(title: title, summary: summary)
+        Button {
+            showsMembers.toggle()
+        } label: {
+            HStack(spacing: 8) {
+                faces(title: title, summary: summary)
+                VStack(alignment: .leading, spacing: 0) {
                     HStack(spacing: 3) {
                         Text(title).font(.headline).lineLimit(1)
                         if summary?.isMuted == true {
@@ -48,59 +79,20 @@ struct SpaceHeader: View {
                             .foregroundStyle(.secondary)
                     }
                     HStack(spacing: 4) {
-                        AccountBadge(info: account, size: 12)
+                        AccountBadge(info: account, size: 11)
                         Text(RemoteText.title(account?.name ?? "")).font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 4)
-                .background(
-                    showsMembers ? Color.primary.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 12)
-                )
-                .contentShape(RoundedRectangle(cornerRadius: 12))
             }
-            .buttonStyle(.plain)
-            .help("Show members")
-            .accessibilityLabel("\(title) in \(RemoteText.title(account?.name ?? "")), show members")
-            .popover(isPresented: $showsMembers, arrowEdge: .bottom) {
-                MembersPopover(model: model, key: key, members: members) { showsMembers = false }
-            }
-            Spacer(minLength: 0)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
         }
-        .overlay(alignment: .trailing) {
-            HStack(spacing: 2) {
-                if let historyOn = summary?.historyOn {
-                    HistoryBadge(historyOn: historyOn).frame(width: 30, height: 28)
-                }
-                Button {
-                    model.showsMessageSearch = true
-                } label: {
-                    Image(systemName: "magnifyingglass").frame(width: 30, height: 28)
-                }
-                .help("Search messages (Cmd-F)")
-                .accessibilityLabel("Search messages")
-                Button {
-                    showsMembers.toggle()
-                } label: {
-                    Image(systemName: "info.circle").frame(width: 30, height: 28)
-                }
-                .help("Members and details")
-                .accessibilityLabel("Members and details")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 4)
-            .modifier(GlassCapsule(flat: snapshotMode))
-            .padding(.trailing, 14)
-        }
-        .padding(.top, 6)
-        .padding(.bottom, 4)
-        .task(id: key) {
-            model.prepareMentions(for: key)
-            members = await model.memberships(for: key)
-        }
-        .onChange(of: model.snapshots[key.account]?.revision) {
-            Task { members = await model.memberships(for: key) }
+        .buttonStyle(.plain)
+        .help("Show members")
+        .accessibilityLabel("\(title) in \(RemoteText.title(account?.name ?? "")), show members")
+        .popover(isPresented: $showsMembers, arrowEdge: .bottom) {
+            MembersPopover(model: model, key: key, members: members) { showsMembers = false }
         }
     }
 
@@ -112,14 +104,14 @@ struct SpaceHeader: View {
             $0.state == .joined && $0.member.type == .human && !$0.member.isAnonymous && $0.member.name != me
         }
         if others.isEmpty {
-            SpaceAvatar(title: title, kind: kind(summary), size: 24)
+            SpaceAvatar(title: title, kind: kind(summary), size: 26)
         } else {
             let context = model.messageContext(for: key)
-            HStack(spacing: -7) {
+            HStack(spacing: -8) {
                 ForEach(others.prefix(3), id: \.name) { membership in
                     PhotoAvatar(
                         name: RemoteText.title(membership.member.displayName ?? ""),
-                        url: context.photoURL(membership.member.name), media: context.media, size: 22
+                        url: context.photoURL(membership.member.name), media: context.media, size: 24
                     )
                     .padding(1.5)
                     .background(Color(nsColor: .windowBackgroundColor), in: Circle())
@@ -133,6 +125,35 @@ struct SpaceHeader: View {
         case .groupChat: .group
         case .directMessage: summary?.isBotDM == true ? .bot : .directMessage
         default: .space
+        }
+    }
+}
+
+/// The conversation's toolbar buttons: its history setting, message search and the members.
+struct SpaceActions: View {
+    let model: AppModel
+    let key: SpaceKey
+    let members: [Membership]
+    @State private var showsDetails = false
+
+    var body: some View {
+        if let historyOn = model.summary(for: key)?.historyOn, !historyOn {
+            HistoryBadge(historyOn: historyOn)
+        }
+        Button {
+            model.showsMessageSearch = true
+        } label: {
+            Label("Search messages", systemImage: "magnifyingglass")
+        }
+        .help("Search messages (Cmd-F)")
+        Button {
+            showsDetails.toggle()
+        } label: {
+            Label("Members and details", systemImage: "info.circle")
+        }
+        .help("Members and details")
+        .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
+            MembersPopover(model: model, key: key, members: members) { showsDetails = false }
         }
     }
 }
@@ -212,9 +233,11 @@ struct MessageList: View {
                     .listRowSeparator(.hidden)
                     .id(row.id)
                     if isOpen, let openThread {
-                        InlineThread(model: model, key: key, thread: openThread, context: context)
-                            .listRowSeparator(.hidden)
-                            .id(Self.openThread)
+                        InlineThread(
+                            model: model, key: key, thread: openThread, context: context, expectedReplies: row.replies
+                        )
+                        .listRowSeparator(.hidden)
+                        .id(Self.openThread)
                     }
                 }
                 // A thread whose first message isn't loaded (older than the loaded history) opens at the end.

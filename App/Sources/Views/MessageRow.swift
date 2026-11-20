@@ -286,11 +286,14 @@ struct MessageRow: View {
                 liveContent(message, mine: mine)
             }
         }
-        // The actions sit just outside the bubble, so they attach before the width limit widens the stack.
+        // The actions hang just outside the bubble's top corner: a zero-width anchor on that edge lets them spill
+        // outward without covering the text or taking any room. The anchor sits on the content, before the width
+        // limit, so it follows the bubble and not the column.
         .overlay(alignment: mine ? .topLeading : .topTrailing) {
             if showsBar {
                 actionBar(message)
-                    .alignmentGuide(mine ? .leading : .trailing) { mine ? $0[.trailing] + 6 : $0[.leading] - 6 }
+                    .padding(mine ? .trailing : .leading, 6)
+                    .frame(width: 0, alignment: mine ? .trailing : .leading)
             }
         }
         .frame(maxWidth: 580, alignment: mine ? .trailing : .leading)

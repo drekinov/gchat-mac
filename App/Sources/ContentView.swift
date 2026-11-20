@@ -49,14 +49,6 @@ struct RootSplitView: View {
                 .toolbar {
                     ToolbarItem {
                         Button {
-                            model.showsMessageSearch = true
-                        } label: {
-                            Label("Search messages", systemImage: "magnifyingglass")
-                        }
-                        .help("Search messages (Cmd-F)")
-                    }
-                    ToolbarItem {
-                        Button {
                             model.openNewMessage()
                         } label: {
                             Label("New message", systemImage: "square.and.pencil")

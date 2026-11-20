@@ -4,9 +4,10 @@ import SwiftUI
 
 struct SidebarView: View {
     let model: AppModel
-    @Environment(\.isSnapshotMode) private var snapshotMode
     @AppStorage("sidebarDensity") private var density = SidebarDensity.comfortable
     @State private var query = ""
+    @State private var hovered: SpaceKey?
+    @FocusState private var listFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,44 +17,101 @@ struct SidebarView: View {
         }
     }
 
-    @ViewBuilder
+    /// A plain scrolling stack rather than a sidebar List, so the selected chat gets the design's soft tint instead
+    /// of the system's strong highlight. Clicking a chat focuses the list; the arrow keys then move the selection,
+    /// as in a sidebar.
     private var inboxList: some View {
         let entries = filtered(model.inbox)
         let spaces = entries.filter { model.kind(of: $0) == .space }
         let people = entries.filter { model.kind(of: $0) != .space }
+        let ordered = spaces + people
         // Badges only help when chats from several accounts share the list.
         let showsBadges = model.accountFilter == nil && model.accounts.count > 1
-        let list = List(selection: selection) {
-            if !spaces.isEmpty {
-                Section("Spaces") { rows(spaces, showsBadges: showsBadges) }
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    if !spaces.isEmpty {
+                        header("Spaces")
+                        rows(spaces, showsBadges: showsBadges)
+                    }
+                    if !people.isEmpty {
+                        header("Direct messages").padding(.top, spaces.isEmpty ? 0 : 8)
+                        rows(people, showsBadges: showsBadges)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
             }
-            if !people.isEmpty {
-                Section("Direct messages") { rows(people, showsBadges: showsBadges) }
+            .focusable()
+            .focused($listFocused)
+            .focusEffectDisabled()
+            .onKeyPress(.upArrow) { move(-1, in: ordered) }
+            .onKeyPress(.downArrow) { move(1, in: ordered) }
+            .onChange(of: model.selection) { _, key in
+                guard let key, listFocused else { return }
+                proxy.scrollTo(key)
+            }
+            .overlay {
+                if model.inbox.isEmpty {
+                    ProgressView().controlSize(.small)
+                } else if entries.isEmpty {
+                    ContentUnavailableView.search(text: query)
+                }
             }
         }
-        .overlay {
-            if model.inbox.isEmpty {
-                ProgressView().controlSize(.small)
-            } else if entries.isEmpty {
-                ContentUnavailableView.search(text: query)
-            }
-        }
-        if snapshotMode {
-            list.listStyle(.inset)
-        } else {
-            list.listStyle(.sidebar)
-        }
+    }
+
+    private func header(_ title: String) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.top, 6)
+            .padding(.bottom, 2)
+            .accessibilityAddTraits(.isHeader)
     }
 
     private func rows(_ entries: [InboxEntry], showsBadges: Bool) -> some View {
         ForEach(entries) { entry in
-            InboxRow(
-                entry: entry, account: model.info(entry.account), kind: model.kind(of: entry),
-                showsBadge: showsBadges, isSelected: model.selection == entry.id, density: density
-            )
-            .tag(entry.id)
-            .listRowSeparator(.hidden)
+            let selected = model.selection == entry.id
+            Button {
+                listFocused = true
+                model.select(entry.id)
+            } label: {
+                InboxRow(
+                    entry: entry, account: model.info(entry.account), kind: model.kind(of: entry),
+                    showsBadge: showsBadges, isSelected: selected, density: density
+                )
+                .padding(.horizontal, 4)
+                .padding(.vertical, 3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(background(selected: selected, hovered: hovered == entry.id), in: Card())
+                .contentShape(Card())
+            }
+            .buttonStyle(.plain)
+            .onHover { inside in
+                if inside {
+                    hovered = entry.id
+                } else if hovered == entry.id {
+                    hovered = nil
+                }
+            }
+            .accessibilityAddTraits(selected ? .isSelected : [])
+            .id(entry.id)
         }
+    }
+
+    private func background(selected: Bool, hovered: Bool) -> Color {
+        if selected { return Theme.selection }
+        return hovered ? Color.primary.opacity(0.04) : .clear
+    }
+
+    private func move(_ step: Int, in entries: [InboxEntry]) -> KeyPress.Result {
+        guard !entries.isEmpty else { return .ignored }
+        let current = entries.firstIndex { $0.id == model.selection }
+        let next = current.map { min(max($0 + step, 0), entries.count - 1) } ?? (step > 0 ? 0 : entries.count - 1)
+        model.select(entries[next].id)
+        return .handled
     }
 
     private func filtered(_ entries: [InboxEntry]) -> [InboxEntry] {
@@ -61,9 +119,12 @@ struct SidebarView: View {
         guard !needle.isEmpty else { return entries }
         return entries.filter { RemoteText.title($0.summary.title).localizedCaseInsensitiveContains(needle) }
     }
+}
 
-    private var selection: Binding<SpaceKey?> {
-        Binding(get: { model.selection }, set: { model.select($0) })
+/// The rounded shape behind a chat in the sidebar.
+private struct Card: Shape {
+    func path(in rect: CGRect) -> Path {
+        RoundedRectangle(cornerRadius: 12, style: .continuous).path(in: rect)
     }
 }
 

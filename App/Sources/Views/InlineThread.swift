@@ -8,6 +8,8 @@ struct InlineThread: View {
     let key: SpaceKey
     let thread: ThreadName
     let context: MessageContext
+    /// Replies the conversation already knows of. A thread started from Reply has none, so it shows only the field.
+    var expectedReplies = 0
     @State private var visible = false
     @State private var dropTargeted = false
 
@@ -23,7 +25,7 @@ struct InlineThread: View {
             // Drops on the replies go to this thread's reply field. The field sits outside this destination, so
             // text dragged onto it still reaches its text view.
             VStack(alignment: .leading, spacing: 2) {
-                if rows.isEmpty && outbox.isEmpty {
+                if rows.isEmpty && outbox.isEmpty && expectedReplies > 0 {
                     ProgressView().controlSize(.small).frame(maxWidth: .infinity)
                 }
                 ForEach(rows) { row in

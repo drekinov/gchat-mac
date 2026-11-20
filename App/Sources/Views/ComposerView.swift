@@ -182,6 +182,7 @@ struct ComposerView: View {
             .background(TextOnlyDrops())
             .font(.body)
             .scrollContentBackground(.hidden)
+            .scrollIndicators(.never)
             .focused($focused)
             .frame(height: editorHeight)
             .padding(.vertical, 4)
