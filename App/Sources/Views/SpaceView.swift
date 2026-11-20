@@ -79,9 +79,15 @@ struct SpaceTitle: View {
                             Image(systemName: "bell.slash.fill").font(.caption).foregroundStyle(.secondary)
                                 .accessibilityLabel("Muted")
                         }
-                        Image(systemName: showsMembers ? "chevron.down" : "chevron.right")
+                        // One chevron that turns, in a slot as wide as it is when pointing down, so the centred
+                        // title doesn't shift when the members open.
+                        Image(systemName: "chevron.right")
                             .font(.system(size: 9, weight: .bold))
                             .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(showsMembers ? 90 : 0))
+                            .frame(width: 11)
+                            .animation(.smooth(duration: 0.2), value: showsMembers)
+                            .accessibilityHidden(true)
                     }
                     HStack(spacing: 4) {
                         AccountBadge(info: account, size: 11)
@@ -134,7 +140,7 @@ struct SpaceTitle: View {
     }
 }
 
-/// The conversation's toolbar buttons: its history setting, message search and the members.
+/// The conversation's toolbar buttons: its history setting, message search and its details.
 struct SpaceActions: View {
     let model: AppModel
     let key: SpaceKey
@@ -154,11 +160,11 @@ struct SpaceActions: View {
         Button {
             showsDetails.toggle()
         } label: {
-            Label("Members and details", systemImage: "info.circle")
+            Label("Conversation details", systemImage: "info.circle")
         }
-        .help("Members and details")
+        .help("Conversation details")
         .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
-            MembersPopover(model: model, key: key, members: members) { showsDetails = false }
+            ConversationDetailsPopover(model: model, key: key, members: members)
         }
     }
 }

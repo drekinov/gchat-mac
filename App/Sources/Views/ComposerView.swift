@@ -52,8 +52,9 @@ struct ComposerView: View {
             HStack(alignment: .bottom, spacing: 8) {
                 Button(action: chooseFiles) {
                     Image(systemName: "plus").font(.system(size: 14, weight: .semibold)).foregroundStyle(.secondary)
-                        .frame(width: 30, height: 30)
+                        .frame(width: Self.attachSize, height: Self.attachSize)
                         .background(Color.primary.opacity(0.07), in: Circle())
+                        .frame(height: Self.rowHeight)
                 }
                 .buttonStyle(.plain)
                 .help("Attach files")
@@ -67,7 +68,7 @@ struct ComposerView: View {
                         if model.accounts.count > 1 {
                             let account = RemoteText.title(model.info(key.account)?.name ?? "")
                             AccountBadge(info: model.info(key.account), size: 18)
-                                .padding(.bottom, 6)
+                                .frame(height: Self.rowHeight)
                                 .help("Sending from \(account)")
                                 .accessibilityLabel("Sending from \(account)")
                         }
@@ -76,7 +77,7 @@ struct ComposerView: View {
                             pickerOpen = true
                         } label: {
                             Image(systemName: "face.smiling").font(.system(size: 17)).foregroundStyle(.secondary)
-                                .frame(width: 26, height: 30)
+                                .frame(width: 26, height: Self.rowHeight)
                         }
                         .buttonStyle(.plain)
                         .help("Add emoji")
@@ -92,24 +93,25 @@ struct ComposerView: View {
                         Button(action: submit) {
                             Image(systemName: "arrow.up").font(.system(size: 13, weight: .bold))
                                 .foregroundStyle(canSend ? Theme.onAccent : Color.secondary)
-                                .frame(width: 26, height: 26)
+                                .frame(width: Self.sendSize, height: Self.sendSize)
                                 .background(canSend ? Theme.accent : Color.primary.opacity(0.08), in: Circle())
+                                .frame(height: Self.rowHeight)
                         }
                         .buttonStyle(.plain)
-                        .padding(.bottom, 2)
                         .disabled(!canSend)
                         .help("Send (Return). Shift-Return adds a new line.")
                         .accessibilityLabel("Send")
                     }
                 }
                 .padding(.leading, 8)
-                .padding(.trailing, 4)
-                .padding(.vertical, 2)
+                .padding(.trailing, Self.sendInset)
                 .background(
-                    Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    Color(nsColor: .textBackgroundColor),
+                    in: RoundedRectangle(cornerRadius: Self.rowHeight / 2)
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Color.secondary.opacity(0.28)))
+                    RoundedRectangle(cornerRadius: Self.rowHeight / 2)
+                        .strokeBorder(Color.secondary.opacity(0.28)))
             }
         }
         .padding(.horizontal, thread == nil ? 16 : 0)
@@ -135,7 +137,7 @@ struct ComposerView: View {
         .overlay(alignment: .topLeading) {
             if !items.isEmpty {
                 MentionPopup(items: items, highlight: popupHighlight, onPick: pickMention)
-                    .padding(.leading, thread == nil ? 54 : 38)
+                    .padding(.leading, thread == nil ? 60 : 44)
                     .frame(height: 0, alignment: .bottom)
             }
         }
@@ -185,17 +187,19 @@ struct ComposerView: View {
             .scrollIndicators(.never)
             .focused($focused)
             .frame(height: editorHeight)
-            .padding(.vertical, 4)
             .overlay(alignment: .topLeading) {
                 if text.isEmpty {
                     Text(placeholder)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .padding(.horizontal, 5)
-                        .padding(.vertical, 4)
                         .allowsHitTesting(false)
                 }
             }
+            // The text view draws its first line at its very top, so this centres one line in the row; the
+            // buttons beside it stay level with the last line as the text grows.
+            .padding(.top, (Self.rowHeight - Self.lineHeight) / 2)
+            .padding(.bottom, (Self.rowHeight - Self.lineHeight) / 2 - Self.editorSlack)
             .onKeyPress(.return, phases: .down) { press in
                 if let pick = items[safe: popupHighlight] {
                     pickMention(pick)
@@ -348,9 +352,21 @@ struct ComposerView: View {
         model.addFiles(panel.urls, to: composerID)
     }
 
+    /// The height of one row of the composer: the field with a single line, and the slot each button sits in.
+    static let rowHeight: CGFloat = 40
+    /// The attach button, the same size as the window's glass buttons.
+    static let attachSize: CGFloat = 36
+    static let sendSize: CGFloat = 26
+    /// Space between the send button and the field's right edge.
+    static let sendInset: CGFloat = 8
+    /// The text view's line height for the body font, emoji included.
+    static let lineHeight: CGFloat = 16
+    /// Room below the last line so the text view never needs to scroll by a fraction of a point.
+    static let editorSlack: CGFloat = 2
+
     private var editorHeight: CGFloat {
         let lines = max(1, min(6, text.split(separator: "\n", omittingEmptySubsequences: false).count))
-        return CGFloat(lines) * 18 + 8
+        return CGFloat(lines) * Self.lineHeight + Self.editorSlack
     }
 
     private func scheduleSave() {

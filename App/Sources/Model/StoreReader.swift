@@ -1,4 +1,5 @@
 import ChatModel
+import ChatStore
 import ChatSync
 import Foundation
 
@@ -27,6 +28,11 @@ enum StoreReader {
     @concurrent
     static func mentionCandidates(session: AccountSession, space: SpaceName) async -> [Contact] {
         (try? session.contacts.mentionCandidates(in: space)) ?? []
+    }
+
+    @concurrent
+    static func storedSpace(session: AccountSession, space: SpaceName) async -> StoredSpace? {
+        (try? session.storedSpace(space)) ?? nil
     }
 
     @concurrent

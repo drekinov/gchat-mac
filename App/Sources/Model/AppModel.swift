@@ -759,6 +759,12 @@ final class AppModel {
     }
 
     /// The space's cached memberships, for the members list. `prepareMentions` refreshes a stale cache.
+    /// The conversation's stored record, for its details: when it was made, guests, notifications.
+    func storedSpace(for key: SpaceKey) async -> StoredSpace? {
+        guard let session = sessions[key.account] else { return nil }
+        return await StoreReader.storedSpace(session: session, space: key.space)
+    }
+
     func memberships(for key: SpaceKey) async -> [Membership] {
         guard let session = sessions[key.account] else { return [] }
         return await StoreReader.memberships(session: session, space: key.space)

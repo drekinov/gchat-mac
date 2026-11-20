@@ -94,6 +94,11 @@
                 MembersPopover(model: model, key: threaded.id, members: members) {}
                     .background(Color(nsColor: .windowBackgroundColor)),
                 NSSize(width: 340, height: 520))
+            await window(
+                "29-details.png",
+                ConversationDetailsPopover(model: model, key: threaded.id, members: members)
+                    .background(Color(nsColor: .windowBackgroundColor)),
+                NSSize(width: 340, height: 280))
 
             await window(
                 "26-message-search.png", MessageSearchSheet(model: model, initialQuery: "release"),
