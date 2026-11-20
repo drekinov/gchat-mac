@@ -85,7 +85,7 @@ struct SidebarView: View {
                     photoURL: { model.photoURL($0, account: entry.account) }
                 )
                 .padding(.horizontal, 4)
-                .padding(.vertical, 3)
+                .padding(.vertical, 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(background(selected: selected, hovered: hovered == entry.id), in: Card())
                 .contentShape(Card())
@@ -286,11 +286,11 @@ struct InboxRow: View {
             Circle()
                 .fill(entry.hasUnread && !isSelected ? Theme.accent : .clear)
                 .frame(width: 7, height: 7)
-            avatar(title, size: compact ? 24 : 38)
+            avatar(title, size: compact ? 24 : 40)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(title)
-                        .font(.body.weight(entry.hasUnread ? .semibold : .medium))
+                        .font(.body.weight(.semibold))
                         .lineLimit(1)
                     if entry.isMuted {
                         Image(systemName: "bell.slash.fill").font(.system(size: 10)).foregroundStyle(.secondary)
@@ -319,8 +319,8 @@ struct InboxRow: View {
         picture(title, size: size)
             .overlay(alignment: .bottomTrailing) {
                 if showsBadge {
-                    AccountBadge(info: account, size: size > 30 ? 16 : 13)
-                        .padding(1.5)
+                    AccountBadge(info: account, size: size > 30 ? 17 : 13)
+                        .padding(2)
                         .background(Color(nsColor: .windowBackgroundColor), in: Circle())
                         .offset(x: 4, y: 4)
                 }
@@ -359,12 +359,12 @@ struct FaceStack: View {
     var size: CGFloat = 38
 
     var body: some View {
-        let small = (size * 0.66).rounded()
+        let small = (size * 0.65).rounded()
         ZStack {
             face(users[0], small)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             face(users[1], small)
-                .padding(1.5)
+                .padding(2)
                 .background(Color(nsColor: .windowBackgroundColor), in: Circle())
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
         }
