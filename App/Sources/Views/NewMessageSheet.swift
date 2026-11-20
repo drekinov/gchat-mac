@@ -92,6 +92,7 @@ struct NewMessageSheet: View {
     private var header: some View {
         let info = accountID.flatMap { model.info($0) }
         return HStack(spacing: 10) {
+            SheetCloseButton(action: close)
             Text("New message").font(.title3.weight(.semibold))
             Spacer()
             Menu {
@@ -114,7 +115,7 @@ struct NewMessageSheet: View {
             .help("Account the chat starts from")
             .accessibilityLabel("From \(RemoteText.title(info?.name ?? "no account"))")
         }
-        .padding(.leading, 18)
+        .padding(.leading, 14)
         .padding(.trailing, 14)
         .padding(.top, 14)
         .padding(.bottom, 10)

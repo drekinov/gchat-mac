@@ -15,6 +15,11 @@ enum Theme {
     static let incomingBubble = dynamic(light: 0xDE_E1E5, dark: 0x36_393F)
     /// Quotes and cards inside a bubble.
     static let insetSurface = dynamic(light: 0xFF_FFFF, dark: 0x26_272B)
+    /// The sidebar island: a little darker than the window in light mode and a little lighter in dark mode, with a
+    /// trace of Slate, so the sidebar reads as a panel of its own.
+    static let island = dynamic(light: 0xEA_EBEE, dark: 0x2B_2D32)
+    /// The island's hairline edge.
+    static let islandEdge = dynamic(light: 0x00_0000, dark: 0xFF_FFFF, lightAlpha: 0.07, darkAlpha: 0.08)
     /// Selected rows and highlighted search results.
     static let selection = dynamic(light: 0x4A_6382, dark: 0x6E_87A6, lightAlpha: 0.14, darkAlpha: 0.32)
     static let warning = dynamic(light: 0x9A_5B00, dark: 0xF2_B455)

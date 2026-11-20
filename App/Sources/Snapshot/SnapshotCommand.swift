@@ -463,7 +463,8 @@
             let window = NSWindow(
                 contentRect: NSRect(origin: NSPoint(x: 20, y: 20), size: size), styleMask: [.borderless],
                 backing: .buffered, defer: false)
-            let host = NSHostingView(rootView: root)
+            // Offscreen renders can't draw glass, so every view gets the flat stand-ins snapshot mode provides.
+            let host = NSHostingView(rootView: root.environment(\.isSnapshotMode, true))
             host.frame = NSRect(origin: .zero, size: size)
             window.isReleasedWhenClosed = false
             window.contentView = host

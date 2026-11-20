@@ -6,36 +6,41 @@ struct SpaceView: View {
     let model: AppModel
     let key: SpaceKey
     @Environment(\.isSnapshotMode) private var snapshotMode
+    @Environment(\.titlebarHeight) private var titlebarHeight
     @State private var dropTargeted = false
     @State private var members: [Membership] = []
 
     var body: some View {
         VStack(spacing: 0) {
-            // Offscreen snapshots have no window toolbar, so they show the title and buttons above the messages.
-            if snapshotMode {
-                SpaceTitle(model: model, key: key, members: members)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .overlay(alignment: .trailing) {
-                        HStack(spacing: 2) { SpaceActions(model: model, key: key, members: members) }
-                            .labelStyle(.iconOnly)
-                            .buttonStyle(.borderless)
-                            .padding(.horizontal, 4)
-                            .modifier(GlassCapsule(flat: true))
-                            .padding(.trailing, 14)
-                    }
-            }
             MessageList(model: model, key: key, dropTargeted: $dropTargeted)
+                // The title sits in the toolbar's strip, centred over the conversation rather than the window, so
+                // it's a bar of the conversation's own; messages scroll under it with the toolbar's edge effect.
+                // Offscreen snapshots have no toolbar, so they also show the buttons here.
+                .safeAreaBar(edge: .top, spacing: 0) {
+                    SpaceTitle(model: model, key: key, members: members)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding(.horizontal, 120)
+                        .background { WindowDragArea() }
+                        .overlay(alignment: .trailing) {
+                            if snapshotMode {
+                                HStack(spacing: 2) { SpaceActions(model: model, key: key, members: members) }
+                                    .labelStyle(.iconOnly)
+                                    .buttonStyle(.borderless)
+                                    .padding(.horizontal, 4)
+                                    .modifier(GlassCapsule(flat: true))
+                                    .padding(.trailing, 14)
+                            }
+                        }
+                        .frame(height: titlebarHeight)
+                        // Solid, like the window, so messages scrolling under it never show through the title.
+                        .background(Color(nsColor: .textBackgroundColor))
+                }
             ComposerView(model: model, key: key, thread: nil, conversationDropTargeted: dropTargeted)
         }
         .background(Color(nsColor: .textBackgroundColor))
         .toolbar {
             if !snapshotMode {
-                ToolbarItem(placement: .principal) {
-                    SpaceTitle(model: model, key: key, members: members)
-                }
-                .sharedBackgroundVisibility(.hidden)
-                ToolbarItemGroup(placement: .primaryAction) {
+                ToolbarItemGroup {
                     SpaceActions(model: model, key: key, members: members).labelStyle(.iconOnly)
                 }
             }

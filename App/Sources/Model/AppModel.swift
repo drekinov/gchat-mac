@@ -83,6 +83,8 @@ final class AppModel {
     @ObservationIgnored var activeComposer: ComposerID?
     private(set) var openWindowRequest = 0
     var showsNewMessage = false
+    /// Whether the sidebar island is showing. View > Hide Sidebar and the island's own button change it.
+    var showsSidebar = true
     private(set) var newMessageAccount: AccountID?
     private(set) var pendingComposerFocus: SpaceKey?
 

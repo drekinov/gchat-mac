@@ -31,12 +31,12 @@ struct MessageSearchSheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 10) {
+                SheetCloseButton { dismiss() }
                 Text("Search messages").font(.title3.weight(.semibold))
                 Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }
-            .padding(.leading, 20)
+            .padding(.leading, 14)
             .padding(.trailing, 16)
             .padding(.top, 14)
             .padding(.bottom, 10)

@@ -22,6 +22,7 @@ struct QuickSwitcher: View {
         let entries = results
         VStack(spacing: 0) {
             HStack(spacing: 10) {
+                SheetCloseButton(action: onClose)
                 Image(systemName: "magnifyingglass")
                     .font(.title3)
                     .foregroundStyle(.secondary)
@@ -40,7 +41,8 @@ struct QuickSwitcher: View {
                         return .handled
                     }
             }
-            .padding(.horizontal, 16)
+            .padding(.leading, 14)
+            .padding(.trailing, 16)
             .padding(.top, 14)
             .padding(.bottom, 12)
             Divider()

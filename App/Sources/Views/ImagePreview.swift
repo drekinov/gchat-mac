@@ -192,6 +192,7 @@ struct ImagePreviewSheet: View {
 
     private var header: some View {
         HStack(spacing: 12) {
+            SheetCloseButton(action: onClose)
             VStack(alignment: .leading, spacing: 1) {
                 Text(current.map { RemoteText.title($0.attachment.contentName) } ?? "GIF")
                     .font(.headline)
@@ -230,9 +231,9 @@ struct ImagePreviewSheet: View {
                 }
                 .labelStyle(.titleAndIcon)
             }
-            Button("Close", action: onClose).keyboardShortcut(.cancelAction)
         }
-        .padding(.horizontal, 16)
+        .padding(.leading, 14)
+        .padding(.trailing, 16)
         .padding(.vertical, 10)
     }
 
