@@ -989,13 +989,17 @@ final class AppModel {
         var context = MessageContext(me: info(key.account)?.me, messages: openMessages)
         context.actions = reactionActions(for: key)
         context.media = mediaLoader(for: key.account)
+        // The thread's messages come second: a reply loaded only for the open thread isn't in the conversation's.
         context.openPreview = { [self] attachment in
             guard let media = mediaLoader(for: key.account) else { return }
-            preview = PreviewTarget(attachment: attachment, media: media)
+            preview = PreviewTarget(
+                attachment: attachment, media: media, messages: [openMessages, threadMessages], space: summary(for: key)
+            )
         }
         context.openGifPreview = { [self] url in
             guard let media = mediaLoader(for: key.account) else { return }
-            preview = PreviewTarget(gifURL: url, media: media)
+            preview = PreviewTarget(
+                gifURL: url, media: media, messages: [openMessages, threadMessages], space: summary(for: key))
         }
         context.photoURL = { [self] in photoURLs[key.account]?[$0] }
         return context
