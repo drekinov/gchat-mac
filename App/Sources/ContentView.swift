@@ -65,31 +65,22 @@ struct RootSplitView: View {
                     }
                 }
         } detail: {
-            // The thread pane is a plain HStack column: SwiftUI's split-view inspector renegotiates column
-            // minimums as messages re-wrap and can loop until AppKit throws.
-            HStack(spacing: 0) {
-                detail.frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-                if let key = model.selection, let thread = model.openThread {
-                    Divider()
-                    ThreadInspector(model: model, key: key, thread: thread)
-                        .id(ComposerID(key: key, thread: thread))
-                        .frame(width: 360)
+            // Threads open in place inside the conversation, so the detail is a single column.
+            detail
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+                .toolbar(removing: .title)
+                .sheet(item: $model.preview) { target in
+                    ImagePreviewSheet(target: target) { model.preview = nil }
                 }
-            }
-            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-            .toolbar(removing: .title)
-            .sheet(item: $model.preview) { target in
-                ImagePreviewSheet(target: target) { model.preview = nil }
-            }
-            .sheet(isPresented: $model.showsNewMessage) {
-                NewMessageSheet(model: model)
-            }
-            .sheet(isPresented: $model.showsSwitcher) {
-                QuickSwitcher(model: model) { model.showsSwitcher = false }
-            }
-            .sheet(isPresented: $model.showsMessageSearch) {
-                MessageSearchSheet(model: model)
-            }
+                .sheet(isPresented: $model.showsNewMessage) {
+                    NewMessageSheet(model: model)
+                }
+                .sheet(isPresented: $model.showsSwitcher) {
+                    QuickSwitcher(model: model) { model.showsSwitcher = false }
+                }
+                .sheet(isPresented: $model.showsMessageSearch) {
+                    MessageSearchSheet(model: model)
+                }
         }
     }
 

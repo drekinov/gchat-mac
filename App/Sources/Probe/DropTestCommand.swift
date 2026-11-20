@@ -37,7 +37,15 @@
             }
             model.select(entry.id)
             await model.waitUntilSettled(timeout: .seconds(3))
-            guard let thread = model.openMessages.last(where: \.isThreadReply)?.thread else {
+            // The newest thread with replies, opened in place under its first message like a click on its replies
+            // button does.
+            let replied = Set(model.openMessages.filter(\.isThreadReply).compactMap(\.thread))
+            guard
+                let thread = model.openMessages.last(where: {
+                    !$0.isThreadReply && $0.thread.map(replied.contains) == true
+                })?
+                .thread
+            else {
                 print("DROPTEST FAIL no thread to open")
                 return 1
             }
@@ -54,12 +62,17 @@
             await Self.pump(.seconds(2.5))
             defer { window.close() }
 
-            // The thread inspector sits to the right of the conversation.
+            // The open thread's reply field sits in the message list, above the conversation's composer.
             let editors = Self.textViews(in: window).filter(\.isEditable).sorted {
-                $0.convert($0.bounds, to: nil).minX < $1.convert($1.bounds, to: nil).minX
+                $0.convert($0.bounds, to: nil).minY < $1.convert($1.bounds, to: nil).minY
             }
             guard editors.count == 2, model.openThread == thread else {
-                print("DROPTEST FAIL expected the main and thread composers, found \(editors.count) editors")
+                print(
+                    "DROPTEST FAIL expected the main and thread composers, found \(editors.count) editors; "
+                        + "open thread: \(model.openThread != nil), replies loaded: \(model.threadMessages.count), "
+                        + "text views: \(Self.textViews(in: window).count), root at "
+                        + "\(model.openMessages.filter { !$0.isThreadReply }.firstIndex { $0.thread == thread } ?? -1) of "
+                        + "\(model.openMessages.filter { !$0.isThreadReply }.count)")
                 return 1
             }
             let composers = [
@@ -105,7 +118,8 @@
                 case .boxTopPadding: NSPoint(x: frame.midX, y: frame.maxY + 2)
                 case .boxBottomPadding: NSPoint(x: frame.midX, y: frame.minY - 2)
                 case .boxLeftPadding: NSPoint(x: frame.minX - 3, y: frame.midY)
-                case .messageList: NSPoint(x: frame.midX, y: frame.maxY + 200)
+                // Near the top of the message list, above the open thread, which takes its own drops.
+                case .messageList: NSPoint(x: frame.midX, y: 800 - 110)
                 }
             }
         }

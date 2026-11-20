@@ -78,6 +78,8 @@ final class AppModel {
     private(set) var droppedText: [ComposerID: [String]] = [:]
     /// Bumped on every queued drop, so a second identical drop still reaches the composer.
     private(set) var droppedTextRevision = 0
+    @ObservationIgnored private var mentionRequests: [ComposerID: Contact] = [:]
+    private(set) var mentionRequestRevision = 0
     @ObservationIgnored var activeComposer: ComposerID?
     private(set) var openWindowRequest = 0
     var showsNewMessage = false
@@ -694,6 +696,22 @@ final class AppModel {
     func mentionCandidates(for key: SpaceKey) async -> [Contact] {
         guard let session = sessions[key.account] else { return [] }
         return await StoreReader.mentionCandidates(session: session, space: key.space)
+    }
+
+    /// The space's cached memberships, for the members list. `prepareMentions` refreshes a stale cache.
+    func memberships(for key: SpaceKey) async -> [Membership] {
+        guard let session = sessions[key.account] else { return [] }
+        return await StoreReader.memberships(session: session, space: key.space)
+    }
+
+    /// Asks a composer to insert an @-mention, for the members list's Mention button.
+    func requestMention(_ contact: Contact, in id: ComposerID) {
+        mentionRequests[id] = contact
+        mentionRequestRevision += 1
+    }
+
+    func takeMentionRequest(_ id: ComposerID) -> Contact? {
+        mentionRequests.removeValue(forKey: id)
     }
 
     // MARK: New message
