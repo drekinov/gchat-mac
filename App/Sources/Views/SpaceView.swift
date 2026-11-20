@@ -22,6 +22,7 @@ struct SpaceView: View {
 struct SpaceHeader: View {
     let model: AppModel
     let key: SpaceKey
+    @Environment(\.isSnapshotMode) private var snapshotMode
     @State private var showsMembers = false
     @State private var members: [Membership] = []
 
@@ -67,9 +68,30 @@ struct SpaceHeader: View {
             Spacer(minLength: 0)
         }
         .overlay(alignment: .trailing) {
-            if let historyOn = summary?.historyOn {
-                HistoryBadge(historyOn: historyOn).padding(.trailing, 16)
+            HStack(spacing: 2) {
+                if let historyOn = summary?.historyOn {
+                    HistoryBadge(historyOn: historyOn).frame(width: 30, height: 28)
+                }
+                Button {
+                    model.showsMessageSearch = true
+                } label: {
+                    Image(systemName: "magnifyingglass").frame(width: 30, height: 28)
+                }
+                .help("Search messages (Cmd-F)")
+                .accessibilityLabel("Search messages")
+                Button {
+                    showsMembers.toggle()
+                } label: {
+                    Image(systemName: "info.circle").frame(width: 30, height: 28)
+                }
+                .help("Members and details")
+                .accessibilityLabel("Members and details")
             }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 4)
+            .modifier(GlassCapsule(flat: snapshotMode))
+            .padding(.trailing, 14)
         }
         .padding(.top, 6)
         .padding(.bottom, 4)
@@ -111,6 +133,20 @@ struct SpaceHeader: View {
         case .groupChat: .group
         case .directMessage: summary?.isBotDM == true ? .bot : .directMessage
         default: .space
+        }
+    }
+}
+
+/// Liquid Glass behind a group of toolbar-like buttons. Offscreen snapshots can't draw glass, and it hides what's
+/// on it there, so they get a flat capsule instead.
+struct GlassCapsule: ViewModifier {
+    let flat: Bool
+
+    func body(content: Content) -> some View {
+        if flat {
+            content.background(Color.primary.opacity(0.06), in: Capsule())
+        } else {
+            content.glassEffect(.regular, in: .capsule)
         }
     }
 }

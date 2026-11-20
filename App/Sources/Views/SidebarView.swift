@@ -52,6 +52,7 @@ struct SidebarView: View {
                 showsBadge: showsBadges, isSelected: model.selection == entry.id, density: density
             )
             .tag(entry.id)
+            .listRowSeparator(.hidden)
         }
     }
 

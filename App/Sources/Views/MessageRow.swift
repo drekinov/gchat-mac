@@ -269,12 +269,6 @@ struct MessageRow: View {
                 Text("App").font(.system(size: 9, weight: .bold)).padding(.horizontal, 4)
                     .background(Color.secondary.opacity(0.2), in: RoundedRectangle(cornerRadius: 3))
             }
-            // The time separator above already says when, so the time repeats only without one.
-            if row.timeHeader == nil {
-                Text(message.createTime.date.formatted(.dateTime.hour().minute()))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
         }
         .foregroundStyle(.secondary)
     }
@@ -337,7 +331,10 @@ struct MessageRow: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .foregroundStyle(mine ? Theme.onAccent : Color(nsColor: .labelColor))
-            .background(mine ? Theme.accent : Theme.incomingBubble, in: Bubble())
+            .background(
+                mine ? Theme.accent : Theme.incomingBubble,
+                in: Bubble(mine: mine, joinsAbove: !row.showsHeader, joinsBelow: !row.endsGroup)
+            )
             .help(message.createTime.date.formatted(date: .complete, time: .shortened))
         }
         if let cards = message.cards {
@@ -399,15 +396,31 @@ struct MessageRow: View {
     }
 }
 
-/// The shape every bubble shares.
+/// The shape every bubble shares. Where bubbles in a run meet, on the sender's side, the corners tighten, so a run
+/// reads as one block.
 struct Bubble: InsettableShape {
+    var mine = false
+    var joinsAbove = false
+    var joinsBelow = false
     var inset: CGFloat = 0
 
     func path(in rect: CGRect) -> Path {
-        RoundedRectangle(cornerRadius: 17, style: .continuous).inset(by: inset).path(in: rect)
+        let round: CGFloat = 17
+        let tight: CGFloat = 6
+        let top = joinsAbove ? tight : round
+        let bottom = joinsBelow ? tight : round
+        let radii = RectangleCornerRadii(
+            topLeading: mine ? round : top, bottomLeading: mine ? round : bottom,
+            bottomTrailing: mine ? bottom : round, topTrailing: mine ? top : round)
+        return UnevenRoundedRectangle(cornerRadii: radii, style: .continuous)
+            .path(in: rect.insetBy(dx: inset, dy: inset))
     }
 
-    func inset(by amount: CGFloat) -> Bubble { Bubble(inset: inset + amount) }
+    func inset(by amount: CGFloat) -> Bubble {
+        var copy = self
+        copy.inset += amount
+        return copy
+    }
 }
 
 /// "3 replies" under a message, with the latest people to reply and the latest reply; opens the thread in place.
