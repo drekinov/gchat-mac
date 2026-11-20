@@ -41,7 +41,7 @@ struct MenuBarContent: View {
         Divider()
         Button("Open Thimble") { showWindow() }
         Divider()
-        Button("Quit") { NSApplication.shared.terminate(nil) }
+        Button("Quit Thimble") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
     }
 

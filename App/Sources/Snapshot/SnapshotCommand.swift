@@ -87,7 +87,7 @@
 
             await window(
                 "26-message-search.png", MessageSearchSheet(model: model, initialQuery: "release"),
-                NSSize(width: 650, height: 490))
+                MessageSearchSheet.size)
 
             let showcases: [(file: String, title: String, size: NSSize)] = [
                 ("05-reactions-and-emoji.png", "Engineering", wide),
@@ -126,14 +126,13 @@
                 EmojiPicker(customEmojis: customEmojis, initialQuery: query, onPick: { _ in })
                     .background(Color(nsColor: .windowBackgroundColor))
             }
-            await window("13-emoji-picker.png", picker(""), NSSize(width: 340, height: 440))
-            await window("14-emoji-picker-search.png", picker("heart"), NSSize(width: 340, height: 440))
+            await window("13-emoji-picker.png", picker(""), EmojiPicker.size)
+            await window("14-emoji-picker-search.png", picker("heart"), EmojiPicker.size)
             let tones = UserDefaults(suiteName: "io.github.drekinov.gchat-mac.snapshot.tone")
             tones?.set(4, forKey: "emojiSkinTone")
             if let tones {
                 await window(
-                    "15-emoji-picker-skin-tone.png", picker("hand").defaultAppStorage(tones),
-                    NSSize(width: 340, height: 440))
+                    "15-emoji-picker-skin-tone.png", picker("hand").defaultAppStorage(tones), EmojiPicker.size)
                 tones.removePersistentDomain(forName: "io.github.drekinov.gchat-mac.snapshot.tone")
             }
 
@@ -156,8 +155,7 @@
 
             for tab in SettingsTab.allCases {
                 await window(
-                    "09-settings-\(tab.rawValue).png", SettingsView(model: model, initialTab: tab),
-                    NSSize(width: 580, height: 440))
+                    "09-settings-\(tab.rawValue).png", SettingsView(model: model, initialTab: tab), SettingsView.size)
             }
 
             model.openNewMessage()
@@ -195,6 +193,12 @@
                 "10-quick-switcher.png", QuickSwitcher(model: model).background(Color(nsColor: .windowBackgroundColor)),
                 NSSize(width: 500, height: 520))
 
+            // The first run: no accounts yet, with a saved client.
+            await window(
+                "27-first-run.png",
+                SignInView(model: model, snapshotClient: "example-chat")
+                    .background(Color(nsColor: .windowBackgroundColor)), wide)
+
             let suite = UserDefaults(suiteName: "io.github.drekinov.gchat-mac.snapshot.notify")
             suite?.set(true, forKey: NotificationCenterPoster.enabledKey)
             if let suite {
@@ -204,8 +208,8 @@
                         NotificationsSettings(statusOverride: .authorized)
                             .tabItem { Label("Notifications", systemImage: "bell") }
                     }
-                    .frame(width: 580, height: 440)
-                    .defaultAppStorage(suite), NSSize(width: 580, height: 440))
+                    .frame(width: SettingsView.size.width, height: SettingsView.size.height)
+                    .defaultAppStorage(suite), SettingsView.size)
                 suite.removePersistentDomain(forName: "io.github.drekinov.gchat-mac.snapshot.notify")
             }
 

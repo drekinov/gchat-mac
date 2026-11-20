@@ -30,18 +30,21 @@ struct NewMessageSheet: View {
         case header(String)
         case person(Contact)
         case email(Contact)
+        /// Explains the email route while a name is typed; not selectable.
+        case hint(String)
 
         var id: String {
             switch self {
             case .header(let title): "h-\(title)"
             case .person(let contact): "p-\(contact.id)"
             case .email(let contact): "e-\(contact.id)"
+            case .hint: "hint"
             }
         }
 
         var contact: Contact? {
             switch self {
-            case .header: nil
+            case .header, .hint: nil
             case .person(let contact), .email(let contact): contact
             }
         }
@@ -52,13 +55,11 @@ struct NewMessageSheet: View {
         let selectable = entries.compactMap(\.contact)
         VStack(spacing: 0) {
             header
-            Divider()
             searchField(selectable)
-            Divider()
             list(entries, selectable)
             if let errorText {
                 Divider()
-                Text(errorText).font(.callout).foregroundStyle(.red).padding(10)
+                Text(errorText).font(.callout).foregroundStyle(Theme.error).padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -89,30 +90,39 @@ struct NewMessageSheet: View {
     // MARK: Pieces
 
     private var header: some View {
-        HStack(spacing: 10) {
+        let info = accountID.flatMap { model.info($0) }
+        return HStack(spacing: 10) {
             Text("New message").font(.title3.weight(.semibold))
             Spacer()
             Menu {
-                ForEach(model.accounts) { info in
-                    Button(RemoteText.title(info.name)) { accountID = info.id }
+                Picker("From", selection: $accountID) {
+                    ForEach(model.accounts) { account in
+                        Text(RemoteText.title(account.name)).tag(Optional(account.id))
+                    }
                 }
+                .pickerStyle(.inline)
+                .labelsHidden()
             } label: {
                 HStack(spacing: 6) {
-                    AccountBadge(info: accountID.flatMap { model.info($0) }, size: 16)
-                    Text(RemoteText.title(accountID.flatMap { model.info($0)?.name } ?? "Account"))
+                    Text("From").foregroundStyle(.secondary)
+                    AccountBadge(info: info, size: 14)
+                    Text(RemoteText.title(info?.name ?? "Account"))
                 }
             }
             .menuStyle(.button)
             .fixedSize()
             .help("Account the chat starts from")
+            .accessibilityLabel("From \(RemoteText.title(info?.name ?? "no account"))")
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.leading, 18)
+        .padding(.trailing, 14)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
     }
 
     private func searchField(_ selectable: [Contact]) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
             TextField("Name or email", text: $query)
                 .textFieldStyle(.plain)
                 .font(.title3)
@@ -128,18 +138,29 @@ struct NewMessageSheet: View {
                 }
             if searching { ProgressView().controlSize(.small) }
         }
-        .padding(12)
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 14)
+        .padding(.bottom, 6)
     }
 
     private func list(_ entries: [Entry], _ selectable: [Contact]) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    if selectable.isEmpty {
+                        Text(query.isEmpty ? "No contacts yet. Type a name or an email address." : "No matches")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(24)
+                    }
                     ForEach(entries) { entry in
                         switch entry {
                         case .header(let title):
                             Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                                 .padding(.horizontal, 14).padding(.top, 10).padding(.bottom, 4)
+                                .accessibilityAddTraits(.isHeader)
                         case .person(let contact):
                             row(contact, label: nil, highlighted: selectable[safe: highlight]?.id == contact.id)
                                 .id(entry.id)
@@ -149,15 +170,12 @@ struct NewMessageSheet: View {
                                 highlighted: selectable[safe: highlight]?.id == contact.id
                             )
                             .id(entry.id)
+                        case .hint(let text):
+                            hintRow(text)
                         }
                     }
-                    if selectable.isEmpty {
-                        Text(query.isEmpty ? "No contacts yet. Type a name or an email address." : "No matches")
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(24)
-                    }
                 }
+                .padding(.horizontal, 6)
                 .padding(.bottom, 8)
             }
             .onChange(of: highlight) {
@@ -173,31 +191,55 @@ struct NewMessageSheet: View {
             if label == nil {
                 Avatar(name: RemoteText.title(contact.displayName), size: 30)
             } else {
-                Image(systemName: "envelope.fill").foregroundStyle(.secondary).frame(width: 30, height: 30)
-                    .background(Color.secondary.opacity(0.15), in: Circle())
+                envelope
             }
-            VStack(alignment: .leading, spacing: 0) {
-                Text(label ?? RemoteText.title(contact.displayName)).lineLimit(1)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label ?? RemoteText.title(contact.displayName)).fontWeight(.medium).lineLimit(1)
                 if label == nil, let email = contact.email, !email.isEmpty {
                     Text(RemoteText.title(email)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
-            Spacer()
+            Spacer(minLength: 8)
             if starting == contact.id {
                 ProgressView().controlSize(.small)
             } else if contact.directMessage != nil {
-                Text("DM").font(.system(size: 10, weight: .bold)).padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(Color.secondary.opacity(0.2), in: Capsule())
+                Text("DM")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 4))
+                    .help("You already have a direct message with this person")
+                    .accessibilityLabel("Direct message")
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 5)
-        .background(highlighted ? Color.accentColor.opacity(0.18) : .clear, in: RoundedRectangle(cornerRadius: 6))
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(highlighted ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 9))
         .contentShape(Rectangle())
         .onTapGesture { start(contact) }
         .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isButton)
+        .accessibilityAddTraits(highlighted ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private func hintRow(_ text: String) -> some View {
+        HStack(spacing: 10) {
+            envelope
+            Text(text).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .padding(.top, 4)
+    }
+
+    private var envelope: some View {
+        Image(systemName: "envelope")
+            .font(.system(size: 13))
+            .foregroundStyle(.secondary)
+            .frame(width: 30, height: 30)
+            .background(.fill.tertiary, in: Circle())
+            .accessibilityHidden(true)
     }
 
     // MARK: Content
@@ -208,11 +250,10 @@ struct NewMessageSheet: View {
             needle.isEmpty || contact.displayName.localizedCaseInsensitiveContains(needle)
                 || (contact.email?.localizedCaseInsensitiveContains(needle) ?? false)
         }
-        let recent = filtered.filter { $0.directMessage != nil }
-        let others = filtered.filter { $0.directMessage == nil }
+        // People with a DM first, then everyone else from shared spaces.
+        let people = filtered.filter { $0.directMessage != nil } + filtered.filter { $0.directMessage == nil }
         var result: [Entry] = []
-        if !recent.isEmpty { result += [.header("Recent DMs")] + recent.map(Entry.person) }
-        if !others.isEmpty { result += [.header("People from your chats")] + others.map(Entry.person) }
+        if !people.isEmpty { result += [.header("People you chat with")] + people.map(Entry.person) }
 
         let known = Set(local.compactMap(\.user))
         let fresh = directory.filter { $0.user.map { !known.contains($0) } ?? true }
@@ -223,6 +264,8 @@ struct NewMessageSheet: View {
             let lower = needle.lowercased()
             let listed = (local + fresh).contains { $0.email?.lowercased() == lower }
             if !listed { result += [.header("Email address"), .email(Contact.typed(email: needle))] }
+        } else if !needle.isEmpty {
+            result.append(.hint("Type a full email address to message anyone in the directory."))
         }
         return result
     }

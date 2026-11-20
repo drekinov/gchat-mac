@@ -80,39 +80,34 @@ struct EmojiPicker: View {
     }
 
     private static let recentLimit = 16
+    static let size = NSSize(width: 340, height: 460)
+    /// The most common reactions, one click away above the search field.
+    private static let quickGlyphs = ["👍", "❤️", "😂", "🎉", "👀", "🙏"]
+
+    /// The section the list is scrolled to, for the category tabs.
+    @State private var visibleSection: String?
 
     var body: some View {
         let layout = rows()
         VStack(spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search emoji", text: $query)
-                    .textFieldStyle(.plain)
-                    .focused($focused)
-                    .onSubmit { pickCurrent(layout.cellRows) }
-                    .onKeyPress(.downArrow) { move(.down, layout.cellRows) }
-                    .onKeyPress(.upArrow) { move(.up, layout.cellRows) }
-                    .onKeyPress(.rightArrow) { query.isEmpty ? move(.right, layout.cellRows) : .ignored }
-                    .onKeyPress(.leftArrow) { query.isEmpty ? move(.left, layout.cellRows) : .ignored }
+            VStack(spacing: 10) {
+                quickReactions
+                searchField(layout)
             }
-            .padding(10)
-            toneSelector
-            Divider()
-            list(layout)
-            Divider()
-            HStack {
-                Button("Emoji & Symbols…") {
-                    onClose()
-                    NSApplication.shared.orderFrontCharacterPalette(nil)
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+            ScrollViewReader { proxy in
+                VStack(spacing: 0) {
+                    categoryTabs(proxy)
+                    Divider()
+                    list(layout, proxy)
                 }
-                .buttonStyle(.link)
-                .font(.callout)
-                Spacer()
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            Divider()
+            footer
         }
-        .frame(width: 340, height: 440)
+        .frame(width: Self.size.width, height: Self.size.height)
         .onChange(of: query) { cursor = Cursor(row: 0, column: 0) }
         .onExitCommand(perform: onClose)
         .task { focused = true }
@@ -120,59 +115,117 @@ struct EmojiPicker: View {
 
     // MARK: Layout
 
-    private var toneSelector: some View {
+    private var quickReactions: some View {
         HStack(spacing: 4) {
-            Text("Skin tone").font(.caption).foregroundStyle(.secondary)
-            Spacer()
-            ForEach(0...5, id: \.self) { value in
+            ForEach(quickCells) { cell in
                 Button {
-                    tone = value
+                    pick(cell)
                 } label: {
-                    Text(EmojiData.item(for: "✋")?.glyph(tone: value) ?? "✋")
-                        .font(.system(size: 14))
-                        .frame(width: 24, height: 22)
-                        .background(
-                            tone == value ? Color.accentColor.opacity(0.25) : .clear,
-                            in: RoundedRectangle(cornerRadius: 5))
+                    Text(cell.display)
+                        .font(.system(size: 24))
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                        .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 8))
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(value == 0 ? "Default skin tone" : "Skin tone \(value)")
+                .help(cell.label)
+                .accessibilityLabel(cell.label)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.bottom, 8)
     }
 
-    private func list(_ layout: (rows: [PickRow], cellRows: [[PickCell]])) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(layout.rows.enumerated()), id: \.element.id) { _, row in
-                        switch row {
-                        case .header(_, let title):
-                            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                                .padding(.top, 8).padding(.bottom, 2)
-                        case .cells(_, let cells, let custom):
-                            HStack(spacing: 2) {
-                                ForEach(cells) { cell in
-                                    cellButton(
-                                        cell, custom: custom, highlighted: cell.id == highlightedID(layout.cellRows))
-                                }
-                            }
+    private func searchField(_ layout: (rows: [PickRow], cellRows: [[PickCell]])) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass").font(.callout).foregroundStyle(.secondary).accessibilityHidden(true)
+            TextField("Search emoji", text: $query)
+                .textFieldStyle(.plain)
+                .focused($focused)
+                .onSubmit { pickCurrent(layout.cellRows) }
+                .onKeyPress(.downArrow) { move(.down, layout.cellRows) }
+                .onKeyPress(.upArrow) { move(.up, layout.cellRows) }
+                .onKeyPress(.rightArrow) { query.isEmpty ? move(.right, layout.cellRows) : .ignored }
+                .onKeyPress(.leftArrow) { query.isEmpty ? move(.left, layout.cellRows) : .ignored }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 30)
+        .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    /// Jumps to a section. Dimmed while searching, when the list is one set of results.
+    private func categoryTabs(_ proxy: ScrollViewProxy) -> some View {
+        let searching = !query.trimmingCharacters(in: .whitespaces).isEmpty
+        let tabs = tabSections()
+        let active = visibleSection ?? tabs.first?.id
+        return HStack(spacing: 2) {
+            ForEach(tabs, id: \.id) { tab in
+                let selected = !searching && tab.id == active
+                Button {
+                    visibleSection = tab.id
+                    proxy.scrollTo("h-\(tab.id)", anchor: .top)
+                } label: {
+                    Image(systemName: tab.symbol)
+                        .font(.system(size: 13))
+                        .foregroundStyle(selected ? .primary : .secondary)
+                        .frame(maxWidth: .infinity, minHeight: 28)
+                        .background(selected ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 7))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(tab.title)
+                .accessibilityLabel(tab.title)
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .disabled(searching)
+        .opacity(searching ? 0.45 : 1)
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
+    private func list(_ layout: (rows: [PickRow], cellRows: [[PickCell]]), _ proxy: ScrollViewProxy) -> some View {
+        let order = Dictionary(
+            tabSections().enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { first, _ in first })
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(layout.rows.enumerated()), id: \.element.id) { _, row in
+                    switch row {
+                    case .header(_, let title):
+                        Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .padding(.horizontal, 4).padding(.top, 8).padding(.bottom, 2)
                             .id(row.id)
+                            .accessibilityAddTraits(.isHeader)
+                    case .cells(_, let cells, let custom):
+                        HStack(spacing: 2) {
+                            ForEach(cells) { cell in
+                                cellButton(
+                                    cell, custom: custom, highlighted: cell.id == highlightedID(layout.cellRows))
+                            }
                         }
-                    }
-                    if layout.cellRows.isEmpty {
-                        Text("No matching emoji").foregroundStyle(.secondary).padding(20)
-                            .frame(maxWidth: .infinity)
+                        .id(row.id)
                     }
                 }
-                .padding(.horizontal, 10)
-                .padding(.bottom, 8)
+                if layout.cellRows.isEmpty {
+                    Text("No matching emoji").foregroundStyle(.secondary).padding(20)
+                        .frame(maxWidth: .infinity)
+                }
             }
-            .onChange(of: cursor) {
-                if let id = highlightedRowID(layout.rows, layout.cellRows) { proxy.scrollTo(id) }
+            .scrollTargetLayout()
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
+        }
+        .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { visible in
+            // Row ids start with their section's id ("h-food", "food-16"), and the topmost section wins.
+            let sections = visible.map { id in
+                id.hasPrefix("h-") ? String(id.dropFirst(2)) : String(id.prefix { $0 != "-" })
             }
+            if let top = sections.compactMap({ section in order[section].map { (section, $0) } })
+                .min(by: { $0.1 < $1.1 })?.0, top != visibleSection
+            {
+                visibleSection = top
+            }
+        }
+        .onChange(of: cursor) {
+            if let id = highlightedRowID(layout.rows, layout.cellRows) { proxy.scrollTo(id) }
         }
     }
 
@@ -182,21 +235,78 @@ struct EmojiPicker: View {
         } label: {
             Group {
                 if custom {
-                    Text(cell.display).font(.caption.monospaced()).foregroundStyle(
-                        Color(red: 0.50, green: 0.30, blue: 0.80)
-                    )
-                    .lineLimit(1).truncationMode(.middle)
+                    // Custom emoji images aren't downloaded, so their shortcodes stand in for them.
+                    Text(cell.display)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(Theme.accentText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 8)
+                        .frame(maxWidth: .infinity, minHeight: 24)
+                        .background(.fill.tertiary, in: Capsule())
+                        .padding(.horizontal, 3)
                 } else {
                     Text(cell.display).font(.system(size: 22))
                 }
             }
             .frame(width: custom ? 104 : 36, height: 34)
-            .background(highlighted ? Color.accentColor.opacity(0.28) : .clear, in: RoundedRectangle(cornerRadius: 6))
+            .background(highlighted ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 8))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(cell.label)
         .accessibilityLabel(cell.label)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Button("Emoji & Symbols…") {
+                onClose()
+                NSApplication.shared.orderFrontCharacterPalette(nil)
+            }
+            .buttonStyle(.plain)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(Theme.accentText)
+            Spacer(minLength: 4)
+            HStack(spacing: 2) {
+                ForEach(0...5, id: \.self) { value in
+                    Button {
+                        tone = value
+                    } label: {
+                        Text(EmojiData.item(for: "✋")?.glyph(tone: value) ?? "✋")
+                            .font(.system(size: 14))
+                            .frame(width: 24, height: 22)
+                            .background(
+                                tone == value ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 6)
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Skin tone")
+                    .accessibilityLabel(value == 0 ? "Default skin tone" : "Skin tone \(value)")
+                    .accessibilityAddTraits(tone == value ? .isSelected : [])
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Skin tone")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private var quickCells: [PickCell] {
+        Self.quickGlyphs.map { glyph in
+            EmojiData.item(for: glyph).map { cell(for: $0) }
+                ?? PickCell(id: "u-\(glyph)", pick: .unicode(glyph), display: glyph, label: glyph, isCustom: false)
+        }
+    }
+
+    /// The browsing sections, in list order, with their tab symbols.
+    private func tabSections() -> [(id: String, title: String, symbol: String)] {
+        var tabs: [(id: String, title: String, symbol: String)] = [("recent", "Frequently used", "clock")]
+        if !customEmojis.isEmpty { tabs.append(("custom", "Custom emoji", "star")) }
+        tabs += EmojiData.categories.map { ($0.id, $0.title, $0.symbol) }
+        return tabs
     }
 
     // MARK: Content
@@ -215,7 +325,7 @@ struct EmojiPicker: View {
         }
         if !customEmojis.isEmpty {
             result.append(
-                PickSection(id: "custom", title: "Custom", columns: 3, cells: customEmojis.map(customCell)))
+                PickSection(id: "custom", title: "Custom emoji", columns: 3, cells: customEmojis.map(customCell)))
         }
         for category in EmojiData.categories {
             result.append(
