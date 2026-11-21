@@ -259,12 +259,6 @@ extension State {
     }
 }
 
-extension WireError {
-    static func failedPrecondition(_ message: String) -> WireError {
-        WireError(status: 400, googleStatus: "FAILED_PRECONDITION", message: message)
-    }
-}
-
 extension FakeChatServer {
     public struct EventSubscriptionInfo: Sendable, Equatable {
         public var name: String

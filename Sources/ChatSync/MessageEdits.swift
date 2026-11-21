@@ -35,11 +35,12 @@ extension AccountSession {
     /// Fetches the current copy of one of the user's messages and stores it.
     public func editableCopy(of name: MessageName) async throws(MessageEditError) -> EditableCopy {
         let generation = try admittedGeneration()
+        let epoch = connectivityEpoch
         let fetched: EditableMessage
         do {
             fetched = try await engine.api.getEditableMessage(name)
         } catch {
-            throw failure(error, .readSpace, generation, space: name.space)
+            throw failure(error, .readSpace, generation, epoch: epoch, space: name.space)
         }
         guard !fetched.message.isDeleted else { throw .gone }
         commitQuietly(name.space, generation) { $0.append(.upsertMessages([fetched.message])) }
@@ -53,12 +54,13 @@ extension AccountSession {
         _ name: MessageName, text: String, basedOn: Timestamp
     ) async throws(MessageEditError) -> Message {
         var generation = try admittedGeneration()
+        let epoch = connectivityEpoch
         do { try await sends.pace(name.space) } catch { throw .failed(error) }
         let current: Message
         do {
             current = try await engine.api.getMessage(name)
         } catch {
-            throw failure(error, .readSpace, generation, space: name.space)
+            throw failure(error, .readSpace, generation, epoch: epoch, space: name.space)
         }
         guard !current.isDeleted else { throw .gone }
         let stored = try? store.message(name)
@@ -73,7 +75,7 @@ extension AccountSession {
         do {
             updated = try await engine.api.updateMessageText(name, text: text)
         } catch {
-            throw failure(error, .updateMessage, generation, space: name.space)
+            throw failure(error, .updateMessage, generation, epoch: epoch, space: name.space)
         }
         commitQuietly(name.space, generation) { $0.append(.upsertMessages([updated])) }
         return (try? store.message(name)) ?? updated
@@ -83,6 +85,7 @@ extension AccountSession {
     /// following event polls; until then the stored copies are marked deleted.
     public func deleteMessage(_ name: MessageName, force: Bool) async throws(MessageEditError) {
         var generation = try admittedGeneration()
+        let epoch = connectivityEpoch
         do { try await sends.pace(name.space) } catch { throw .failed(error) }
         generation = try admittedGeneration()
         sends.markWrite(name.space)
@@ -95,7 +98,7 @@ extension AccountSession {
             // Google doesn't document which 400 a thread starter with replies gets.
             throw .hasReplies
         } catch {
-            throw failure(error, .deleteMessage, generation, space: name.space)
+            throw failure(error, .deleteMessage, generation, epoch: epoch, space: name.space)
         }
         let tombstones = localTombstones(for: name, force: force)
         commitQuietly(name.space, generation) { $0.append(.upsertMessages(tombstones)) }
@@ -109,13 +112,14 @@ extension AccountSession {
     }
 
     private func failure(
-        _ error: ChatAPIError, _ operation: ChatOperation, _ generation: Generation, space: SpaceName
+        _ error: ChatAPIError, _ operation: ChatOperation, _ generation: Generation, epoch: UInt64,
+        space: SpaceName
     ) -> MessageEditError {
         switch error {
         case .permissionDenied: return .denied
         case .notFound: return .gone
         default:
-            handle(.api(error, operation), generation, space: space)
+            handle(.api(error, operation), generation, epoch: epoch, space: space)
             return .failed(.api(error, operation))
         }
     }
