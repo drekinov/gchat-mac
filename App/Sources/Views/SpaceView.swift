@@ -265,6 +265,7 @@ struct MessageList: View {
                     .id(Self.bottom)
             }
             .listStyle(.plain)
+            .defaultScrollAnchor(.bottom)
             .scrollContentBackground(.hidden)
             .background(Color(nsColor: .textBackgroundColor))
             // The stronger edge effect hides messages that scroll under the toolbar, so its title stays readable.
@@ -419,9 +420,21 @@ struct MessageList: View {
     // MARK: Scrolling
 
     private func scroll(_ proxy: ScrollViewProxy, animated: Bool, force: Bool = false) {
-        if force { pinned = true }
+        if force {
+            pinned = true
+            // Opening lands short while cards and long rows settle their heights, so it lands a few times.
+            scrollLater(.thread, after: .zero) {
+                for pause in [0, 120, 250, 450] {
+                    try? await Task.sleep(for: .milliseconds(pause))
+                    guard !Task.isCancelled else { return }
+                    pinned = true
+                    proxy.scrollTo(Self.bottom, anchor: .bottom)
+                }
+            }
+            return
+        }
         guard pinned else { return }
-        scrollLater(.follow, after: .milliseconds(force ? 120 : 30)) {
+        scrollLater(.follow, after: .milliseconds(30)) {
             if animated {
                 withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
             } else {

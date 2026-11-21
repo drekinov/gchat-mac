@@ -671,6 +671,18 @@ final class AppModel {
             .sorted { ($0.createTime, $0.name.rawValue) < ($1.createTime, $1.name.rawValue) }
     }
 
+    /// Profile photos for `users` not seen yet, for lists of people outside a conversation.
+    func loadPhotos(for users: [UserName], account: AccountID) {
+        guard let session = sessions[account] else { return }
+        let cached = photoURLs[account] ?? [:]
+        let missing = users.filter { cached[$0] == nil }
+        guard !missing.isEmpty else { return }
+        Task {
+            let found = await session.photos.load(missing)
+            if !found.isEmpty, sessions[account] === session { photoURLs[account, default: [:]].merge(found) { $1 } }
+        }
+    }
+
     /// Profile photos for human senders not seen yet; the session caches misses, so repeats cost nothing.
     private func loadPhotos(for messages: [Message], session: AccountSession) {
         let cached = photoURLs[session.account] ?? [:]

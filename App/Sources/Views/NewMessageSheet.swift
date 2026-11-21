@@ -73,6 +73,7 @@ struct NewMessageSheet: View {
             guard let accountID else { return }
             model.refreshContacts(for: accountID)
             local = await model.contacts(for: accountID)
+            model.loadPhotos(for: local.compactMap(\.user), account: accountID)
             directory = []
             if !query.isEmpty { scheduleDirectorySearch() }
         }
@@ -190,7 +191,10 @@ struct NewMessageSheet: View {
     private func row(_ contact: Contact, label: String?, highlighted: Bool) -> some View {
         HStack(spacing: 10) {
             if label == nil {
-                Avatar(name: RemoteText.title(contact.displayName), size: 30)
+                PhotoAvatar(
+                    name: RemoteText.title(contact.displayName),
+                    url: accountID.flatMap { id in contact.user.flatMap { model.photoURL($0, account: id) } },
+                    media: accountID.flatMap { model.mediaLoader(for: $0) }, size: 30)
             } else {
                 envelope
             }
