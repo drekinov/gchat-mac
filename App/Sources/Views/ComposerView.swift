@@ -166,7 +166,7 @@ struct ComposerView: View {
             if editRevision == revision, text.isEmpty { text = draft }
             insertDroppedText()
         }
-        .onChange(of: model.snapshots[key.account]?.revision) {
+        .onChange(of: model.summary(for: key)?.membersFetched) {
             Task {
                 candidates = await model.mentionCandidates(for: key)
                 refreshTrigger()

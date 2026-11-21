@@ -454,11 +454,15 @@ final class AppModel {
 
     /// Spaces and group chats whose members were refetched since the last snapshot, such as one just opened.
     private func refreshChangedFaces(_ snapshot: AccountSnapshot, previous: AccountSnapshot?) {
-        guard let previous, !snapshot.changedSpaces.isEmpty, facesWarmed.contains(snapshot.account),
-            let session = sessions[snapshot.account]
-        else { return }
+        guard let previous, facesWarmed.contains(snapshot.account), let session = sessions[snapshot.account] else {
+            return
+        }
+        // A skipped revision means snapshots were coalesced, so `changedSpaces` no longer names every change.
+        let skipped = snapshot.revision > previous.revision + 1
+        guard skipped || !snapshot.changedSpaces.isEmpty else { return }
         let changed = snapshot.spaces.filter { summary in
-            snapshot.changedSpaces.contains(summary.name) && (summary.type == .space || summary.type == .groupChat)
+            (skipped || snapshot.changedSpaces.contains(summary.name))
+                && (summary.type == .space || summary.type == .groupChat)
                 && summary.membersFetched != nil
                 && previous.spaces.first { $0.name == summary.name }?.membersFetched != summary.membersFetched
         }
@@ -468,8 +472,8 @@ final class AppModel {
 
     private func refreshFaces(_ account: AccountID, session: AccountSession, spaces: [SpaceName]) async {
         let found = await StoreReader.faces(session: session, spaces: spaces)
-        guard sessions[account] === session, !found.isEmpty else { return }
-        for (space, users) in found { spaceFaces[SpaceKey(account: account, space: space)] = users }
+        guard sessions[account] === session else { return }
+        for space in spaces { spaceFaces[SpaceKey(account: account, space: space)] = found[space] }
         let cached = photoURLs[account] ?? [:]
         var missing: [UserName] = []
         for user in found.values.joined() where cached[user.name] == nil && !missing.contains(user.name) {
@@ -624,6 +628,9 @@ final class AppModel {
                 guard historyOpening == opening else { return }
                 keepInHistory(page.items)
                 openMessages = withHistory(storeWindow)
+                if let thread = openThread {
+                    threadMessages = Self.merged(page.items.filter { $0.thread == thread }, threadMessages)
+                }
                 loadPhotos(for: page.items, session: session)
                 historyCursor = (cursor.before, page.nextPageToken)
                 if page.nextPageToken == nil {

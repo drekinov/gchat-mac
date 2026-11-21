@@ -64,6 +64,7 @@ public actor AccountSession {
     var openThreadRead: ThreadReadPosition?
     var pendingThreadRead: ThreadReadPosition?
     var updatingThreadRead = false
+    var memberFetches: [SpaceName: Task<Result<Bool, SyncError>, Never>] = [:]
     var nextSidebar: Timestamp?
     var nextFocus: Timestamp?
     var backoffUntil: Timestamp?
@@ -321,13 +322,35 @@ public actor AccountSession {
     /// Makes sure the open space's members are cached for @-mention autocomplete; call when its composer appears.
     public func prepareMentions(in space: SpaceName) {
         guard let generation = gate.current, admitted else { return }
-        work.spawn { [weak self, contacts] in
+        work.spawn { [weak self] in await self?.refreshMentions(in: space, generation) }
+    }
+
+    private func refreshMentions(in space: SpaceName, _ generation: Generation) async {
+        do throws(SyncError) {
+            if try await fetchMembers(in: space, generation) { didCommit(space, generation) }
+        } catch {
+            handle(error, generation, space: space)
+        }
+    }
+
+    /// Fetches `space`'s members if stale, one fetch per space at a time; a caller that finds one running waits
+    /// for it. True for the caller whose fetch wrote the cache.
+    private func fetchMembers(in space: SpaceName, _ generation: Generation) async throws(SyncError) -> Bool {
+        if let running = memberFetches[space] {
+            _ = try await running.value.get()
+            return false
+        }
+        let task = Task { [contacts] () -> Result<Bool, SyncError> in
             do throws(SyncError) {
-                if try await contacts.ensureMembers(in: space, generation) { await self?.didCommit(space, generation) }
+                return .success(try await contacts.ensureMembers(in: space, generation))
             } catch {
-                await self?.handle(error, generation, space: space)
+                return .failure(error)
             }
         }
+        memberFetches[space] = task
+        let result = await task.value
+        memberFetches[space] = nil
+        return try result.get()
     }
 
     /// Makes sure `space`'s members are cached, for the members list. False when they're missing and couldn't be
@@ -337,8 +360,7 @@ public actor AccountSession {
         do throws(SyncError) {
             guard try contacts.needsMembers(in: space) else { return true }
             guard admitted else { return false }
-            try await contacts.ensureMembers(in: space, generation)
-            didCommit(space, generation)
+            if try await fetchMembers(in: space, generation) { didCommit(space, generation) }
             return true
         } catch .busy {
             return true
@@ -355,7 +377,7 @@ public actor AccountSession {
         for space in stale.prefix(Contacts.memberRefreshLimit) {
             guard let generation = gate.current, admitted else { return }
             do throws(SyncError) {
-                try await contacts.ensureMembers(in: space, generation)
+                _ = try await fetchMembers(in: space, generation)
             } catch {
                 handle(error, generation, space: space)
                 return

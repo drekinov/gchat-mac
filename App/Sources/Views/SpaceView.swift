@@ -299,7 +299,9 @@ struct MessageList: View {
             }
             .animation(.easeOut(duration: 0.15), value: pinned)
             .onChange(of: rows.first?.id) { previous, _ in
-                if let previous, !pinned, !model.history.isEmpty { proxy.scrollTo(previous, anchor: .top) }
+                if let previous, !pinned, !revealing, !model.history.isEmpty {
+                    proxy.scrollTo(previous, anchor: .top)
+                }
             }
             .onChange(of: model.openMessages.last?.id) { scroll(proxy, animated: true) }
             .onChange(of: model.openOutbox.count) { scroll(proxy, animated: true) }
@@ -324,7 +326,7 @@ struct MessageList: View {
                     }
                     reveal(thread, proxy)
                     try? await Task.sleep(for: .milliseconds(150))
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled, model.threadMessages.contains(where: { $0.name == name }) else { return }
                     withAnimation { proxy.scrollTo(name, anchor: .center) }
                 }
             }

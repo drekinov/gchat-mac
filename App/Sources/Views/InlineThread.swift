@@ -35,6 +35,8 @@ struct InlineThread: View {
                     seen(name, onScreen: onScreen)
                 }
                 .onDisappear { seen(name, onScreen: false) }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Thread reply")
                 .modifier(ThreadRail(context: context, top: row.id == rows.first?.id ? 8 : 1))
                 .id(row.id)
         }
@@ -61,7 +63,7 @@ struct InlineThread: View {
     }
 
     private func seen(_ name: MessageName, onScreen: Bool) {
-        guard viewport.update(name, in: thread, onScreen: onScreen) else { return }
+        guard thread == model.openThread, viewport.update(name, in: thread, onScreen: onScreen) else { return }
         model.threadViewportChanged(key, thread: thread, newest: viewport.newest(in: model.threadMessages))
     }
 
