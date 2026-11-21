@@ -16,7 +16,7 @@ private struct EditRig {
     let team: SpaceName
     let scratch = ScratchDirectory()
 
-    init() async throws {
+    init(timing: SessionTiming = EditRig.timing) async throws {
         alice = server.addAccount(displayName: "Alice")
         bob = server.addAccount(displayName: "Bob")
         team = server.addSpace(.space, displayName: "Team", members: [alice, bob])
@@ -25,7 +25,14 @@ private struct EditRig {
             api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: alice.token)),
             store: store, clock: SteppingClock(server: server),
             logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
-            timing: .fast)
+            timing: timing)
+    }
+
+    /// No follow-up polls, so each test decides when Google's tombstones arrive.
+    static var timing: SessionTiming {
+        var timing = SessionTiming.fast
+        timing.deleteReconcileDelays = []
+        return timing
     }
 
     var generation: Generation { session.gate.current! }
@@ -216,5 +223,41 @@ struct MessageEditTests {
         #expect(!AccountSession.losesFormatting(message, formattedText: "hi 🙂 <users/2> see docs"))
         #expect(AccountSession.losesFormatting(message, formattedText: "hi 🙂 <users/2> see <https://x.example|docs>"))
         #expect(!AccountSession.losesFormatting(message, formattedText: nil))
+    }
+
+    @Test func aRetriedFollowUpPollBringsGooglesTombstone() async throws {
+        var timing = EditRig.timing
+        timing.deleteReconcileDelays = [.seconds(3), .seconds(10)]
+        let rig = try await EditRig(timing: timing)
+        let mine = rig.post("x", from: rig.alice)
+        try await rig.sync()
+        rig.server.fail(
+            FailureRule(route: .listSpaceEvents, times: 1, response: .http(status: 500, googleStatus: "INTERNAL")))
+        try await rig.session.deleteMessage(mine.name, force: false)
+        let local = try #require(try rig.stored(mine.name))
+        for _ in 0..<200 where try rig.stored(mine.name)?.version == local.version {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(try rig.stored(mine.name).map { $0.version > local.version } == true)
+    }
+
+    @Test func pausingDuringPacingStopsTheWrite() async throws {
+        let rig = try await EditRig()
+        let mine = rig.post("x", from: rig.alice)
+        let other = rig.post("y", from: rig.alice)
+        try await rig.sync()
+        try await rig.session.deleteMessage(mine.name, force: false)
+        let session = rig.session
+        let second = Task { () async -> MessageEditError? in
+            do {
+                try await session.deleteMessage(other.name, force: false)
+                return nil
+            } catch {
+                return error as? MessageEditError
+            }
+        }
+        await rig.session.setPaused(true)
+        #expect(await second.value == MessageEditError.notAdmitted)
+        #expect(rig.requests("DELETE").count == 1)
     }
 }

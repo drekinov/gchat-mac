@@ -525,7 +525,8 @@ public final class SQLiteAccountStore: AccountStore {
     private func upsertMessages(
         _ messages: [Message], _ c: Connection, rewriteEqual: Bool = false
     ) throws(StoreError) {
-        let select = try c.prepare("SELECT is_deleted, payload FROM messages WHERE name = ?1")
+        let select = try c.prepare("SELECT version_s, version_n, is_deleted FROM messages WHERE name = ?1")
+        let payload = try c.prepare("SELECT payload FROM messages WHERE name = ?1")
         let insert = try c.prepare(
             """
             INSERT OR REPLACE INTO messages
@@ -534,11 +535,24 @@ public final class SQLiteAccountStore: AccountStore {
             """)
         for incoming in messages {
             let name = incoming.name.rawValue
-            let row = try select.first([.text(name)]) { ($0.int(0) != 0, $0.blob(1)) }
-            let stored = try row.map { (_, payload) throws(StoreError) in
-                try codec.open(payload, as: Message.self, table: "messages", rowKey: name)
+            var message = incoming
+            if let (seconds, nanos, storedDeleted) = try select.first(
+                [.text(name)], { ($0.int(0), $0.int(1), $0.int(2) != 0) })
+            {
+                let older = (incoming.version.seconds, Int64(incoming.version.nanos)) < (seconds, nanos)
+                let equal = (incoming.version.seconds, Int64(incoming.version.nanos)) == (seconds, nanos)
+                switch (storedDeleted, incoming.isDeleted) {
+                case (true, false): continue
+                case (false, false): if older || (equal && !rewriteEqual) { continue }
+                case (true, true): if older { continue }
+                case (false, true): break
+                }
+                // Only a tombstone needs the stored copy: Google's deletion events leave out the thread and sender.
+                if incoming.isDeleted, let sealed = try payload.first([.text(name)], { $0.blob(0) }) {
+                    let stored = try codec.open(sealed, as: Message.self, table: "messages", rowKey: name)
+                    message = Message.merge(incoming, over: stored, rewriteEqual: true) ?? incoming
+                }
             }
-            guard let message = Message.merge(incoming, over: stored, rewriteEqual: rewriteEqual) else { continue }
             let version = message.version
             let sealed = try codec.seal(message, table: "messages", rowKey: name)
             try insert.run([

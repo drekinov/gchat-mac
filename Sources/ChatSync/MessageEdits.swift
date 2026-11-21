@@ -26,9 +26,6 @@ public struct EditableCopy: Sendable, Equatable {
 }
 
 extension AccountSession {
-    /// Retries after a delete that wait out the event poll's trailing window and any running sync.
-    static let deleteReconcileDelays: [Duration] = [.seconds(3), .seconds(10), .seconds(30)]
-
     /// The user's role in `space` while joined, from the cached member list; nil when unknown.
     public nonisolated func myRole(in space: SpaceName) -> Membership.Role? {
         let members = (try? contacts.memberships(in: space)) ?? []
@@ -94,6 +91,9 @@ extension AccountSession {
         } catch .notFound {
         } catch .failedPrecondition where !force {
             throw .hasReplies
+        } catch .invalidArgument where !force && (try? store.message(name))?.isThreadReply == false {
+            // Google doesn't document which 400 a thread starter with replies gets.
+            throw .hasReplies
         } catch {
             throw failure(error, .deleteMessage, generation, space: name.space)
         }
@@ -150,8 +150,9 @@ extension AccountSession {
     }
 
     private func reconcileAfterDelete(_ space: SpaceName, _ generation: Generation) {
+        let delays = timing.deleteReconcileDelays
         work.spawn { [weak self, clock] in
-            for delay in Self.deleteReconcileDelays {
+            for delay in delays {
                 do { try await clock.sleep(for: delay) } catch { return }
                 guard let self, await self.reconcileDeleted(space, generation) else { continue }
                 return

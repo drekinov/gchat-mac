@@ -159,15 +159,8 @@ struct ComposerView: View {
             model.consumeComposerFocus(key)
         }
         .task(id: key) {
-            // An edit this composer started before it was last shown is over; its draft comes back.
-            if edit == nil, model.editRequests[composerID]?.started == true {
-                model.endEdit(composerID, attempt: nil)
-                if let stash = model.takeStashedDraft(composerID) {
-                    text = stash.text
-                    mentionEditor = stash.mentions
-                    restored = true
-                }
-            }
+            // SwiftUI can rebuild the composer mid-edit; the new one picks the edit up again.
+            if edit == nil { model.restartEdit(composerID) }
             startRequestedEdit()
             model.prepareMentions(for: key)
             candidates = await model.mentionCandidates(for: key)
@@ -209,7 +202,6 @@ struct ComposerView: View {
 
     private func editor(_ items: [Contact]) -> some View {
         TextEditor(text: editorBinding, selection: $selection)
-            .disabled(edit.map { $0.saving || $0.basedOn == nil } ?? false)
             .background(TextOnlyDrops())
             .font(.body)
             .scrollContentBackground(.hidden)
@@ -277,7 +269,7 @@ struct ComposerView: View {
         Binding(
             get: { text },
             set: { newValue in
-                guard newValue != text else { return }
+                guard newValue != text, !(edit.map { $0.saving || $0.basedOn == nil } ?? false) else { return }
                 commit(newValue)
             })
     }
@@ -468,7 +460,7 @@ extension ComposerView {
 
     /// Up arrow in an empty composer edits my last message here.
     fileprivate func editLast() -> KeyPress.Result {
-        guard edit == nil, text.isEmpty, model.attachments(for: composerID).isEmpty,
+        guard edit == nil, restored, text.isEmpty, model.attachments(for: composerID).isEmpty,
             let message = model.lastEditable(for: composerID)
         else { return .ignored }
         model.beginEdit(message, key: key)
@@ -478,7 +470,7 @@ extension ComposerView {
     fileprivate func startRequestedEdit() {
         guard let request = model.takeEditRequest(composerID) else { return }
         saveTask?.cancel()
-        if edit == nil {
+        if edit == nil, restored, !model.hasStashedDraft(composerID) {
             model.stashDraft(StashedDraft(text: text, mentions: mentionEditor), for: composerID)
             let snapshot = text
             Task { await model.saveDraft(snapshot, key: key, thread: thread) }
@@ -542,12 +534,19 @@ extension ComposerView {
         edit = nil
         trigger = nil
         model.endEdit(composerID, attempt: attempt)
+        mentionEditor = MentionEditor()
         if let stash = model.takeStashedDraft(composerID) {
             text = stash.text
             mentionEditor = stash.mentions
         } else {
             text = ""
-            mentionEditor = MentionEditor()
+            restored = false
+            Task {
+                let draft = await model.loadDraft(key, thread: thread)
+                guard edit == nil, text.isEmpty else { return }
+                text = draft
+                restored = true
+            }
         }
         selection = TextSelection(insertionPoint: text.endIndex)
         focused = true

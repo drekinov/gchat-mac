@@ -16,6 +16,8 @@ public struct SessionTiming: Sendable {
     public var logoutDrain: Duration = .seconds(5)
     /// The longest single sleep of the poll loop; it normally sleeps until its next deadline and is woken early.
     public var idleSleep: Duration = .seconds(600)
+    /// Event polls after a delete, waiting out the poll's trailing window and any sync already running.
+    public var deleteReconcileDelays: [Duration] = [.seconds(3), .seconds(10), .seconds(30)]
 
     public init() {}
 }

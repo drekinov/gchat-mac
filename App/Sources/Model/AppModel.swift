@@ -506,6 +506,8 @@ final class AppModel {
             recent = Array(recent.prefix(3))
         }
         selection = key
+        endEdits { $0.key != key }
+        pendingDelete = nil
         openRole = nil
         roleSource = nil
         openThread = nil
@@ -536,6 +538,7 @@ final class AppModel {
 
     func openThread(_ thread: ThreadName) {
         guard thread.space == selection?.space, openThread != thread else { return }
+        if let old = openThread { endEdits { $0.thread == old } }
         openThread = thread
         newestVisibleReply = nil
         threadMessages = openMessages.filter { $0.thread == thread }
@@ -544,6 +547,7 @@ final class AppModel {
     }
 
     func closeThread() {
+        if let old = openThread { endEdits { $0.thread == old } }
         openThread = nil
         newestVisibleReply = nil
         threadMessages = []
@@ -1266,6 +1270,19 @@ final class AppModel {
     }
 
     func stashDraft(_ draft: StashedDraft, for id: ComposerID) { stashedDrafts[id] = draft }
+
+    func hasStashedDraft(_ id: ComposerID) -> Bool { stashedDrafts[id] != nil }
+
+    /// Lets a rebuilt composer take its edit again.
+    func restartEdit(_ id: ComposerID) { editRequests[id]?.started = false }
+
+    /// Edits in composers that are going away end; their drafts were saved when the edits began.
+    private func endEdits(where leaving: (ComposerID) -> Bool) {
+        for id in editRequests.keys where leaving(id) {
+            editRequests[id] = nil
+            stashedDrafts[id] = nil
+        }
+    }
 
     /// A one-line problem above the conversation's composer.
     func showComposerNotice(_ text: String) { sendError = text }

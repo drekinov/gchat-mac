@@ -438,6 +438,15 @@
             guard let mine = model.lastEditable(for: ComposerID(key: key, thread: nil)) else {
                 return print("snapshot: edit FAILED no message of mine to edit")
             }
+            let size = NSSize(width: 1280, height: 800)
+            model.beginEdit(mine, key: key)
+            await mainWindow("33-editing-in-composer.png", model, size) {
+                try? await Task.sleep(for: .milliseconds(800))
+            }
+            print(
+                "snapshot: edit composer started=\(model.editRequests.values.contains { $0.message == mine.name && $0.started })"
+            )
+            model.endEdit(ComposerID(key: key, thread: nil), attempt: nil)
             guard case .success(let copy) = await model.editableCopy(of: mine.name, key: key) else {
                 return print("snapshot: edit FAILED could not load the message")
             }
