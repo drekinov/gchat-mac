@@ -419,6 +419,7 @@ final class AppModel {
         if let previous, snapshot.generation < previous.generation { return }
         snapshots[id] = snapshot
         warmFaces(id)
+        refreshChangedFaces(snapshot, previous: previous)
 
         guard let key = selection, key.account == id else { return }
         let skipped = previous.map { snapshot.revision > $0.revision + 1 } ?? false
@@ -449,6 +450,20 @@ final class AppModel {
             await session.prepareMembers(in: spaces)
             await refreshFaces(account, session: session, spaces: shown)
         }
+    }
+
+    /// Spaces and group chats whose members were refetched since the last snapshot, such as one just opened.
+    private func refreshChangedFaces(_ snapshot: AccountSnapshot, previous: AccountSnapshot?) {
+        guard let previous, !snapshot.changedSpaces.isEmpty, facesWarmed.contains(snapshot.account),
+            let session = sessions[snapshot.account]
+        else { return }
+        let changed = snapshot.spaces.filter { summary in
+            snapshot.changedSpaces.contains(summary.name) && (summary.type == .space || summary.type == .groupChat)
+                && summary.membersFetched != nil
+                && previous.spaces.first { $0.name == summary.name }?.membersFetched != summary.membersFetched
+        }
+        guard !changed.isEmpty else { return }
+        Task { await refreshFaces(snapshot.account, session: session, spaces: changed.map(\.name)) }
     }
 
     private func refreshFaces(_ account: AccountID, session: AccountSession, spaces: [SpaceName]) async {
@@ -686,13 +701,13 @@ final class AppModel {
         updateThreadReadPosition()
     }
 
+    /// The open thread's read position only rises, and only from replies on screen while the window is key; an
+    /// empty viewport or losing focus keeps what was already seen.
     private func updateThreadReadPosition() {
-        let position: ThreadReadPosition?
+        var position = threadReadPosition.flatMap { $0.thread == openThread ? $0 : nil }
         if windowIsKey, let thread = openThread, let newestVisibleReply {
-            let previous = threadReadPosition.flatMap { $0.thread == thread ? $0.upTo : nil }
-            position = ThreadReadPosition(thread: thread, upTo: max(previous ?? newestVisibleReply, newestVisibleReply))
-        } else {
-            position = nil
+            position = ThreadReadPosition(
+                thread: thread, upTo: max(position?.upTo ?? newestVisibleReply, newestVisibleReply))
         }
         guard threadReadPosition != position else { return }
         threadReadPosition = position
@@ -758,16 +773,22 @@ final class AppModel {
         return await StoreReader.mentionCandidates(session: session, space: key.space)
     }
 
-    /// The space's cached memberships, for the members list. `prepareMentions` refreshes a stale cache.
     /// The conversation's stored record, for its details: when it was made, guests, notifications.
     func storedSpace(for key: SpaceKey) async -> StoredSpace? {
         guard let session = sessions[key.account] else { return nil }
         return await StoreReader.storedSpace(session: session, space: key.space)
     }
 
+    /// The space's cached memberships, for the members list. `ensureMembers` refreshes a stale cache.
     func memberships(for key: SpaceKey) async -> [Membership] {
         guard let session = sessions[key.account] else { return [] }
         return await StoreReader.memberships(session: session, space: key.space)
+    }
+
+    /// Fetches the space's members when the cache is missing or stale; false when they couldn't be fetched now.
+    func ensureMembers(for key: SpaceKey) async -> Bool {
+        guard let session = sessions[key.account] else { return false }
+        return await session.ensureMembers(in: key.space)
     }
 
     /// Asks a composer to insert an @-mention, for the members list's Mention button.

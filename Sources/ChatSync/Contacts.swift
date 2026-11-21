@@ -117,12 +117,18 @@ public final class Contacts: Sendable {
             .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
 
-    /// Fetches `space`'s members if the cache is missing or stale, so mentions can be offered.
-    public func ensureMembers(in space: SpaceName, _ generation: Generation) async throws(SyncError) {
-        guard let stored = try engine.read({ () throws(StoreError) in try store.space(space) }),
-            engine.needsMembers(stored)
-        else { return }
+    /// Whether `space`'s member cache is missing or stale. A space the store doesn't know needs nothing.
+    public func needsMembers(in space: SpaceName) throws(SyncError) -> Bool {
+        guard let stored = try engine.read({ () throws(StoreError) in try store.space(space) }) else { return false }
+        return engine.needsMembers(stored)
+    }
+
+    /// Fetches `space`'s members if the cache is missing or stale, so mentions can be offered. True when it fetched.
+    @discardableResult
+    public func ensureMembers(in space: SpaceName, _ generation: Generation) async throws(SyncError) -> Bool {
+        guard try needsMembers(in: space) else { return false }
         try await engine.syncMemberTitle(space, generation)
+        return true
     }
 
     /// Directory matches for `query`. Turns itself off after a 403 (scope not granted or admin policy).

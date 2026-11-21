@@ -269,6 +269,7 @@ extension AccountStatus {
 struct GeneralSettings: View {
     @State private var status: SMAppService.Status = SMAppService.mainApp.status
     @State private var failure: String?
+    @AppStorage(AppModel.historyLimitKey) private var historyLimit = 2000
 
     var body: some View {
         Form {
@@ -290,6 +291,16 @@ struct GeneralSettings: View {
                     ) {
                         Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
                     }
+                }
+            }
+            Section {
+                Picker(selection: $historyLimit) {
+                    ForEach(AppModel.historyLimits, id: \.self) { Text($0.formatted()).tag($0) }
+                } label: {
+                    Text("Older messages per conversation")
+                    Text(
+                        "Scrolling up loads earlier messages up to this many. Only the open conversation keeps "
+                            + "them in memory.")
                 }
             }
         }
@@ -443,7 +454,6 @@ struct AppearanceSettings: View {
     @AppStorage(AppAppearance.key) private var appearance = AppAppearance.system
     @AppStorage("sidebarDensity") private var density = SidebarDensity.comfortable
     @AppStorage("inlineImagePreviews") private var inlinePreviews = false
-    @AppStorage(AppModel.historyLimitKey) private var historyLimit = 2000
 
     var body: some View {
         Form {
@@ -468,14 +478,6 @@ struct AppearanceSettings: View {
                 Toggle(isOn: $inlinePreviews) {
                     Text("Show images in the conversation")
                     Text("Off shows images and GIFs as small file chips. Click one to preview it.")
-                }
-                Picker(selection: $historyLimit) {
-                    ForEach(AppModel.historyLimits, id: \.self) { Text($0.formatted()).tag($0) }
-                } label: {
-                    Text("Older messages per conversation")
-                    Text(
-                        "Scrolling up loads earlier messages up to this many. Only the open conversation keeps "
-                            + "them in memory.")
                 }
             }
         }

@@ -89,7 +89,7 @@ struct MentionEditor {
         MentionText(visible: text, mentions: mentions).wireText(displayNames: names)
     }
 
-    private static func isWhitespace(_ unit: UInt16) -> Bool {
+    static func isWhitespace(_ unit: UInt16) -> Bool {
         unit == 0x20 || unit == 0x0A || unit == 0x09
     }
 }

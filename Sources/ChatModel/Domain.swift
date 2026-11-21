@@ -71,7 +71,14 @@ public struct Membership: Hashable, Sendable, Codable {
     public enum Role: String, Sendable, Codable {
         case member = "ROLE_MEMBER"
         case manager = "ROLE_MANAGER"
+        case assistantManager = "ROLE_ASSISTANT_MANAGER"
         case unspecified = "MEMBERSHIP_ROLE_UNSPECIFIED"
+
+        /// An unknown stored role reads as unspecified, so one row can't fail the whole members list.
+        public init(from decoder: any Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Role(rawValue: raw) ?? .unspecified
+        }
     }
 
     public enum State: String, Sendable, Codable {
@@ -287,3 +294,12 @@ public struct Page<Item: Sendable>: Sendable {
 }
 
 extension Page: Equatable where Item: Equatable {}
+
+extension Message {
+    /// The newest of `replies` whose name is in `visible`, leaving out deleted ones; what an open thread has read.
+    public static func newestVisibleReply(in replies: [Message], visible: Set<MessageName>) -> Timestamp? {
+        guard !visible.isEmpty else { return nil }
+        return replies.lazy.filter { $0.isThreadReply && !$0.isDeleted && visible.contains($0.name) }.map(\.createTime)
+            .max()
+    }
+}

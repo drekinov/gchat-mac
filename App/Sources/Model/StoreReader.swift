@@ -40,9 +40,6 @@ enum StoreReader {
         (try? session.contacts.memberships(in: space)) ?? []
     }
 
-    /// Two other joined people per conversation from the member cache, picked by a shuffle seeded with the
-    /// conversation's name: stable from launch to launch, and not the same alphabetically first person everywhere.
-    /// A conversation with fewer is left out and keeps its own picture.
     /// FNV-1a over both names: the same pair always gives the same number, unlike `hashValue`.
     private static func seeded(_ space: SpaceName, _ user: UserName) -> UInt64 {
         (space.rawValue + "|" + user.rawValue).utf8.reduce(0xcbf2_9ce4_8422_2325) {
@@ -50,6 +47,8 @@ enum StoreReader {
         }
     }
 
+    /// Two other joined people per conversation, in an order seeded by its name so they stay the same across
+    /// launches. A conversation with fewer is left out and keeps its own picture.
     @concurrent
     static func faces(session: AccountSession, spaces: [SpaceName]) async -> [SpaceName: [User]] {
         let me = session.me

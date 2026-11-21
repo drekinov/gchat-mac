@@ -96,10 +96,8 @@ public final class Reactions: Sendable {
         try await refreshSummary(message, generation)
     }
 
-    /// Everyone who reacted to `message`, by emoji, in the order Google lists them. Read only when someone asks
-    /// (hovering a reaction) and kept for a minute while the message's reaction counts stay the same; the age
-    /// limit catches one person's reaction replacing another's, which leaves the counts unchanged. It also
-    /// refreshes which of them are the user's.
+    /// Everyone who reacted to `message`, by emoji, cached for a minute while its counts stay the same; the age limit
+    /// catches one reaction replacing another, which leaves the counts unchanged. Also refreshes which are mine.
     public func reactors(
         on message: MessageName, matching summaries: [ReactionSummary], _ generation: Generation
     ) async throws(SyncError) -> ReactorList {

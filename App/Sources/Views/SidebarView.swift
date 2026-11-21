@@ -17,9 +17,8 @@ struct SidebarView: View {
         }
     }
 
-    /// A plain scrolling stack rather than a sidebar List, so the selected chat gets the design's soft tint instead
-    /// of the system's strong highlight. Clicking a chat focuses the list; the arrow keys then move the selection,
-    /// as in a sidebar.
+    /// A plain stack, not a sidebar List, so selection gets the design's soft tint rather than the system highlight.
+    /// Clicking a chat focuses the list for the arrow keys.
     private var inboxList: some View {
         let entries = filtered(model.inbox)
         let spaces = entries.filter { model.kind(of: $0) == .space }

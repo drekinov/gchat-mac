@@ -39,17 +39,15 @@ struct ContentView: View {
     }
 }
 
-/// The main window: the sidebar as a rounded island inset from the window, and the conversation beside it on the
-/// same surface. It's laid out side by side rather than with a split view: the system split view draws its own
-/// glass edge and shadow between the columns, and macOS has no way to turn them off.
+/// The sidebar as an inset island beside the conversation. Not a split view: the system one draws a glass edge and
+/// shadow between the columns that can't be turned off.
 struct MainLayout: View {
     @Bindable var model: AppModel
 
     var body: some View {
         GeometryReader { proxy in
-            // The toolbar's strip. It's transparent; it's there so the traffic lights sit in the island's corner,
-            // and it holds the conversation's buttons. Offscreen snapshots have no toolbar, so they get the same
-            // strip.
+            // The transparent toolbar strip puts the traffic lights in the island's corner and holds the
+            // conversation's buttons. Offscreen snapshots have no toolbar, so they get the same strip.
             let top = proxy.safeAreaInsets.top > 0 ? proxy.safeAreaInsets.top : 52
             HStack(spacing: 0) {
                 if model.showsSidebar {
