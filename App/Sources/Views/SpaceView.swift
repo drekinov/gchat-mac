@@ -284,9 +284,13 @@ struct MessageList: View {
             .overlay(alignment: .bottom) {
                 if !pinned {
                     Button {
-                        cancelScroll()
                         pinned = true
                         withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
+                        // A long jump lands short while rows on the way settle their heights; land on it again.
+                        scrollLater(.message, after: .milliseconds(400)) {
+                            pinned = true
+                            proxy.scrollTo(Self.bottom, anchor: .bottom)
+                        }
                     } label: {
                         Label("Newest", systemImage: "arrow.down")
                             .font(.callout.weight(.medium))
