@@ -64,6 +64,7 @@ public actor AccountSession {
     var openThreadRead: ThreadReadPosition?
     var pendingThreadRead: ThreadReadPosition?
     var updatingThreadRead = false
+    var memberFetches: [SpaceName: Task<Result<Bool, SyncError>, Never>] = [:]
     var nextSidebar: Timestamp?
     var nextFocus: Timestamp?
     var backoffUntil: Timestamp?
@@ -321,23 +322,62 @@ public actor AccountSession {
     /// Makes sure the open space's members are cached for @-mention autocomplete; call when its composer appears.
     public func prepareMentions(in space: SpaceName) {
         guard let generation = gate.current, admitted else { return }
-        work.spawn { [weak self, contacts] in
-            do throws(SyncError) {
-                try await contacts.ensureMembers(in: space, generation)
-                await self?.didCommit(space, generation)
-            } catch {
-                await self?.handle(error, generation, space: space)
-            }
+        work.spawn { [weak self] in await self?.refreshMentions(in: space, generation) }
+    }
+
+    private func refreshMentions(in space: SpaceName, _ generation: Generation) async {
+        do throws(SyncError) {
+            if try await fetchMembers(in: space, generation) { didCommit(space, generation) }
+        } catch {
+            handle(error, generation, space: space)
         }
     }
 
-    /// Fills the member cache for `spaces`, one at a time and only where it is missing or stale, for the sidebar's
-    /// pictures. Returns when done; the first error ends the pass, so a rate limit isn't hit again and again.
+    /// Fetches `space`'s members if stale, one fetch per space at a time; a caller that finds one running waits
+    /// for it. True for the caller whose fetch wrote the cache.
+    private func fetchMembers(in space: SpaceName, _ generation: Generation) async throws(SyncError) -> Bool {
+        if let running = memberFetches[space] {
+            _ = try await running.value.get()
+            return false
+        }
+        let task = Task { [contacts] () -> Result<Bool, SyncError> in
+            do throws(SyncError) {
+                return .success(try await contacts.ensureMembers(in: space, generation))
+            } catch {
+                return .failure(error)
+            }
+        }
+        memberFetches[space] = task
+        let result = await task.value
+        memberFetches[space] = nil
+        return try result.get()
+    }
+
+    /// Makes sure `space`'s members are cached, for the members list. False when they're missing and couldn't be
+    /// fetched now (offline, backing off, or the request failed).
+    public func ensureMembers(in space: SpaceName) async -> Bool {
+        guard let generation = gate.current else { return false }
+        do throws(SyncError) {
+            guard try contacts.needsMembers(in: space) else { return true }
+            guard admitted else { return false }
+            if try await fetchMembers(in: space, generation) { didCommit(space, generation) }
+            return true
+        } catch .busy {
+            return true
+        } catch {
+            handle(error, generation, space: space)
+            return false
+        }
+    }
+
+    /// Fills the member cache for the first `Contacts.memberRefreshLimit` of `spaces` that lack it or have it stale,
+    /// one at a time, for the sidebar's pictures. The first error ends the pass, so a rate limit isn't hit repeatedly.
     public func prepareMembers(in spaces: [SpaceName]) async {
-        for space in spaces {
+        let stale = spaces.lazy.filter { [contacts] in (try? contacts.needsMembers(in: $0)) == true }
+        for space in stale.prefix(Contacts.memberRefreshLimit) {
             guard let generation = gate.current, admitted else { return }
             do throws(SyncError) {
-                try await contacts.ensureMembers(in: space, generation)
+                _ = try await fetchMembers(in: space, generation)
             } catch {
                 handle(error, generation, space: space)
                 return

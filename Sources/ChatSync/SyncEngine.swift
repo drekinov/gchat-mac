@@ -446,7 +446,8 @@ public struct SyncEngine: Sendable {
                     name: name, type: stored.space.type, title: Self.title(of: stored),
                     lastActiveTime: stored.space.lastActiveTime, unreadCount: digest.unreadCount, isMuted: muted,
                     lastMessagePreview: digest.preview, isThreaded: stored.space.isThreaded,
-                    isBotDM: stored.space.isSingleUserBotDM, historyOn: stored.space.historyOn))
+                    isBotDM: stored.space.isSingleUserBotDM, historyOn: stored.space.historyOn,
+                    membersFetched: stored.memberTitleFetched))
         }
         digests = digests.filter { live.contains($0.key) }
         return summaries.sorted { ($0.lastActiveTime ?? .init(seconds: 0)) > ($1.lastActiveTime ?? .init(seconds: 0)) }

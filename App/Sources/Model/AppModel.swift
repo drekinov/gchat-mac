@@ -419,6 +419,7 @@ final class AppModel {
         if let previous, snapshot.generation < previous.generation { return }
         snapshots[id] = snapshot
         warmFaces(id)
+        refreshChangedFaces(snapshot, previous: previous)
 
         guard let key = selection, key.account == id else { return }
         let skipped = previous.map { snapshot.revision > $0.revision + 1 } ?? false
@@ -451,10 +452,28 @@ final class AppModel {
         }
     }
 
+    /// Spaces and group chats whose members were refetched since the last snapshot, such as one just opened.
+    private func refreshChangedFaces(_ snapshot: AccountSnapshot, previous: AccountSnapshot?) {
+        guard let previous, facesWarmed.contains(snapshot.account), let session = sessions[snapshot.account] else {
+            return
+        }
+        // A skipped revision means snapshots were coalesced, so `changedSpaces` no longer names every change.
+        let skipped = snapshot.revision > previous.revision + 1
+        guard skipped || !snapshot.changedSpaces.isEmpty else { return }
+        let changed = snapshot.spaces.filter { summary in
+            (skipped || snapshot.changedSpaces.contains(summary.name))
+                && (summary.type == .space || summary.type == .groupChat)
+                && summary.membersFetched != nil
+                && previous.spaces.first { $0.name == summary.name }?.membersFetched != summary.membersFetched
+        }
+        guard !changed.isEmpty else { return }
+        Task { await refreshFaces(snapshot.account, session: session, spaces: changed.map(\.name)) }
+    }
+
     private func refreshFaces(_ account: AccountID, session: AccountSession, spaces: [SpaceName]) async {
         let found = await StoreReader.faces(session: session, spaces: spaces)
-        guard sessions[account] === session, !found.isEmpty else { return }
-        for (space, users) in found { spaceFaces[SpaceKey(account: account, space: space)] = users }
+        guard sessions[account] === session else { return }
+        for space in spaces { spaceFaces[SpaceKey(account: account, space: space)] = found[space] }
         let cached = photoURLs[account] ?? [:]
         var missing: [UserName] = []
         for user in found.values.joined() where cached[user.name] == nil && !missing.contains(user.name) {
@@ -609,6 +628,9 @@ final class AppModel {
                 guard historyOpening == opening else { return }
                 keepInHistory(page.items)
                 openMessages = withHistory(storeWindow)
+                if let thread = openThread {
+                    threadMessages = Self.merged(page.items.filter { $0.thread == thread }, threadMessages)
+                }
                 loadPhotos(for: page.items, session: session)
                 historyCursor = (cursor.before, page.nextPageToken)
                 if page.nextPageToken == nil {
@@ -649,6 +671,18 @@ final class AppModel {
             .sorted { ($0.createTime, $0.name.rawValue) < ($1.createTime, $1.name.rawValue) }
     }
 
+    /// Profile photos for `users` not seen yet, for lists of people outside a conversation.
+    func loadPhotos(for users: [UserName], account: AccountID) {
+        guard let session = sessions[account] else { return }
+        let cached = photoURLs[account] ?? [:]
+        let missing = users.filter { cached[$0] == nil }
+        guard !missing.isEmpty else { return }
+        Task {
+            let found = await session.photos.load(missing)
+            if !found.isEmpty, sessions[account] === session { photoURLs[account, default: [:]].merge(found) { $1 } }
+        }
+    }
+
     /// Profile photos for human senders not seen yet; the session caches misses, so repeats cost nothing.
     private func loadPhotos(for messages: [Message], session: AccountSession) {
         let cached = photoURLs[session.account] ?? [:]
@@ -686,13 +720,13 @@ final class AppModel {
         updateThreadReadPosition()
     }
 
+    /// The open thread's read position only rises, and only from replies on screen while the window is key; an
+    /// empty viewport or losing focus keeps what was already seen.
     private func updateThreadReadPosition() {
-        let position: ThreadReadPosition?
+        var position = threadReadPosition.flatMap { $0.thread == openThread ? $0 : nil }
         if windowIsKey, let thread = openThread, let newestVisibleReply {
-            let previous = threadReadPosition.flatMap { $0.thread == thread ? $0.upTo : nil }
-            position = ThreadReadPosition(thread: thread, upTo: max(previous ?? newestVisibleReply, newestVisibleReply))
-        } else {
-            position = nil
+            position = ThreadReadPosition(
+                thread: thread, upTo: max(position?.upTo ?? newestVisibleReply, newestVisibleReply))
         }
         guard threadReadPosition != position else { return }
         threadReadPosition = position
@@ -758,16 +792,22 @@ final class AppModel {
         return await StoreReader.mentionCandidates(session: session, space: key.space)
     }
 
-    /// The space's cached memberships, for the members list. `prepareMentions` refreshes a stale cache.
     /// The conversation's stored record, for its details: when it was made, guests, notifications.
     func storedSpace(for key: SpaceKey) async -> StoredSpace? {
         guard let session = sessions[key.account] else { return nil }
         return await StoreReader.storedSpace(session: session, space: key.space)
     }
 
+    /// The space's cached memberships, for the members list. `ensureMembers` refreshes a stale cache.
     func memberships(for key: SpaceKey) async -> [Membership] {
         guard let session = sessions[key.account] else { return [] }
         return await StoreReader.memberships(session: session, space: key.space)
+    }
+
+    /// Fetches the space's members when the cache is missing or stale; false when they couldn't be fetched now.
+    func ensureMembers(for key: SpaceKey) async -> Bool {
+        guard let session = sessions[key.account] else { return false }
+        return await session.ensureMembers(in: key.space)
     }
 
     /// Asks a composer to insert an @-mention, for the members list's Mention button.

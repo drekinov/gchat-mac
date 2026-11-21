@@ -1,8 +1,8 @@
 import ChatModel
 import SwiftUI
 
-/// An open thread, shown in place under its first message: the replies, any replies still sending, and a reply
-/// field.
+/// An open thread's rows under its first message: one list row per reply, any replies still sending, then a reply
+/// field. Separate rows let the list create only the replies on screen.
 struct InlineThread: View {
     let model: AppModel
     let key: SpaceKey
@@ -10,64 +10,114 @@ struct InlineThread: View {
     let context: MessageContext
     /// Replies the conversation already knows of. A thread started from Reply has none, so it shows only the field.
     var expectedReplies = 0
-    @State private var visible = false
-    @State private var dropTargeted = false
+    let viewport: ThreadViewport
+    /// The list's visible area in window coordinates; a reply counts as read once it's inside it.
+    let listFrame: CGRect
+    /// Rows a drag is over; the thread's reply field shows its drop outline while there's at least one.
+    @Binding var dropRows: Int
 
     var body: some View {
-        let replies = model.threadMessages.filter(\.isThreadReply)
-        let rows = MessageRowModel.build(replies, threaded: false, showsReplies: false).map { row in
+        let rows = MessageRowModel.build(
+            model.threadMessages.filter(\.isThreadReply), threaded: false, showsReplies: false
+        )
+        .map { row in
             var row = row
             row.timeHeader = nil
             return row
         }
         let outbox = model.openOutbox.filter { $0.payload.thread == thread }
-        VStack(alignment: .leading, spacing: 6) {
-            // Drops on the replies go to this thread's reply field. The field sits outside this destination, so
-            // text dragged onto it still reaches its text view.
-            VStack(alignment: .leading, spacing: 2) {
-                if rows.isEmpty && outbox.isEmpty && expectedReplies > 0 {
-                    ProgressView().controlSize(.small).frame(maxWidth: .infinity)
-                }
-                ForEach(rows) { row in
-                    MessageRow(row: row, context: context, compact: true)
-                }
-                ForEach(outbox) { item in
-                    OutboxRow(
-                        item: item, context: context,
-                        onRepost: { Task { await model.repostAsNewMessage(item, key: key) } },
-                        onDiscard: { Task { await model.discard(item, key: key) } }
-                    )
-                }
-            }
-            .dropDestination(for: DroppedFile.self) { drops, _ in
-                model.addDroppedFiles(drops, to: ComposerID(key: key, thread: thread))
-            } isTargeted: {
-                dropTargeted = $0
-            }
-            ComposerView(model: model, key: key, thread: thread, conversationDropTargeted: dropTargeted)
-                .id(ComposerID(key: key, thread: thread))
+        if rows.isEmpty && outbox.isEmpty && expectedReplies > 0 {
+            ProgressView().controlSize(.small).frame(maxWidth: .infinity)
+                .modifier(ThreadRail(context: context, top: 8))
         }
-        .padding(.vertical, 8)
-        .padding(.leading, 6)
-        .overlay(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 1).fill(Color.secondary.opacity(0.25)).frame(width: 2)
+        ForEach(rows) { row in
+            let name = row.message.name
+            takesDrops(MessageRow(row: row, context: context, compact: true))
+                .onGeometryChange(for: Bool.self, of: { [listFrame] in Self.isOnScreen($0, in: listFrame) }) {
+                    onScreen in
+                    seen(name, onScreen: onScreen)
+                }
+                .onDisappear { seen(name, onScreen: false) }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Thread reply")
+                .modifier(ThreadRail(context: context, top: row.id == rows.first?.id ? 8 : 1))
+                .id(row.id)
         }
-        .padding(.leading, context.showsAvatars ? 36 : 4)
-        .padding(.trailing, 24)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Thread replies")
-        .onAppear {
-            visible = true
-            reportRead(replies)
+        ForEach(outbox) { item in
+            takesDrops(
+                OutboxRow(
+                    item: item, context: context,
+                    onRepost: { Task { await model.repostAsNewMessage(item, key: key) } },
+                    onDiscard: { Task { await model.discard(item, key: key) } }
+                )
+            )
+            .modifier(ThreadRail(context: context, top: 1))
         }
-        .onDisappear { visible = false }
-        .onChange(of: model.threadMessages.last?.id) { reportRead(model.threadMessages.filter(\.isThreadReply)) }
+        ComposerView(model: model, key: key, thread: thread, conversationDropTargeted: dropRows > 0)
+            .modifier(ThreadRail(context: context, top: 5, bottom: 8))
+            .id(ComposerID(key: key, thread: thread))
     }
 
-    /// The replies are on screen while the open thread is, so its read position follows the newest one.
-    private func reportRead(_ replies: [Message]) {
-        guard visible else { return }
-        let newest = replies.lazy.filter { !$0.isDeleted }.map(\.createTime).max()
-        model.threadViewportChanged(key, thread: thread, newest: newest)
+    /// A row is on screen when a useful part of it is inside the list's visible area. The list is table-backed,
+    /// so rows get no scroll view bounds and compare window coordinates instead.
+    nonisolated private static func isOnScreen(_ proxy: GeometryProxy, in listFrame: CGRect) -> Bool {
+        let shown = proxy.frame(in: .global).intersection(listFrame).height
+        return shown >= min(24, proxy.size.height)
+    }
+
+    private func seen(_ name: MessageName, onScreen: Bool) {
+        guard thread == model.openThread, viewport.update(name, in: thread, onScreen: onScreen) else { return }
+        model.threadViewportChanged(key, thread: thread, newest: viewport.newest(in: model.threadMessages))
+    }
+
+    /// Drops on the thread's rows attach to its reply field.
+    private func takesDrops<V: View>(_ row: V) -> some View {
+        row.dropDestination(for: DroppedFile.self) { drops, _ in
+            dropRows = 0
+            return model.addDroppedFiles(drops, to: ComposerID(key: key, thread: thread))
+        } isTargeted: { over in
+            dropRows = max(0, dropRows + (over ? 1 : -1))
+        }
+    }
+}
+
+/// The thread's left rail and indent, drawn per row with no gap between rows so it reads as one line.
+private struct ThreadRail: ViewModifier {
+    let context: MessageContext
+    var top: CGFloat = 1
+    var bottom: CGFloat = 1
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.top, top)
+            .padding(.bottom, bottom)
+            .padding(.leading, 6)
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 1).fill(Color.secondary.opacity(0.25)).frame(width: 2)
+            }
+            .padding(.leading, context.showsAvatars ? 36 : 4)
+            .padding(.trailing, 24)
+            .listRowInsets(EdgeInsets())
+            .listRowSeparator(.hidden)
+    }
+}
+
+/// The open thread's replies on screen. A plain object, so scrolling doesn't redraw the conversation.
+@MainActor
+final class ThreadViewport {
+    private var thread: ThreadName?
+    private var visible: Set<MessageName> = []
+
+    /// Records one row; false when nothing changed.
+    func update(_ name: MessageName, in thread: ThreadName, onScreen: Bool) -> Bool {
+        if thread != self.thread {
+            self.thread = thread
+            visible = []
+        }
+        return onScreen ? visible.insert(name).inserted : visible.remove(name) != nil
+    }
+
+    func newest(in replies: [Message]) -> Timestamp? {
+        Message.newestVisibleReply(in: replies, visible: visible)
     }
 }

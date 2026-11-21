@@ -2,8 +2,8 @@ import ChatModel
 import ChatSync
 import SwiftUI
 
-/// Everyone in the conversation, from the members list the app already caches: you first, then managers, members,
-/// apps, invited people and deleted users. Message opens a direct message; Mention adds them to the reply.
+/// Everyone in the conversation, from the members list the app caches: you first, then owners and managers, members,
+/// apps and deleted users. Message opens a direct message; Mention adds them to the reply.
 struct MembersPopover: View {
     let model: AppModel
     let key: SpaceKey
@@ -12,6 +12,8 @@ struct MembersPopover: View {
     @State private var query = ""
     @State private var hovered: UserName?
     @State private var failure: String?
+    /// Nil while the cache is being checked or fetched; false when the members couldn't be fetched.
+    @State private var fetched: Bool?
 
     var body: some View {
         let summary = model.summary(for: key)
@@ -33,7 +35,7 @@ struct MembersPopover: View {
                 .padding(.bottom, 8)
 
             if members.isEmpty {
-                Text("Loading members…").font(.callout).foregroundStyle(.secondary).padding(20)
+                emptyState
             } else if shown.isEmpty {
                 Text("No members match “\(query)”.").font(.callout).foregroundStyle(.secondary).padding(20)
             } else {
@@ -51,33 +53,51 @@ struct MembersPopover: View {
             }
         }
         .frame(width: 340)
+        .task { await load() }
+    }
+
+    @ViewBuilder private var emptyState: some View {
+        switch fetched {
+        case nil:
+            Text("Loading members…").font(.callout).foregroundStyle(.secondary).padding(20)
+        case true?:
+            Text("No members").font(.callout).foregroundStyle(.secondary).padding(20)
+        case false?:
+            VStack(spacing: 6) {
+                Text("Couldn't load members").font(.callout).foregroundStyle(.secondary)
+                Button("Retry") { Task { await load() } }.buttonStyle(.link)
+            }
+            .padding(20)
+        }
+    }
+
+    private func load() async {
+        fetched = nil
+        fetched = await model.ensureMembers(for: key)
     }
 
     private var me: UserName? { model.info(key.account)?.me }
 
     private func subtitle(_ summary: SpaceSummary?) -> String {
         let joined = members.filter { $0.state == .joined }.count
-        let invited = members.filter { $0.state == .invited }.count
         let account = RemoteText.title(model.info(key.account)?.name ?? "")
         let people = "\(joined) \(joined == 1 ? "member" : "members")"
-        let invites = invited > 0 ? ", \(invited) invited" : ""
         switch summary?.type {
         case .directMessage: return account
-        case .groupChat: return "\(account) group chat with \(people)\(invites)"
-        default: return "\(account) space with \(people)\(invites)"
+        case .groupChat: return "\(account) group chat with \(people)"
+        default: return "\(account) space with \(people)"
         }
     }
 
-    /// You, managers, members, apps, invited people, then deleted users; by name within each.
+    /// You, owners and managers, members, apps, then deleted users; by name within each.
     private var sorted: [Membership] {
         func rank(_ m: Membership) -> Int {
             if m.member.name == me { return 0 }
-            if m.member.isAnonymous { return 5 }
-            if m.state == .invited { return 4 }
+            if m.member.isAnonymous { return 4 }
             if m.member.type == .bot { return 3 }
-            return m.role == .manager ? 1 : 2
+            return role(m) == nil ? 2 : 1
         }
-        return members.filter { $0.state != .notAMember }.sorted {
+        return members.filter { $0.state == .joined }.sorted {
             let (a, b) = (rank($0), rank($1))
             if a != b { return a < b }
             return name($0).localizedCaseInsensitiveCompare(name($1)) == .orderedAscending
@@ -98,9 +118,17 @@ struct MembersPopover: View {
 
     private func detail(_ membership: Membership) -> String? {
         if membership.member.isAnonymous { return nil }
-        if membership.state == .invited { return "Invited, hasn't joined yet" }
         if membership.member.type == .bot { return "App" }
         return nil
+    }
+
+    /// Chat's API calls a space's owners managers, and its managers assistant managers.
+    private func role(_ membership: Membership) -> String? {
+        switch membership.role {
+        case .manager: "Owner"
+        case .assistantManager: "Manager"
+        case .member, .unspecified: nil
+        }
     }
 
     /// People you can message or mention: joined, human, not deleted, and not you.
@@ -114,19 +142,18 @@ struct MembersPopover: View {
         let isMe = user == me
         let canReach = reachable(membership)
         let showsActions = canReach && hovered == user
-        let context = model.messageContext(for: key)
         let label = name(membership) + (isMe ? " (you)" : "")
         return HStack(spacing: 10) {
             if membership.member.type == .bot {
                 SpaceAvatar(title: label, kind: .bot, size: 30)
             } else {
-                PhotoAvatar(name: label, url: context.photoURL(user), media: context.media, size: 30)
-                    .opacity(membership.state == .invited ? 0.5 : 1)
+                PhotoAvatar(
+                    name: label, url: model.photoURL(user, account: key.account),
+                    media: model.mediaLoader(for: key.account), size: 30)
             }
             VStack(alignment: .leading, spacing: 0) {
                 Text(label)
                     .fontWeight(.medium)
-                    .foregroundStyle(membership.state == .invited ? .secondary : .primary)
                     .lineLimit(1)
                 if let detail = detail(membership) {
                     Text(detail).font(.caption).foregroundStyle(.secondary)
@@ -153,8 +180,8 @@ struct MembersPopover: View {
                 }
                 .buttonStyle(.plain)
                 .help("Mention \(label) in the reply")
-            } else if membership.role == .manager && membership.state == .joined {
-                Text("Manager").font(.caption).foregroundStyle(.secondary)
+            } else if let role = role(membership) {
+                Text(role).font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 8)

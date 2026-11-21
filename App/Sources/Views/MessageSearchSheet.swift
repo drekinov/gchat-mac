@@ -70,6 +70,9 @@ struct MessageSearchSheet: View {
         .frame(width: Self.size.width, height: Self.size.height, alignment: .top)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { focused = true }
+        .onChange(of: account) {
+            if let account, selected?.account != account { selected = nil }
+        }
         .onChange(of: model.accounts.map(\.id)) {
             selected = nil
             if let account, model.info(account) == nil { self.account = nil }

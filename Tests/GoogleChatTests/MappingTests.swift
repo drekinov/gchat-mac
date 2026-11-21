@@ -225,6 +225,15 @@ import Testing
         #expect(page.items[1].member.type == .bot)
     }
 
+    @Test func assistantManagersKeepTheirRole() async throws {
+        let body = Data(
+            #"{"memberships":[{"name":"\#(testSpace.rawValue)/members/1","state":"JOINED","role":"ROLE_ASSISTANT_MANAGER","member":{"name":"users/1","displayName":"Ann","type":"HUMAN"}}]}"#
+                .utf8)
+        let page = try await makeClient(StubTransport(status: 200, body: body)).listMemberships(
+            in: testSpace, pageToken: nil)
+        #expect(page.items.map(\.role) == [.assistantManager])
+    }
+
     @Test func customEmojisMapAndSkipInvalid() async throws {
         let (client, _) = clientServing("custom_emojis_list")
         let page = try await client.listCustomEmojis(pageToken: nil)

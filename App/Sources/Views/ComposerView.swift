@@ -166,7 +166,7 @@ struct ComposerView: View {
             if editRevision == revision, text.isEmpty { text = draft }
             insertDroppedText()
         }
-        .onChange(of: model.snapshots[key.account]?.revision) {
+        .onChange(of: model.summary(for: key)?.membersFetched) {
             Task {
                 candidates = await model.mentionCandidates(for: key)
                 refreshTrigger()
@@ -329,12 +329,25 @@ struct ComposerView: View {
     /// The members list asked for this person to be mentioned: types "@" at the caret and picks them.
     private func insertRequestedMention() {
         guard let contact = model.takeMentionRequest(composerID) else { return }
-        let before = text.last
-        insert(before == nil || before?.isWhitespace == true ? "@" : " @")
+        insert(startsWord(at: insertionOffset()) ? "@" : " @")
         guard let caret = caretOffset(), let found = mentionEditor.trigger(in: text, caret: caret) else { return }
         trigger = found
         pickMention(contact)
         focused = true
+    }
+
+    /// Where `insert` puts text: the start of the selection, or the end of the draft without one.
+    private func insertionOffset() -> Int {
+        if let selection, case .selection(let range) = selection.indices, range.upperBound <= text.endIndex {
+            return text.utf16.distance(from: text.utf16.startIndex, to: range.lowerBound)
+        }
+        return text.utf16.count
+    }
+
+    /// Whether an "@" at `offset` starts a word, by the same rule the mention popup uses.
+    private func startsWord(at offset: Int) -> Bool {
+        guard offset > 0 else { return true }
+        return MentionEditor.isWhitespace(text.utf16[text.utf16.index(text.utf16.startIndex, offsetBy: offset - 1)])
     }
 
     private var mentionNames: [UserName: String] {
