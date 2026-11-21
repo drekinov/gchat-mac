@@ -54,8 +54,8 @@ scopes**, use the values below. [Open Data Access](https://console.cloud.google.
 <details>
 <summary>OAuth scopes requested by Thimble</summary>
 
-The required scopes identify the signed-in account, list spaces and members, read and search messages, send messages
-and attachments, start direct messages, react, sync read state, and read space notification settings and custom emoji.
+The required scopes identify the signed-in account, list spaces and members, read and search messages, send, edit and delete
+messages and attachments, start direct messages, react, sync read state, and read space notification settings and custom emoji.
 Google’s console lists the app’s `email` scope as `https://www.googleapis.com/auth/userinfo.email`.
 
 ```text
@@ -65,6 +65,7 @@ https://www.googleapis.com/auth/chat.spaces.readonly
 https://www.googleapis.com/auth/chat.memberships.readonly
 https://www.googleapis.com/auth/chat.messages.readonly
 https://www.googleapis.com/auth/chat.messages.create
+https://www.googleapis.com/auth/chat.messages
 https://www.googleapis.com/auth/chat.messages.reactions
 https://www.googleapis.com/auth/chat.users.readstate
 https://www.googleapis.com/auth/chat.users.spacesettings

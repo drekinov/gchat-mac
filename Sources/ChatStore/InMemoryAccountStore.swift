@@ -153,11 +153,8 @@ public final class InMemoryAccountStore: AccountStore {
             state.notified = state.notified.filter { $0.key.space != name }
         case .upsertMessages(let messages):
             for message in messages {
-                if let stored = state.messages[message.name] {
-                    if message.version < stored.version { continue }
-                    if message.version == stored.version, !(message.isDeleted && !stored.isDeleted) { continue }
-                }
-                state.messages[message.name] = message
+                guard let kept = Message.merge(message, over: state.messages[message.name]) else { continue }
+                state.messages[message.name] = kept
             }
         case .replaceMessages(let space, let messages, let coveredBefore):
             let keep = Set(messages.map(\.name))
@@ -165,8 +162,9 @@ public final class InMemoryAccountStore: AccountStore {
                 $0.value.space != space || $0.value.createTime >= coveredBefore || keep.contains($0.key)
             }
             for message in messages where message.space == space {
-                if let stored = state.messages[message.name], message.version < stored.version { continue }
-                state.messages[message.name] = message
+                let stored = state.messages[message.name]
+                guard let kept = Message.merge(message, over: stored, rewriteEqual: true) else { continue }
+                state.messages[message.name] = kept
             }
         case .updateReactions(let name, let reactions):
             state.messages[name]?.reactions = reactions

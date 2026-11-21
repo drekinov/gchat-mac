@@ -41,3 +41,35 @@ struct ScrollCommand: Equatable {
     var sequence: Int
     var toTop: Bool
 }
+
+/// Asks a composer to edit one message. `id` tells attempts apart, so a late result can't end a newer edit.
+struct EditRequest: Equatable {
+    let id = UUID()
+    let message: MessageName
+    var started = false
+}
+
+/// The draft a composer held when an edit started, given back when the edit ends.
+struct StashedDraft {
+    var text: String
+    var mentions: MentionEditor
+}
+
+enum EditFailure: Error {
+    case changed(Message)
+    case message(String)
+}
+
+/// A delete waiting for confirmation. `force` also deletes a thread starter's replies.
+struct DeleteRequest: Identifiable {
+    let key: SpaceKey
+    let message: Message
+    let force: Bool
+    var id: MessageName { message.name }
+}
+
+/// Which member list the open space's role was read from.
+struct RoleSource: Equatable {
+    let key: SpaceKey
+    let fetched: Timestamp?
+}

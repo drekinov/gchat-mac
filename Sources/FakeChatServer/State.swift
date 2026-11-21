@@ -134,10 +134,12 @@ struct State: Sendable {
         return user
     }
 
-    func membership(of user: User, in space: SpaceName, state: Membership.State = .joined) -> Membership {
+    func membership(
+        of user: User, in space: SpaceName, role: Membership.Role = .member, state: Membership.State = .joined
+    ) -> Membership {
         Membership(
             name: MembershipName(unchecked: "\(space.rawValue)/members/\(user.name.id(at: 0))"), member: user,
-            state: state)
+            role: role, state: state)
     }
 
     mutating func record(_ payload: StoredEvent.Payload, in space: SpaceName, at time: Timestamp) {
@@ -165,14 +167,22 @@ struct State: Sendable {
         return name
     }
 
-    mutating func addMember(_ user: User, to space: SpaceName, at: Timestamp?) {
+    mutating func addMember(_ user: User, to space: SpaceName, role: Membership.Role = .member, at: Timestamp?) {
         guard let state = spaces[space] else { preconditionFailure("unknown space \(space)") }
         guard !state.isMember(user.name) else { return }
         knownUsers[user.name] = user
         let time = stamp(at)
-        let added = membership(of: user, in: space)
+        let added = membership(of: user, in: space, role: role)
         spaces[space]?.members.append(added)
         record(.membershipCreated(added), in: space, at: time)
+    }
+
+    /// Changes an existing member's role without recording an event.
+    mutating func setRole(_ role: Membership.Role, of user: UserName, in space: SpaceName) {
+        guard let index = spaces[space]?.members.firstIndex(where: { $0.member.name == user }) else {
+            preconditionFailure("\(user) is not in \(space)")
+        }
+        spaces[space]?.members[index].role = role
     }
 
     mutating func removeMember(_ user: User, from space: SpaceName, at: Timestamp?) {
@@ -229,11 +239,14 @@ struct State: Sendable {
     }
 
     @discardableResult
-    mutating func edit(_ name: MessageName, text: String, at: Timestamp?) -> Message {
+    mutating func edit(
+        _ name: MessageName, text: String, annotations: [Annotation]? = nil, at: Timestamp?
+    ) -> Message {
         let index = recordIndex(name)
         precondition(spaces[name.space]?.messages[index].message.isDeleted == false, "message is deleted")
         let time = stamp(at)
         spaces[name.space]?.messages[index].message.text = text
+        if let annotations { spaces[name.space]?.messages[index].message.annotations = annotations }
         spaces[name.space]?.messages[index].message.lastUpdateTime = time
         let message = spaces[name.space]!.messages[index].message
         record(.messageUpdated(message), in: name.space, at: time)

@@ -6,6 +6,8 @@ enum Endpoint {
     case listMessages(SpaceName)
     case createMessage(SpaceName)
     case getMessage(MessageName)
+    case updateMessage(MessageName)
+    case deleteMessage(MessageName)
     case listSpaceEvents(SpaceName)
     case listMembers(SpaceName)
     case getSpaceReadState(SpaceName, user: String)
@@ -30,6 +32,8 @@ enum Endpoint {
         case .listMessages: .listMessages
         case .createMessage: .createMessage
         case .getMessage: .getMessage
+        case .updateMessage: .updateMessage
+        case .deleteMessage: .deleteMessage
         case .listSpaceEvents: .listSpaceEvents
         case .listMembers: .listMembers
         case .getSpaceReadState: .getSpaceReadState
@@ -57,7 +61,9 @@ enum Endpoint {
             .getThreadReadState(let space, _, _), .updateThreadReadState(let space, _, _),
             .getNotificationSetting(let space, _), .uploadAttachment(let space):
             space
-        case .getMessage(let message), .createReaction(let message), .listReactions(let message): message.space
+        case .getMessage(let message), .updateMessage(let message), .deleteMessage(let message),
+            .createReaction(let message), .listReactions(let message):
+            message.space
         case .deleteReaction(let reaction): reaction.message.space
         }
     }
@@ -106,8 +112,14 @@ enum Endpoint {
             case ("members", "GET"): return .listMembers(name)
             default: return nil
             }
-        case 4 where rest[0] == "spaces" && rest[2] == "messages" && isGet:
-            return MessageName("spaces/\(rest[1])/messages/\(rest[3])").map { .getMessage($0) }
+        case 4 where rest[0] == "spaces" && rest[2] == "messages":
+            guard let message = MessageName("spaces/\(rest[1])/messages/\(rest[3])") else { return nil }
+            switch method {
+            case "GET": return .getMessage(message)
+            case "PATCH": return .updateMessage(message)
+            case "DELETE": return .deleteMessage(message)
+            default: return nil
+            }
         case 5 where rest[0] == "spaces" && rest[2] == "messages" && rest[4] == "reactions":
             guard let message = MessageName("spaces/\(rest[1])/messages/\(rest[3])") else { return nil }
             switch method {

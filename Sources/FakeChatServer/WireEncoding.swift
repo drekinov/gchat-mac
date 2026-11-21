@@ -130,14 +130,26 @@ extension State {
         return out
     }
 
+    /// A deletion event's message: Google sends no sender, thread or text.
+    func wireDeletedMessage(_ message: Message) -> JSON {
+        var out: JSON = [
+            "name": message.name.rawValue, "createTime": message.createTime.rfc3339,
+            "deletionMetadata": ["deletionType": "CREATOR"] as JSON,
+        ]
+        if let time = message.deleteTime { out["deleteTime"] = time.rfc3339 }
+        return out
+    }
+
     func wireReaction(_ reaction: ReactionRecord) -> JSON {
         ["name": reaction.name, "user": wireUser(reaction.user), "emoji": wireEmoji(reaction.emoji)]
     }
 
     private func wireEntity(_ payload: StoredEvent.Payload) -> (entity: String, plural: String, object: JSON) {
         switch payload {
-        case .messageCreated(let message), .messageUpdated(let message), .messageDeleted(let message):
+        case .messageCreated(let message), .messageUpdated(let message):
             ("message", "messages", wireMessage(message))
+        case .messageDeleted(let message):
+            ("message", "messages", wireDeletedMessage(message))
         case .reactionCreated(let reaction), .reactionDeleted(let reaction):
             ("reaction", "reactions", wireReaction(reaction))
         case .membershipCreated(let membership), .membershipDeleted(let membership):

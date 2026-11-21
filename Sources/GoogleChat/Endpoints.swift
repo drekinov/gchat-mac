@@ -34,6 +34,10 @@ private struct CreateMessageBody: Encodable {
     var attachment: [AttachmentRef]?
 }
 
+private struct UpdateTextBody: Encodable {
+    var text: String
+}
+
 private struct ReadStateBody: Encodable {
     var name: String? = nil
     var lastReadTime: Timestamp
@@ -112,6 +116,11 @@ extension GoogleChatClient: ChatAPI {
     public func getMessage(_ message: MessageName) async throws(ChatAPIError) -> Message {
         let dto: Wire.MessageDTO = try await send(.get, url("/v1/\(message.rawValue)"))
         return try dto.domain()
+    }
+
+    public func getEditableMessage(_ message: MessageName) async throws(ChatAPIError) -> EditableMessage {
+        let dto: Wire.MessageDTO = try await send(.get, url("/v1/\(message.rawValue)"))
+        return EditableMessage(message: try dto.domain(), formattedText: dto.formattedText)
     }
 
     public func searchMessages(
@@ -226,6 +235,21 @@ extension GoogleChatClient: ChatAPI {
             throw .decoding(path: "name")
         }
         return CreatedMessage(name: name, message: try? dto.domain())
+    }
+
+    public func updateMessageText(_ message: MessageName, text: String) async throws(ChatAPIError) -> Message {
+        guard text.utf8.count <= Self.maxMessageBytes else { throw Self.invalid("CLIENT_TEXT_TOO_LONG") }
+        let query = [URLQueryItem(name: "updateMask", value: "text")]
+        let dto: Wire.MessageDTO = try await send(
+            .patch, url("/v1/\(message.rawValue)", query: query), body: UpdateTextBody(text: text))
+        let updated = try dto.domain()
+        guard updated.name == message else { throw .decoding(path: "name") }
+        return updated
+    }
+
+    public func deleteMessage(_ message: MessageName, force: Bool) async throws(ChatAPIError) {
+        let query = force ? [URLQueryItem(name: "force", value: "true")] : []
+        let _: Empty = try await send(.delete, url("/v1/\(message.rawValue)", query: query))
     }
 
     public func createReaction(on message: MessageName, emoji: Emoji) async throws(ChatAPIError) -> Reaction {

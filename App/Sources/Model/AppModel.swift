@@ -32,6 +32,16 @@ final class AppModel {
     private(set) var historyEnd = HistoryEnd.open
     private(set) var loadingHistory = false
     private(set) var sendError: String?
+    /// An edit each composer was asked to start; the composer takes it and owns the edit from then on.
+    private(set) var editRequests: [ComposerID: EditRequest] = [:]
+    var pendingDelete: DeleteRequest?
+    /// My role in the open space, for showing Delete on others' messages; Google decides in the end.
+    private(set) var openRole: Membership.Role?
+    @ObservationIgnored private var roleSource: RoleSource?
+    @ObservationIgnored private var stashedDrafts: [ComposerID: StashedDraft] = [:]
+    /// Deletes confirmed by Google this run; rows show as deleted until the store has Google's tombstones.
+    @ObservationIgnored private var locallyDeleted: Set<MessageName> = []
+    @ObservationIgnored private var deletedThreads: Set<ThreadName> = []
     var windowIsKey = true {
         didSet {
             guard windowIsKey != oldValue else { return }
@@ -496,6 +506,8 @@ final class AppModel {
             recent = Array(recent.prefix(3))
         }
         selection = key
+        openRole = nil
+        roleSource = nil
         openThread = nil
         newestVisibleReply = nil
         threadReadPosition = nil
@@ -582,17 +594,23 @@ final class AppModel {
             keepInHistory(openMessages.filter { $0.createTime < oldest })
         }
         storeWindow = loaded.messages
-        openMessages = withHistory(loaded.messages)
+        openMessages = withLocalDeletes(withHistory(loaded.messages))
         loadPhotos(for: loaded.messages + loaded.thread, session: session)
         openOutbox = loaded.outbox
         openMine = loaded.mine
         loadedKey = key
         if openThread == thread {
-            threadMessages =
-                thread.map { thread in Self.merged(history.filter { $0.thread == thread }, loaded.thread) } ?? []
+            threadMessages = withLocalDeletes(
+                thread.map { thread in Self.merged(history.filter { $0.thread == thread }, loaded.thread) } ?? [])
         }
         updateVisibleThreads(key)
         markReadIfNeeded()
+        let source = RoleSource(key: key, fetched: summary(for: key)?.membersFetched)
+        if roleSource != source {
+            roleSource = source
+            let role = await StoreReader.myRole(session: session, space: key.space)
+            if selection == key { openRole = role }
+        }
     }
 
     // MARK: Older history
@@ -627,9 +645,10 @@ final class AppModel {
                 }
                 guard historyOpening == opening else { return }
                 keepInHistory(page.items)
-                openMessages = withHistory(storeWindow)
+                openMessages = withLocalDeletes(withHistory(storeWindow))
                 if let thread = openThread {
-                    threadMessages = Self.merged(page.items.filter { $0.thread == thread }, threadMessages)
+                    threadMessages = withLocalDeletes(
+                        Self.merged(page.items.filter { $0.thread == thread }, threadMessages))
                 }
                 loadPhotos(for: page.items, session: session)
                 historyCursor = (cursor.before, page.nextPageToken)
@@ -664,11 +683,15 @@ final class AppModel {
         history.isEmpty ? window : Self.merged(history, window)
     }
 
-    /// Union by name, the later list winning, ordered by creation time.
-    private static func merged(_ older: [Message], _ newer: [Message]) -> [Message] {
-        let names = Set(newer.map(\.name))
-        return (older.filter { !names.contains($0.name) } + newer)
-            .sorted { ($0.createTime, $0.name.rawValue) < ($1.createTime, $1.name.rawValue) }
+    /// Union by name, ordered by creation time. The later list wins unless its copy is older or would undo a
+    /// delete (`Message.merge`).
+    static func merged(_ older: [Message], _ newer: [Message]) -> [Message] {
+        var byName = Dictionary(older.map { ($0.name, $0) }) { _, last in last }
+        for message in newer {
+            let current = byName[message.name]
+            byName[message.name] = Message.merge(message, over: current, rewriteEqual: true) ?? current
+        }
+        return byName.values.sorted { ($0.createTime, $0.name.rawValue) < ($1.createTime, $1.name.rawValue) }
     }
 
     /// Profile photos for `users` not seen yet, for lists of people outside a conversation.
@@ -1136,7 +1159,12 @@ final class AppModel {
             toggle: { [self] emoji, message in Task { await toggleReaction(emoji, on: message, key: key) } },
             customEmojis: { [self] in customEmojis(for: key.account) },
             reactors: { [self] message, summaries in await reactors(on: message, key: key, summaries: summaries) },
-            media: mediaLoader(for: key.account))
+            media: mediaLoader(for: key.account),
+            canEdit: { [self] in canEdit($0, key: key) },
+            canDelete: { [self] in canDelete($0, key: key) },
+            edit: { [self] in beginEdit($0, key: key) },
+            delete: { [self] in requestDelete($0, key: key, replies: $1) },
+            editing: Set(editRequests.filter { $0.key.key == key }.values.map(\.message)))
     }
 
     /// Everyone who reacted to a message, by emoji: you first, then in the order Google lists them, each person
@@ -1186,6 +1214,150 @@ final class AppModel {
         guard let session = sessions[key.account] else { return }
         try? await session.discard(item)
         if selection == key { requestReload() }
+    }
+
+    // MARK: Editing and deleting
+
+    /// The composer that edits `message`: a thread reply's thread composer, otherwise the conversation's.
+    func composerID(editing message: Message, key: SpaceKey) -> ComposerID {
+        ComposerID(key: key, thread: isThreaded(key) && message.isThreadReply ? message.thread : nil)
+    }
+
+    func canEdit(_ message: Message, key: SpaceKey) -> Bool {
+        !message.isDeleted && message.sender.name == info(key.account)?.me && message.privateViewer == nil
+            && canReact(key.account)
+    }
+
+    func canDelete(_ message: Message, key: SpaceKey) -> Bool {
+        guard !message.isDeleted, canReact(key.account) else { return false }
+        return message.sender.name == info(key.account)?.me || openRole == .manager || openRole == .assistantManager
+    }
+
+    /// Hands `message` to the composer that edits it, opening its thread first if needed.
+    func beginEdit(_ message: Message, key: SpaceKey) {
+        guard selection == key, canEdit(message, key: key) else { return }
+        let id = composerID(editing: message, key: key)
+        if let thread = id.thread, openThread != thread { openThread(thread) }
+        editRequests[id] = EditRequest(message: message.name)
+    }
+
+    /// The newest message of mine in this composer's part of the conversation, for Up arrow.
+    func lastEditable(for id: ComposerID) -> Message? {
+        guard selection == id.key else { return nil }
+        let rows = id.thread == nil ? openMessages : threadMessages
+        return rows.last { composerID(editing: $0, key: id.key) == id && canEdit($0, key: id.key) }
+    }
+
+    /// The request the composer should start now; marks it started so a later remount doesn't start it again.
+    func takeEditRequest(_ id: ComposerID) -> EditRequest? {
+        guard var request = editRequests[id], !request.started else { return nil }
+        request.started = true
+        editRequests[id] = request
+        return request
+    }
+
+    /// True while `attempt` is still the composer's current edit.
+    func isCurrentEdit(_ attempt: UUID, in id: ComposerID) -> Bool { editRequests[id]?.id == attempt }
+
+    /// Ends the edit if it is still `attempt`, or whatever edit is there when nil.
+    func endEdit(_ id: ComposerID, attempt: UUID?) {
+        guard let current = editRequests[id], attempt == nil || current.id == attempt else { return }
+        editRequests[id] = nil
+    }
+
+    func stashDraft(_ draft: StashedDraft, for id: ComposerID) { stashedDrafts[id] = draft }
+
+    /// A one-line problem above the conversation's composer.
+    func showComposerNotice(_ text: String) { sendError = text }
+
+    func takeStashedDraft(_ id: ComposerID) -> StashedDraft? { stashedDrafts.removeValue(forKey: id) }
+
+    func editableCopy(of name: MessageName, key: SpaceKey) async -> Result<EditableCopy, EditFailure> {
+        guard let session = sessions[key.account] else { return .failure(.message("This account is gone.")) }
+        do {
+            return .success(try await session.editableCopy(of: name))
+        } catch {
+            return .failure(.message(Self.describe(edit: error)))
+        }
+    }
+
+    func saveEdit(
+        _ name: MessageName, text: String, basedOn: Timestamp, key: SpaceKey
+    ) async -> Result<Message, EditFailure> {
+        guard let session = sessions[key.account] else { return .failure(.message("This account is gone.")) }
+        do {
+            let updated = try await session.editMessage(name, text: text, basedOn: basedOn)
+            replaceLoaded(updated)
+            if selection == key { requestReload() }
+            return .success(updated)
+        } catch .changedElsewhere(let latest) {
+            replaceLoaded(latest)
+            return .failure(.changed(latest))
+        } catch {
+            return .failure(.message(Self.describe(edit: error)))
+        }
+    }
+
+    func requestDelete(_ message: Message, key: SpaceKey, replies: Int) {
+        guard canDelete(message, key: key) else { return }
+        let threadStarter = !message.isThreadReply && replies > 0
+        pendingDelete = DeleteRequest(key: key, message: message, force: threadStarter)
+    }
+
+    func performDelete(_ request: DeleteRequest) async {
+        pendingDelete = nil
+        guard let session = sessions[request.key.account] else { return }
+        do {
+            try await session.deleteMessage(request.message.name, force: request.force)
+        } catch .hasReplies {
+            pendingDelete = DeleteRequest(key: request.key, message: request.message, force: true)
+            return
+        } catch {
+            sendError = Self.describe(edit: error, deleting: true)
+            return
+        }
+        locallyDeleted.insert(request.message.name)
+        if request.force, let thread = request.message.thread {
+            deletedThreads.insert(thread)
+            if openThread == thread { closeThread() }
+        }
+        for (id, edit) in editRequests where edit.message == request.message.name { editRequests[id] = nil }
+        openMessages = withLocalDeletes(openMessages)
+        threadMessages = withLocalDeletes(threadMessages)
+        if selection == request.key { requestReload() }
+    }
+
+    private func replaceLoaded(_ message: Message) {
+        func replace(_ list: [Message]) -> [Message] {
+            list.contains { $0.name == message.name } ? Self.merged(list, [message]) : list
+        }
+        history = replace(history)
+        openMessages = replace(openMessages)
+        threadMessages = replace(threadMessages)
+    }
+
+    private func withLocalDeletes(_ messages: [Message]) -> [Message] {
+        guard !locallyDeleted.isEmpty || !deletedThreads.isEmpty else { return messages }
+        return messages.map { message in
+            let inDeletedThread = message.isThreadReply && message.thread.map(deletedThreads.contains) == true
+            guard !message.isDeleted, locallyDeleted.contains(message.name) || inDeletedThread else { return message }
+            var tombstone = Message(
+                name: message.name, sender: message.sender, createTime: message.createTime,
+                deleteTime: message.version, thread: message.thread, isThreadReply: message.isThreadReply)
+            tombstone.lastUpdateTime = message.lastUpdateTime
+            return tombstone
+        }
+    }
+
+    static func describe(edit error: MessageEditError, deleting: Bool = false) -> String {
+        switch error {
+        case .notAdmitted: "This account is offline or paused. Try again when it's connected."
+        case .changedElsewhere: "This message changed somewhere else. Save again to replace that version."
+        case .hasReplies: "This message has replies."
+        case .denied: deleting ? "Google didn't allow deleting this message." : "Google didn't allow this edit."
+        case .gone: "This message no longer exists."
+        case .failed: deleting ? "Could not delete the message." : "Could not save the edit."
+        }
     }
 
     // MARK: Test support

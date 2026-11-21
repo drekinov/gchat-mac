@@ -49,6 +49,43 @@ import Testing
         #expect(transport.requests.allSatisfy { $0.url.query == nil })
     }
 
+    @Test func updatingTextPatchesOnlyTheTextAndChecksTheReturnedName() async throws {
+        let message = MessageName(unchecked: "spaces/AAAA/messages/M.1")
+        let reply = #"{"name":"spaces/AAAA/messages/M.1","createTime":"2026-10-14T12:00:00Z","text":"fixed"}"#
+        let transport = StubTransport(status: 200, body: Data(reply.utf8))
+        let updated = try await makeClient(transport).updateMessageText(message, text: "fixed")
+        let request = try #require(transport.requests.first)
+        #expect(request.method == .patch)
+        #expect(request.url.path == "/v1/spaces/AAAA/messages/M.1")
+        #expect(queryItems(request) == ["updateMask": "text"])
+        let body = try #require(
+            request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: String] })
+        #expect(body == ["text": "fixed"])
+        #expect(updated.text == "fixed")
+
+        let other = StubTransport(status: 200, body: Data(reply.replacingOccurrences(of: "M.1", with: "M.2").utf8))
+        let error = await thrownError { try await makeClient(other).updateMessageText(message, text: "x") }
+        #expect(error == .decoding(path: "name"))
+        let long = await thrownError {
+            try await makeClient(StubTransport()).updateMessageText(
+                message, text: String(repeating: "a", count: 32_001))
+        }
+        guard case .invalidArgument = long else {
+            Issue.record("expected a client-side length error")
+            return
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func deletingSendsForceOnlyWhenAsked(force: Bool) async throws {
+        let transport = StubTransport(status: 200, body: Data("{}".utf8))
+        try await makeClient(transport).deleteMessage(MessageName(unchecked: "spaces/AAAA/messages/M.1"), force: force)
+        let request = try #require(transport.requests.first)
+        #expect(request.method == .delete)
+        #expect(request.url.path == "/v1/spaces/AAAA/messages/M.1")
+        #expect(queryItems(request) == (force ? ["force": "true"] : [:]))
+    }
+
     @Test func listMessagesFilterIsExactlyOrderedAndEncoded() async throws {
         let transport = StubTransport()
         let thread = ThreadName(unchecked: "spaces/AAAA/threads/THR1")

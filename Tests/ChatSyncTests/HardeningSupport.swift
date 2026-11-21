@@ -297,6 +297,24 @@ struct BarrierAPI: ChatAPI {
         return tamper.apply(created)
     }
 
+    func getEditableMessage(_ message: MessageName) async throws(ChatAPIError) -> EditableMessage {
+        try await held("getEditableMessage") { () async throws(ChatAPIError) in
+            try await base.getEditableMessage(message)
+        }
+    }
+
+    func updateMessageText(_ message: MessageName, text: String) async throws(ChatAPIError) -> Message {
+        try await held("updateMessageText") { () async throws(ChatAPIError) in
+            try await base.updateMessageText(message, text: text)
+        }
+    }
+
+    func deleteMessage(_ message: MessageName, force: Bool) async throws(ChatAPIError) {
+        try await held("deleteMessage") { () async throws(ChatAPIError) in
+            try await base.deleteMessage(message, force: force)
+        }
+    }
+
     func setUpDirectMessage(with member: DirectMessageMember) async throws(ChatAPIError) -> Space {
         try await held("setUpDirectMessage") { () async throws(ChatAPIError) in
             try await base.setUpDirectMessage(with: member)

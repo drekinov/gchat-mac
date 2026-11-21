@@ -51,6 +51,29 @@ struct SpaceView: View {
         .onChange(of: model.summary(for: key)?.membersFetched) {
             Task { members = await model.memberships(for: key) }
         }
+        .confirmationDialog(
+            deleteTitle, isPresented: deleteShown, titleVisibility: .visible, presenting: model.pendingDelete
+        ) { request in
+            Button(request.force ? "Delete Thread" : "Delete", role: .destructive) {
+                Task { await model.performDelete(request) }
+            }
+            Button("Cancel", role: .cancel) { model.pendingDelete = nil }
+        } message: { request in
+            Text(
+                request.force
+                    ? "This also deletes every reply in its thread, including replies not shown. This can't be undone."
+                    : "This can't be undone.")
+        }
+    }
+
+    private var deleteTitle: String {
+        model.pendingDelete?.force == true ? "Delete this message and its thread?" : "Delete this message?"
+    }
+
+    private var deleteShown: Binding<Bool> {
+        Binding(
+            get: { model.pendingDelete?.key == key },
+            set: { if !$0 { model.pendingDelete = nil } })
     }
 }
 

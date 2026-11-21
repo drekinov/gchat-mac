@@ -40,7 +40,7 @@ public struct StoreWrite: Sendable {
         case mergeSpace(Space)
         case setSpaceHidden(SpaceName, Bool)
         case deleteSpace(SpaceName)
-        /// Per message: replaces the stored copy only if `version` is not older; at equal version a tombstone wins.
+        /// Per message, by `Message.merge`: a copy that isn't older replaces the stored one, and deletes are terminal.
         case upsertMessages([Message])
         /// A fresh authoritative window: cached messages of the space created before `coveredBefore` that aren't in
         /// `messages` are dropped; `messages` then replace rows of the same or an older version. Newer rows stay.

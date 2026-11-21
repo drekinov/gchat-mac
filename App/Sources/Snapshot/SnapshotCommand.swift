@@ -165,6 +165,7 @@
             if let entry = model.inbox.first(where: { $0.summary.title == "Engineering" }) {
                 model.select(entry.id)
                 await mentionChecks(model, entry.id)
+                await editRoundTrip(model, entry.id)
                 let preview = VStack(spacing: 0) {
                     Color(nsColor: .textBackgroundColor).frame(height: 200)
                     ComposerView(model: model, key: entry.id, thread: nil, previewText: "Thanks @mo")
@@ -428,6 +429,32 @@
             let edited = text.replacingOccurrences(of: "@" + (candidates.first?.displayName ?? ""), with: "@X")
             editor.applyEdit(old: text, new: edited)
             print("snapshot: after editing first mention, wire: \(editor.wireText(edited, names: names))")
+        }
+
+        /// Edits and deletes my last message through the real session against the fake, and checks that a stale
+        /// copy arriving afterwards (a slow history page) undoes neither.
+        private func editRoundTrip(_ model: AppModel, _ key: SpaceKey) async {
+            await model.waitUntilSettled(timeout: .seconds(3))
+            guard let mine = model.lastEditable(for: ComposerID(key: key, thread: nil)) else {
+                return print("snapshot: edit FAILED no message of mine to edit")
+            }
+            guard case .success(let copy) = await model.editableCopy(of: mine.name, key: key) else {
+                return print("snapshot: edit FAILED could not load the message")
+            }
+            let saved = await model.saveEdit(
+                mine.name, text: copy.message.text + " (edited)", basedOn: copy.message.version, key: key)
+            await model.waitUntilSettled(timeout: .seconds(3))
+            let shown = model.openMessages.first { $0.name == mine.name }
+            let staleKept = AppModel.merged([shown].compactMap { $0 }, [mine]).first?.text == shown?.text
+            print(
+                "snapshot: edit saved=\((try? saved.get()) != nil) edited=\(shown?.lastUpdateTime != nil) staleIgnored=\(staleKept)"
+            )
+            guard let edited = shown else { return }
+            await model.performDelete(DeleteRequest(key: key, message: edited, force: false))
+            await model.waitUntilSettled(timeout: .seconds(3))
+            let deleted = model.openMessages.first { $0.name == mine.name }
+            let staleAfterDelete = AppModel.merged([deleted].compactMap { $0 }, [edited]).first?.isDeleted == true
+            print("snapshot: delete shown=\(deleted?.isDeleted == true) staleIgnored=\(staleAfterDelete)")
         }
 
         /// Toggles through the real session against the fake: remove an own reaction, re-add it, add a new one.

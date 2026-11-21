@@ -82,6 +82,7 @@ public enum OAuthScopes {
         ["openid", "email"]
         + [
             "chat.spaces.readonly", "chat.memberships.readonly", "chat.messages.readonly", "chat.messages.create",
+            "chat.messages",
             "chat.messages.reactions", "chat.users.readstate", "chat.users.spacesettings", "chat.customemojis.readonly",
             "chat.spaces.create",
         ].map { prefix + $0 }

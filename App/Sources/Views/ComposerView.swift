@@ -20,6 +20,7 @@ struct ComposerView: View {
     @State private var dismissedAt: Int?
     @State private var popupHighlight = 0
     @State private var dropTargeted = false
+    @State private var edit: ActiveEdit?
     @FocusState private var focused: Bool
     private let previewMode: Bool
     /// A drag is over the conversation's messages, whose drops attach here, so the composer shows its drop outline.
@@ -49,6 +50,7 @@ struct ComposerView: View {
             if let problem = model.attachmentError(for: composerID) {
                 Text(problem).font(.caption).foregroundStyle(Theme.error)
             }
+            if let edit { EditBar(edit: edit, onCancel: { finishEdit() }) }
             // Google Chat's per-conversation history setting; the org's retention rules apply only while it's on.
             if thread == nil, model.summary(for: key)?.historyOn == false {
                 Label("History is off. Messages are deleted after about 24 hours.", systemImage: "timer")
@@ -63,6 +65,7 @@ struct ComposerView: View {
                         .frame(height: Self.rowHeight)
                 }
                 .buttonStyle(.plain)
+                .disabled(edit != nil)
                 .help("Attach files")
                 .accessibilityLabel("Attach files")
                 VStack(alignment: .leading, spacing: 6) {
@@ -97,16 +100,18 @@ struct ComposerView: View {
                             }
                         }
                         Button(action: submit) {
-                            Image(systemName: "arrow.up").font(.system(size: 13, weight: .bold))
-                                .foregroundStyle(canSend ? Theme.onAccent : Color.secondary)
-                                .frame(width: Self.sendSize, height: Self.sendSize)
-                                .background(canSend ? Theme.accent : Color.primary.opacity(0.08), in: Circle())
-                                .frame(height: Self.rowHeight)
+                            Image(systemName: edit == nil ? "arrow.up" : "checkmark").font(
+                                .system(size: 13, weight: .bold)
+                            )
+                            .foregroundStyle(canSend ? Theme.onAccent : Color.secondary)
+                            .frame(width: Self.sendSize, height: Self.sendSize)
+                            .background(canSend ? Theme.accent : Color.primary.opacity(0.08), in: Circle())
+                            .frame(height: Self.rowHeight)
                         }
                         .buttonStyle(.plain)
                         .disabled(!canSend)
-                        .help("Send (Return). Shift-Return adds a new line.")
-                        .accessibilityLabel("Send")
+                        .help(edit == nil ? "Send (Return). Shift-Return adds a new line." : "Save (Return)")
+                        .accessibilityLabel(edit == nil ? "Send" : "Save")
                     }
                 }
                 .padding(.leading, 8)
@@ -154,6 +159,16 @@ struct ComposerView: View {
             model.consumeComposerFocus(key)
         }
         .task(id: key) {
+            // An edit this composer started before it was last shown is over; its draft comes back.
+            if edit == nil, model.editRequests[composerID]?.started == true {
+                model.endEdit(composerID, attempt: nil)
+                if let stash = model.takeStashedDraft(composerID) {
+                    text = stash.text
+                    mentionEditor = stash.mentions
+                    restored = true
+                }
+            }
+            startRequestedEdit()
             model.prepareMentions(for: key)
             candidates = await model.mentionCandidates(for: key)
             guard !Task.isCancelled else { return }
@@ -163,8 +178,15 @@ struct ComposerView: View {
             let draft = await model.loadDraft(key, thread: thread)
             guard !Task.isCancelled else { return }
             restored = true
-            if editRevision == revision, text.isEmpty { text = draft }
+            if editRevision == revision, text.isEmpty, edit == nil { text = draft }
             insertDroppedText()
+        }
+        .onChange(of: model.editRequests[composerID]?.id) {
+            if model.editRequests[composerID] == nil {
+                if edit != nil { finishEdit() }
+            } else {
+                startRequestedEdit()
+            }
         }
         .onChange(of: model.summary(for: key)?.membersFetched) {
             Task {
@@ -187,6 +209,7 @@ struct ComposerView: View {
 
     private func editor(_ items: [Contact]) -> some View {
         TextEditor(text: editorBinding, selection: $selection)
+            .disabled(edit.map { $0.saving || $0.basedOn == nil } ?? false)
             .background(TextOnlyDrops())
             .font(.body)
             .scrollContentBackground(.hidden)
@@ -226,12 +249,16 @@ struct ComposerView: View {
                 return .handled
             }
             .onKeyPress(.upArrow) {
-                guard !items.isEmpty else { return .ignored }
+                guard !items.isEmpty else { return editLast() }
                 popupHighlight = max(popupHighlight - 1, 0)
                 return .handled
             }
             .onKeyPress(.escape) {
-                guard !items.isEmpty, let trigger else { return .ignored }
+                guard !items.isEmpty, let trigger else {
+                    guard edit != nil else { return .ignored }
+                    finishEdit()
+                    return .handled
+                }
                 dismissedAt = trigger.at
                 return .handled
             }
@@ -359,7 +386,9 @@ struct ComposerView: View {
     // MARK: Sending
 
     private var canSend: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.attachments(for: composerID).isEmpty
+        if let edit { return !edit.saving && edit.basedOn != nil }
+        return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !model.attachments(for: composerID).isEmpty
     }
 
     private func chooseFiles() {
@@ -390,6 +419,7 @@ struct ComposerView: View {
 
     private func scheduleSave() {
         saveTask?.cancel()
+        guard edit == nil else { return }
         let snapshot = text
         saveTask = Task {
             try? await Task.sleep(for: .milliseconds(600))
@@ -400,6 +430,7 @@ struct ComposerView: View {
 
     private func submit() {
         guard canSend else { return }
+        guard edit == nil else { return saveEdit() }
         let outgoing = text
         let sentMentions = mentionEditor
         let sentAttachments = model.takeAttachments(composerID)
@@ -418,6 +449,139 @@ struct ComposerView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: Editing a sent message
+
+extension ComposerView {
+    /// One edit in progress: `basedOn` is nil while the message loads.
+    struct ActiveEdit: Equatable {
+        let attempt: UUID
+        let message: MessageName
+        var basedOn: Timestamp?
+        var original = ""
+        var losesFormatting = false
+        var saving = false
+        var problem: String?
+    }
+
+    /// Up arrow in an empty composer edits my last message here.
+    fileprivate func editLast() -> KeyPress.Result {
+        guard edit == nil, text.isEmpty, model.attachments(for: composerID).isEmpty,
+            let message = model.lastEditable(for: composerID)
+        else { return .ignored }
+        model.beginEdit(message, key: key)
+        return .handled
+    }
+
+    fileprivate func startRequestedEdit() {
+        guard let request = model.takeEditRequest(composerID) else { return }
+        saveTask?.cancel()
+        if edit == nil {
+            model.stashDraft(StashedDraft(text: text, mentions: mentionEditor), for: composerID)
+            let snapshot = text
+            Task { await model.saveDraft(snapshot, key: key, thread: thread) }
+        }
+        edit = ActiveEdit(attempt: request.id, message: request.message)
+        text = ""
+        mentionEditor = MentionEditor()
+        trigger = nil
+        focused = true
+        Task {
+            let result = await model.editableCopy(of: request.message, key: key)
+            guard edit?.attempt == request.id, model.isCurrentEdit(request.id, in: composerID) else { return }
+            switch result {
+            case .success(let copy):
+                text = copy.message.text
+                mentionEditor = MentionEditor(mentions: MentionText.mentions(in: copy.message))
+                edit?.basedOn = copy.message.version
+                edit?.original = mentionEditor.wireText(text, names: mentionNames)
+                edit?.losesFormatting = copy.losesFormatting
+                selection = TextSelection(insertionPoint: text.endIndex)
+            case .failure(.changed(let latest)):
+                text = latest.text
+                edit?.basedOn = latest.version
+            case .failure(.message(let problem)):
+                finishEdit()
+                model.showComposerNotice(problem)
+            }
+        }
+    }
+
+    fileprivate func saveEdit() {
+        guard let current = edit, let basedOn = current.basedOn, !current.saving else { return }
+        let wire = mentionEditor.wireText(text, names: mentionNames)
+        guard wire != current.original else { return finishEdit() }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            edit?.problem = "A message can't be empty. Delete it instead."
+            return
+        }
+        edit?.saving = true
+        edit?.problem = nil
+        Task {
+            let result = await model.saveEdit(current.message, text: wire, basedOn: basedOn, key: key)
+            guard edit?.attempt == current.attempt else { return }
+            switch result {
+            case .success:
+                finishEdit()
+            case .failure(.changed(let latest)):
+                edit?.saving = false
+                edit?.basedOn = latest.version
+                edit?.problem = "Changed somewhere else since you started. Save again to replace that version."
+            case .failure(.message(let problem)):
+                edit?.saving = false
+                edit?.problem = problem
+            }
+        }
+    }
+
+    /// Leaves edit mode and gives the draft back.
+    fileprivate func finishEdit() {
+        let attempt = edit?.attempt
+        edit = nil
+        trigger = nil
+        model.endEdit(composerID, attempt: attempt)
+        if let stash = model.takeStashedDraft(composerID) {
+            text = stash.text
+            mentionEditor = stash.mentions
+        } else {
+            text = ""
+            mentionEditor = MentionEditor()
+        }
+        selection = TextSelection(insertionPoint: text.endIndex)
+        focused = true
+    }
+}
+
+/// Above the field while a sent message is being edited.
+private struct EditBar: View {
+    let edit: ComposerView.ActiveEdit
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "pencil")
+                Text(edit.basedOn == nil ? "Loading message…" : edit.saving ? "Saving…" : "Editing message")
+                    .fontWeight(.medium)
+                Spacer()
+                Text("Esc to cancel").foregroundStyle(.secondary)
+                Button("Cancel", action: onCancel).buttonStyle(.borderless)
+            }
+            if edit.losesFormatting {
+                Label(
+                    "Formatting added in Google Chat (links, bold, lists) may be lost.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .foregroundStyle(.orange)
+            }
+            if let problem = edit.problem {
+                Text(problem).foregroundStyle(Theme.error)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(Theme.accentText)
     }
 }
 

@@ -62,6 +62,7 @@ enum Wire {
         var deleteTime: String?
         var deletionMetadata: Deletion?
         var text: String?
+        var formattedText: String?
         var thread: ThreadDTO?
         var threadReply: Bool?
         var fallbackText: String?
