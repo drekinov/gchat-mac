@@ -11,6 +11,8 @@ struct InlineThread: View {
     /// Replies the conversation already knows of. A thread started from Reply has none, so it shows only the field.
     var expectedReplies = 0
     let viewport: ThreadViewport
+    /// The list's visible area in window coordinates; a reply counts as read once it's inside it.
+    let listFrame: CGRect
     /// Rows a drag is over; the thread's reply field shows its drop outline while there's at least one.
     @Binding var dropRows: Int
 
@@ -31,7 +33,8 @@ struct InlineThread: View {
         ForEach(rows) { row in
             let name = row.message.name
             takesDrops(MessageRow(row: row, context: context, compact: true))
-                .onGeometryChange(for: Bool.self, of: Self.isOnScreen) { onScreen in
+                .onGeometryChange(for: Bool.self, of: { [listFrame] in Self.isOnScreen($0, in: listFrame) }) {
+                    onScreen in
                     seen(name, onScreen: onScreen)
                 }
                 .onDisappear { seen(name, onScreen: false) }
@@ -55,10 +58,10 @@ struct InlineThread: View {
             .id(ComposerID(key: key, thread: thread))
     }
 
-    /// A row is on screen when a useful part of it is inside the list's visible area.
-    nonisolated private static func isOnScreen(_ proxy: GeometryProxy) -> Bool {
-        guard let viewport = proxy.bounds(of: .scrollView) else { return true }
-        let shown = CGRect(origin: .zero, size: proxy.size).intersection(viewport).height
+    /// A row is on screen when a useful part of it is inside the list's visible area. The list is table-backed,
+    /// so rows get no scroll view bounds and compare window coordinates instead.
+    nonisolated private static func isOnScreen(_ proxy: GeometryProxy, in listFrame: CGRect) -> Bool {
+        let shown = proxy.frame(in: .global).intersection(listFrame).height
         return shown >= min(24, proxy.size.height)
     }
 

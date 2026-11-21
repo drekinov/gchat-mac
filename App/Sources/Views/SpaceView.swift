@@ -190,6 +190,7 @@ struct MessageList: View {
     /// The same for the open thread's rows and its reply field.
     @State private var threadDropRows = 0
     @State private var threadViewport = ThreadViewport()
+    @State private var listFrame = CGRect.zero
     @State private var pendingScroll: ScrollRequest?
     @State private var scrollSequence = 0
 
@@ -231,7 +232,7 @@ struct MessageList: View {
                     if isOpen, let openThread {
                         InlineThread(
                             model: model, key: key, thread: openThread, context: context, expectedReplies: row.replies,
-                            viewport: threadViewport, dropRows: $threadDropRows)
+                            viewport: threadViewport, listFrame: listFrame, dropRows: $threadDropRows)
                     }
                 }
                 // A thread whose first message isn't loaded (older than the loaded history) opens at the end.
@@ -247,7 +248,7 @@ struct MessageList: View {
                     .id(Self.openThread)
                     InlineThread(
                         model: model, key: key, thread: openThread, context: context, viewport: threadViewport,
-                        dropRows: $threadDropRows)
+                        listFrame: listFrame, dropRows: $threadDropRows)
                 }
                 ForEach(outbox) { item in
                     takesDrops(
@@ -268,6 +269,7 @@ struct MessageList: View {
             .background(Color(nsColor: .textBackgroundColor))
             // The stronger edge effect hides messages that scroll under the toolbar, so its title stays readable.
             .scrollEdgeEffectStyle(.hard, for: .top)
+            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { listFrame = $0 }
             .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in
                 let atBottom = new.contentOffset.y + new.containerSize.height >= new.contentSize.height - 24
                 if new.contentSize.height == old.contentSize.height {
