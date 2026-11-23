@@ -53,9 +53,11 @@ enum StoreReader {
     }
 
     /// Two other joined people per conversation, in an order seeded by its name so they stay the same across
-    /// launches. A conversation with fewer is left out and keeps its own picture.
+    /// launches; a direct message gets its one other person. Any other conversation with fewer is left out.
     @concurrent
-    static func faces(session: AccountSession, spaces: [SpaceName]) async -> [SpaceName: [User]] {
+    static func faces(
+        session: AccountSession, spaces: [SpaceName], direct: Set<SpaceName> = []
+    ) async -> [SpaceName: [User]] {
         let me = session.me
         var faces: [SpaceName: [User]] = [:]
         for space in spaces {
@@ -66,7 +68,11 @@ enum StoreReader {
                 }
                 .map(\.member)
                 .sorted { seeded(space, $0.name) < seeded(space, $1.name) }
-            if people.count >= 2 { faces[space] = Array(people.prefix(2)) }
+            if people.count >= 2 {
+                faces[space] = Array(people.prefix(2))
+            } else if direct.contains(space), let one = people.first {
+                faces[space] = [one]
+            }
         }
         return faces
     }
