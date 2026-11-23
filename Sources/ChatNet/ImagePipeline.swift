@@ -114,6 +114,13 @@ public final class ImagePipeline: Sendable {
         return EncodedAdmission(reservation: try await reserve(byteCount))
     }
 
+    /// Like `reserveEncoded(byteCount:)`, but fails with `.budget` if the memory isn't free within `timeout`.
+    public func reserveEncoded(byteCount: Int, timeout: Duration) async throws(ImageError) -> EncodedAdmission {
+        guard byteCount > 0 else { throw .corrupt }
+        guard byteCount <= limits.maxBytes else { throw .tooLarge }
+        return EncodedAdmission(reservation: try await reserve(byteCount, timeout: timeout))
+    }
+
     /// For data that is already in memory: its size is reserved together with the decode peak.
     @concurrent
     public func thumbnail(from data: Data, maxPixelSize: Int) async throws(ImageError) -> DecodedImage {

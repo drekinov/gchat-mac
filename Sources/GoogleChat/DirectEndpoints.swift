@@ -77,8 +77,8 @@ extension GoogleChatClient: PeopleDirectoryAPI {
         for response in batch.responses ?? [] {
             guard let person = response.value?.person, let resource = person.resourceName,
                 resource.hasPrefix("people/"), let user = UserName("users/\(resource.dropFirst("people/".count))"),
-                let photo = person.photos?.compactMap(\.value).first(where: { $0.isDefault != true }),
-                let url = Mapping.profilePhotoURL(photo.url, pixels: 64)
+                let url = person.photos?.compactMap(\.value).lazy.filter({ $0.isDefault != true })
+                    .compactMap({ Mapping.profilePhotoURL($0.url, pixels: 64) }).first
             else { continue }
             result[user] = url
         }
