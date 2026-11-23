@@ -13,10 +13,11 @@ struct UnreadPopover: View {
     static let minListHeight: CGFloat = 120
     static let maxListHeight: CGFloat = 420
 
-    /// Fixed while the popover is open, from the badge count it opened with: a popover keeps its first size, so a
-    /// spinner, an error or a list that grows all fit the same frame, and rows scroll past it.
-    static func listHeight(for count: Int) -> CGFloat {
-        min(max(CGFloat(count) * rowHeight + 10, minListHeight), maxListHeight)
+    /// Fixed while the popover is open, from the count it opened with (nil: full height), so a spinner, an error or a
+    /// growing list leaves its size alone; rows scroll past it.
+    static func listHeight(for count: Int?) -> CGFloat {
+        guard let count else { return maxListHeight }
+        return min(max(CGFloat(min(count, 100)) * rowHeight + 10, minListHeight), maxListHeight)
     }
 
     var body: some View {

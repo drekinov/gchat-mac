@@ -397,8 +397,9 @@ final class AppModel {
     /// The conversation whose unread list is open. The model owns it, so the toolbar redrawing can't drop it.
     private(set) var unreadPopover: SpaceKey?
     private(set) var unreadState = UnreadListState.loading
-    /// The badge count when the list opened, which sizes it for as long as it stays open.
-    private(set) var unreadSizedFor = 0
+    /// The badge count when the list opened, which sizes it while it stays open. Nil while thread read times were
+    /// still due a check, because the count can grow: it then opens at full height.
+    private(set) var unreadSizedFor: Int?
     /// Whether the list shown was read while some of its threads' read times were still due a check.
     private(set) var unreadReadWhileDiscovering = false
     @ObservationIgnored private var unreadLoad: Task<Void, Never>?
@@ -415,7 +416,7 @@ final class AppModel {
         unreadPopover = key
         unreadState = .loading
         unreadReadWhileDiscovering = false
-        unreadSizedFor = summary(for: key)?.unreadCount ?? 0
+        unreadSizedFor = isDiscovering(key) ? nil : summary(for: key)?.unreadCount ?? 0
         reloadUnread()
     }
 
@@ -450,6 +451,7 @@ final class AppModel {
         unreadSequence += 1
         let sequence = unreadSequence
         guard let session = sessions[key.account] else {
+            Self.unreadLog.error("Unread list read failed: no session for the account")
             unreadState = .failed
             return
         }
@@ -592,7 +594,7 @@ final class AppModel {
         let skipped = previous.map { snapshot.revision > $0.revision + 1 } ?? false
         if let open = unreadPopover, open.account == id {
             let wasDiscovering = previous?.discoveringSpaces.contains(open.space) ?? false
-            if snapshot.changedSpaces.contains(open.space) || skipped
+            if snapshot.changedSpaces.contains(open.space) || skipped || previous?.generation != snapshot.generation
                 || wasDiscovering != snapshot.discoveringSpaces.contains(open.space)
             {
                 reloadUnread()

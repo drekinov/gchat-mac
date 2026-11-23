@@ -40,9 +40,8 @@ struct ThreadReadFlushTests {
         let work = await session.work
         _ = try await session.engine.syncSpaces(generation)
         try await session.engine.syncMessages(team, generation)
-        // Focusing the space starts its first sync, which also checks the thread's read time once. Once it's done,
-        // nothing else calls Google (no threads are visible and nothing has reactions), so the barrier can only park
-        // the thread read.
+        // The first sync also checks the thread's read time once. After it nothing else calls Google, so the barrier
+        // can only park the thread read.
         await session.setFocus(team)
         #expect(await poll { log.count("getSpaceReadState") >= 1 && work.count == 0 })
         let checked = log.count("getThreadReadState")

@@ -237,3 +237,15 @@ struct UnreadThreadsTests {
         #expect(await rig.session.discoveringSpace == nil)
     }
 }
+
+struct UnreadReactionsTests {
+    @Test func reactionsOnAMessageThisAccountCantReadAreSkipped() async throws {
+        let rig = try await UnreadThreadsRig(threads: 1)
+        rig.server.fail(
+            FailureRule(
+                account: rig.alice, route: .listReactions, times: nil,
+                response: .http(status: 403, googleStatus: "PERMISSION_DENIED")))
+        try await rig.session.reactions.refreshMine([rig.replies[0].name], rig.generation)
+        #expect(rig.log.count("listReactions") == 1)
+    }
+}

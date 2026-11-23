@@ -727,8 +727,8 @@ public actor AccountSession {
             threadReadsChecked = [:]
             threadReadsGeneration = generation
         }
-        let due: [ThreadName]
-        do { due = try dueThreadReads(in: space) } catch { return .failure(error) }
+        // A store hiccup here only skips this tick's checks; it mustn't mark the account failed.
+        let due = (try? dueThreadReads(in: space)) ?? []
         if due.isEmpty {
             discoveringSpace = nil
             return .success(())
