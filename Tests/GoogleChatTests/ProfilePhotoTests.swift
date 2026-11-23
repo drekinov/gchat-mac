@@ -19,6 +19,16 @@ import Testing
         #expect(Mapping.profilePhotoURL(nil, pixels: 64) == nil)
     }
 
+    @Test func everyPhotoHostTheFetcherAcceptsMapsAndNoOther() {
+        #expect(
+            Mapping.profilePhotoURL("https://LH5.googleusercontent.com/a/x", pixels: 64)?.absoluteString
+                == "https://LH5.googleusercontent.com/a/x=s64-c")
+        #expect(Mapping.profilePhotoURL("https://lh6.googleusercontent.com/a/x", pixels: 64) != nil)
+        #expect(Mapping.profilePhotoURL("https://lh7.googleusercontent.com/a/x", pixels: 64) == nil)
+        #expect(Mapping.profilePhotoURL("https://googleusercontent.com/a/x", pixels: 64) == nil)
+        #expect(Mapping.profilePhotoURL("https://lh3.googleusercontent.com:8443/a/x", pixels: 64) == nil)
+    }
+
     @Test func batchGetSkipsDefaultPhotosAndBadEntries() async throws {
         let body = Data(
             """

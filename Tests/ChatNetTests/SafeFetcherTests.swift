@@ -142,7 +142,11 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
         await #expect(throws: TransportError.hostNotAllowed) {
             try await fetcher(hosts: []).fetch(url("https://media.example.com/sf/ok"))
         }
-        #expect(SafeFetcher.productionHosts == ["lh3.googleusercontent.com"])
+        #expect(
+            SafeFetcher.productionHosts == [
+                "lh3.googleusercontent.com", "lh4.googleusercontent.com", "lh5.googleusercontent.com",
+                "lh6.googleusercontent.com",
+            ])
     }
 
     @Test func rejectsHostsResolvingToPrivateRanges() async {
@@ -160,6 +164,90 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
         let public4 = fetcher(resolver: { _ in [[93, 184, 216, 34]] })
         let (data, _) = try await public4.fetch(url("https://media.example.com/sf/dns-ok"))
         #expect(data == Data("x".utf8))
+    }
+
+    @Test func aBurstOfFetchesWaitsForLookupSlotsInsteadOfFailing() async throws {
+        route("/sf/burst", .init(status: 200, body: Data("x".utf8)))
+        let slow: SafeFetcher.Resolver = { _ in
+            Thread.sleep(forTimeInterval: 0.05)
+            return [[93, 184, 216, 34]]
+        }
+        let fetcher = fetcher(resolver: slow)
+        let target = url("https://media.example.com/sf/burst")
+        let successes = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<20 { group.addTask { (try? await fetcher.fetch(target)) != nil } }
+            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        }
+        #expect(successes == 20)
+    }
+
+    @Test func lookupsBeyondTheSlotsWaitAndNeverRunMoreAtOnce() async {
+        let slots = MemoryBudget(capacity: 3)
+        let running = Atomic<Int>(0)
+        let peak = Atomic<Int>(0)
+        let resolver: SafeFetcher.Resolver = { _ in
+            let now = running.add(1, ordering: .acquiringAndReleasing).newValue
+            peak.max(now, ordering: .acquiringAndReleasing)
+            Thread.sleep(forTimeInterval: 0.03)
+            running.subtract(1, ordering: .acquiringAndReleasing)
+            return [[93, 184, 216, 34]]
+        }
+        let outcomes = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<12 {
+                group.addTask {
+                    if case .addresses = await SafeFetcher.resolve(
+                        "media.example.com", using: resolver, timeout: .seconds(5), slots: slots)
+                    {
+                        return true
+                    }
+                    return false
+                }
+            }
+            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        }
+        #expect(outcomes == 12)
+        #expect(peak.load(ordering: .acquiring) <= 3)
+    }
+
+    @Test func stuckLookupsHoldTheirSlotsAndLaterOnesTimeOut() async {
+        let slots = MemoryBudget(capacity: 1)
+        let calls = Atomic<Int>(0)
+        let stall: SafeFetcher.Resolver = { _ in
+            calls.add(1, ordering: .acquiringAndReleasing)
+            Thread.sleep(forTimeInterval: 1)
+            return [[93, 184, 216, 34]]
+        }
+        let first = await SafeFetcher.resolve("a.example.com", using: stall, timeout: .milliseconds(50), slots: slots)
+        let clock = ContinuousClock()
+        let start = clock.now
+        let second = await SafeFetcher.resolve("a.example.com", using: stall, timeout: .milliseconds(100), slots: slots)
+        guard case .timedOut = first, case .timedOut = second else {
+            Issue.record("expected both to time out")
+            return
+        }
+        #expect(clock.now - start < .milliseconds(800))
+        #expect(calls.load(ordering: .acquiring) == 1)
+    }
+
+    @Test func aCancelledWaiterNeverStartsItsLookup() async {
+        let slots = MemoryBudget(capacity: 1)
+        let held = try? await slots.reserve(1)
+        let calls = Atomic<Int>(0)
+        let resolver: SafeFetcher.Resolver = { _ in
+            calls.add(1, ordering: .acquiringAndReleasing)
+            return [[93, 184, 216, 34]]
+        }
+        let waiter = Task {
+            await SafeFetcher.resolve("a.example.com", using: resolver, timeout: .seconds(5), slots: slots)
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+        waiter.cancel()
+        held?.release()
+        guard case .cancelled = await waiter.value else {
+            Issue.record("expected cancelled")
+            return
+        }
+        #expect(calls.load(ordering: .acquiring) == 0)
     }
 
     @Test func resolutionFailureIsOffline() async {

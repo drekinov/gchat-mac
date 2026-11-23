@@ -1,4 +1,5 @@
 import ChatModel
+import ChatNet
 import Foundation
 
 enum Mapping {
@@ -38,18 +39,18 @@ extension Wire.UserDTO {
 }
 
 extension Mapping {
-    /// An https photo on googleusercontent.com, re-sized with Google's `=s<pixels>-c` suffix so only a small image
+    /// An https photo on a host the photo fetcher accepts, re-sized with Google's `=s<pixels>-c` suffix so only a small image
     /// is downloaded.
     static func profilePhotoURL(_ raw: String?, pixels: Int) -> URL? {
-        guard let raw, raw.utf8.count < 2048, var components = URLComponents(string: raw), components.scheme == "https",
-            let host = components.host, host == "googleusercontent.com" || host.hasSuffix(".googleusercontent.com")
-        else { return nil }
+        guard let raw, raw.utf8.count < 2048, var components = URLComponents(string: raw) else { return nil }
         var path = components.path
         if let marker = path.lastIndex(of: "="), !path[marker...].contains("/") { path = String(path[..<marker]) }
         components.path = path + "=s\(pixels)-c"
         components.query = nil
         components.fragment = nil
-        return components.url
+        guard let url = components.url, SafeFetcher.passesSyntax(url, allowedHosts: SafeFetcher.profilePhotoHosts)
+        else { return nil }
+        return url
     }
 }
 

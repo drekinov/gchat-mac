@@ -54,6 +54,12 @@ struct MembersPopover: View {
         }
         .frame(width: 340)
         .task { await load() }
+        .task(id: photoDemand) { model.loadPhotos(for: photoDemand, account: key.account) }
+    }
+
+    /// People shown here, in display order; re-asked whenever the roster arrives or changes.
+    private var photoDemand: [UserName] {
+        sorted.filter { $0.member.type == .human && !$0.member.isAnonymous }.map(\.member.name)
     }
 
     @ViewBuilder private var emptyState: some View {

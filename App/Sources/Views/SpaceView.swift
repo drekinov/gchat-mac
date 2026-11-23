@@ -150,6 +150,9 @@ struct SpaceTitle: View {
                     .background(Color(nsColor: .windowBackgroundColor), in: Circle())
                 }
             }
+            .task(id: others.prefix(3).map(\.member.name)) {
+                model.loadPhotos(for: others.prefix(3).map(\.member.name), account: key.account)
+            }
         }
     }
 

@@ -99,11 +99,15 @@ public final class MediaLoader: Sendable {
     }
 
     public static let maxAvatarBytes = 256 * 1024
+    static let avatarAdmissionWait: Duration = .seconds(5)
 
     /// A small still image (a profile photo) from a token-less host; not cached on disk.
     public func avatar(at url: URL, maxPixelSize: Int) async throws(MediaLoadError) -> DecodedImage {
         let admission: EncodedAdmission
-        do { admission = try await pipeline.reserveEncoded(byteCount: Self.maxAvatarBytes) } catch {
+        do {
+            admission = try await pipeline.reserveEncoded(
+                byteCount: Self.maxAvatarBytes, timeout: Self.avatarAdmissionWait)
+        } catch {
             throw .image(error)
         }
         let data: Data

@@ -8,13 +8,17 @@ import Synchronization
 /// between is not covered; the exact-host allowlist is the primary control. Lookups run on their own threads,
 /// so a stalled resolver is abandoned at the deadline instead of holding the fetch.
 public final class SafeFetcher: Sendable {
-    /// Filled in once real payload hosts have been observed.
-    /// Hosts seen live: profile photos. GIF and custom-emoji hosts are added once observed.
-    public static let productionHosts: Set<String> = ["lh3.googleusercontent.com"]
+    /// Profile photos only so far; GIF and custom-emoji hosts are added once observed.
+    public static let productionHosts: Set<String> = profilePhotoHosts
+    /// Google serves profile photos from any of these.
+    public static let profilePhotoHosts: Set<String> = [
+        "lh3.googleusercontent.com", "lh4.googleusercontent.com", "lh5.googleusercontent.com",
+        "lh6.googleusercontent.com",
+    ]
     public static let maxRedirects = 3
     public static let deadline: Duration = .seconds(20)
-    static let maxAbandonedLookups = 8
-    private static let lookupsInFlight = Atomic<Int>(0)
+    static let maxResolverThreads = 8
+    static let lookupSlots = MemoryBudget(capacity: maxResolverThreads)
 
     typealias Resolver = @Sendable (String) throws -> [[UInt8]]
 
@@ -128,7 +132,7 @@ public final class SafeFetcher: Sendable {
         case .addresses(let addresses):
             guard !addresses.isEmpty else { throw .offline }
             guard addresses.allSatisfy(Self.isPublicAddress) else { throw .hostNotAllowed }
-        case .failed, .busy: throw .offline
+        case .failed: throw .offline
         case .timedOut: throw .timedOut
         case .cancelled: throw .cancelled
         }
@@ -139,27 +143,36 @@ public final class SafeFetcher: Sendable {
         case failed
         case timedOut
         case cancelled
-        /// Too many earlier lookups are still stuck.
-        case busy
     }
 
     /// Runs `resolver` on a dedicated thread and returns at the first of: its answer, `timeout`, or cancellation.
-    /// On timeout or cancellation the thread is abandoned and finishes on its own.
-    static func resolve(_ host: String, using resolver: @escaping Resolver, timeout: Duration) async -> Resolution {
-        guard lookupsInFlight.add(1, ordering: .acquiringAndReleasing).newValue <= maxAbandonedLookups else {
-            lookupsInFlight.subtract(1, ordering: .acquiringAndReleasing)
-            return .busy
+    /// Lookups beyond `maxResolverThreads` wait their turn within `timeout`. On timeout or cancellation the thread is
+    /// abandoned and keeps its slot until it finishes, so stuck lookups can't pile up threads.
+    static func resolve(
+        _ host: String, using resolver: @escaping Resolver, timeout: Duration, slots: MemoryBudget = lookupSlots
+    ) async -> Resolution {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        let slot: Reservation
+        do {
+            slot = try await slots.reserve(1, timeout: timeout)
+        } catch {
+            return Task.isCancelled || error is CancellationError ? .cancelled : .timedOut
         }
+        // A grant can race with cancellation or arrive at the deadline; dropping `slot` returns it.
+        guard !Task.isCancelled else { return .cancelled }
+        let remaining = clock.now.duration(to: deadline)
+        guard remaining > .zero else { return .timedOut }
         let latch = Latch<Resolution>()
         let thread = Thread {
             let result = try? resolver(host)
-            lookupsInFlight.subtract(1, ordering: .acquiringAndReleasing)
+            slot.release()
             latch.set(result.map { .addresses($0) } ?? .failed)
         }
         thread.stackSize = 512 * 1024
         thread.start()
         let timer = Task {
-            do { try await Task.sleep(for: timeout) } catch { return }
+            do { try await Task.sleep(for: remaining) } catch { return }
             latch.set(.timedOut)
         }
         let outcome = await withTaskCancellationHandler {
@@ -169,6 +182,11 @@ public final class SafeFetcher: Sendable {
         }
         timer.cancel()
         return outcome
+    }
+
+    /// True when `url` passes every check that doesn't need the network.
+    public static func passesSyntax(_ url: URL, allowedHosts: Set<String>) -> Bool {
+        (try? validateSyntax(url, allowedHosts: allowedHosts)) != nil
     }
 
     /// Everything that can be decided without the network. Returns the lowercased host.
