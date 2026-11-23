@@ -17,7 +17,9 @@ struct MembersPopover: View {
 
     var body: some View {
         let summary = model.summary(for: key)
-        let shown = filtered(sorted)
+        let ordered = sorted
+        let shown = filtered(ordered)
+        let photoDemand = ordered.filter { $0.member.type == .human && !$0.member.isAnonymous }.map(\.member.name)
         VStack(spacing: 0) {
             VStack(spacing: 3) {
                 Text(RemoteText.title(summary?.title ?? "")).font(.headline).lineLimit(1)
@@ -54,12 +56,8 @@ struct MembersPopover: View {
         }
         .frame(width: 340)
         .task { await load() }
+        // Re-asked whenever the roster arrives or changes.
         .task(id: photoDemand) { model.loadPhotos(for: photoDemand, account: key.account) }
-    }
-
-    /// People shown here, in display order; re-asked whenever the roster arrives or changes.
-    private var photoDemand: [UserName] {
-        sorted.filter { $0.member.type == .human && !$0.member.isAnonymous }.map(\.member.name)
     }
 
     @ViewBuilder private var emptyState: some View {

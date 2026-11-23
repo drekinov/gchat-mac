@@ -54,9 +54,16 @@ struct PhotoAvatar: View {
                     loaded = (url, hit)
                     return
                 }
-                guard let media, let decoded = await AvatarImages.shared.load(url, media: media), !Task.isCancelled
-                else { return }
-                loaded = (url, decoded)
+                guard let media else { return }
+                // Rows that stay on screen try again now and then, so a photo missed while offline still arrives.
+                for pause in [Duration.zero, .seconds(30), .seconds(120), .seconds(600)] {
+                    if pause > .zero { try? await Task.sleep(for: pause) }
+                    guard !Task.isCancelled else { return }
+                    if let decoded = await AvatarImages.shared.load(url, media: media), !Task.isCancelled {
+                        loaded = (url, decoded)
+                        return
+                    }
+                }
             }
     }
 }

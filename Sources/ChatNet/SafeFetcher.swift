@@ -10,7 +10,7 @@ import Synchronization
 public final class SafeFetcher: Sendable {
     /// Profile photos only so far; GIF and custom-emoji hosts are added once observed.
     public static let productionHosts: Set<String> = profilePhotoHosts
-    /// Google serves profile photos from any of these.
+    /// The People API has been seen to hand out photos on lh3; the other lh hosts serve the same content.
     public static let profilePhotoHosts: Set<String> = [
         "lh3.googleusercontent.com", "lh4.googleusercontent.com", "lh5.googleusercontent.com",
         "lh6.googleusercontent.com",

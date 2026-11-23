@@ -1,5 +1,9 @@
+import ChatModel
+import ChatStore
 import CoreGraphics
+import FakeChatServer
 import Foundation
+import GoogleChat
 import Synchronization
 import Testing
 
@@ -161,5 +165,53 @@ struct AvatarLoadsTests {
     ])
     func outcomes(_ error: MediaLoadError, _ expected: AvatarLoads.Outcome) {
         #expect(AvatarLoads.outcome(error) == expected)
+    }
+}
+
+/// Serves the same small PNG for every request.
+final class PhotoHost: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let body = FakeMedia.png()
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "image/png", "Content-Length": String(body.count)])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+struct AvatarDownloadTests {
+    func loader(budget: Int) throws -> (MediaLoader, URL) {
+        let h = Harness()
+        let client = GoogleChatClient(transport: h.server.makeTransport(), tokens: StaticTokens(token: h.alice.token))
+        let root = FileManager.default.temporaryDirectory.appending(path: "gchat-avatar-\(UUID().uuidString)")
+        let account = AccountID()
+        let directory = AccountDirectory(root: root, account: account)
+        let key = StoreKey.random(for: account)
+        _ = try SQLiteAccountStore.open(directory: directory, key: key)
+        let loader = MediaLoader(
+            media: client, cache: try MediaCache(directory: directory, key: key),
+            exports: ExportDirectory(directory: directory),
+            pipeline: ImagePipeline(budget: MemoryBudget(capacity: budget)),
+            fetcher: SafeFetcher(allowedHosts: SafeFetcher.profilePhotoHosts, protocolClasses: [PhotoHost.self]),
+            gate: h.gate)
+        return (loader, root)
+    }
+
+    @Test func aProfilePhotoDownloadsAndDecodes() async throws {
+        let (loader, root) = try loader(budget: 32 << 20)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let decoded = try await loader.avatar(at: url, maxPixelSize: 64)
+        #expect(decoded.image.width <= 64 && decoded.image.width > 0)
+    }
+
+    @Test func aBudgetTooSmallForAPhotoIsABudgetError() async throws {
+        let (loader, root) = try loader(budget: 1024)
+        defer { try? FileManager.default.removeItem(at: root) }
+        await #expect(throws: MediaLoadError.image(.budget)) { _ = try await loader.avatar(at: url, maxPixelSize: 64) }
     }
 }
