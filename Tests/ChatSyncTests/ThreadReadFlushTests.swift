@@ -40,22 +40,23 @@ struct ThreadReadFlushTests {
         let work = await session.work
         _ = try await session.engine.syncSpaces(generation)
         try await session.engine.syncMessages(team, generation)
-        // Focusing the space starts its first sync. After its read state nothing else calls Google (no threads are
-        // visible and nothing has reactions), so once it's done the barrier can only park the thread read.
+        // The first sync also checks the thread's read time once. After it nothing else calls Google, so the barrier
+        // can only park the thread read.
         await session.setFocus(team)
         #expect(await poll { log.count("getSpaceReadState") >= 1 && work.count == 0 })
+        let checked = log.count("getThreadReadState")
 
         barrier.arm()
         await session.setFocus(team, threadRead: ThreadReadPosition(thread: thread, upTo: first.createTime))
         #expect(await barrier.waitForArrival())
-        #expect(log.count("getThreadReadState") == 1)
+        #expect(log.count("getThreadReadState") == checked + 1)
         #expect(work.count == 1)
         await session.setFocus(team, threadRead: ThreadReadPosition(thread: thread, upTo: second.createTime))
         // The second save attempt is a task of its own. Once the registry is back to one task it has returned while
         // the first is still parked, having made no call and saved nothing, so only the first save's loop can
         // deliver the newer position.
         #expect(await poll { work.count == 1 })
-        #expect(log.count("getThreadReadState") == 1)
+        #expect(log.count("getThreadReadState") == checked + 1)
         #expect(barrier.arrivals == 1)
         #expect(server.threadReadState(alice, thread: thread) == nil)
         barrier.release()

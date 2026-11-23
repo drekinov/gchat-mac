@@ -43,10 +43,12 @@ public struct AccountSnapshot: Sendable {
     /// Bumped on every commit; the open space re-reads the store when it changes.
     public var revision: UInt64
     public var changedSpaces: Set<SpaceName>
+    /// Spaces whose unread replies may still grow, because some of their threads' read times are due a check.
+    public var discoveringSpaces: Set<SpaceName>
 
     public init(
         account: AccountID, generation: Generation, status: AccountStatus, spaces: [SpaceSummary] = [],
-        revision: UInt64 = 0, changedSpaces: Set<SpaceName> = []
+        revision: UInt64 = 0, changedSpaces: Set<SpaceName> = [], discoveringSpaces: Set<SpaceName> = []
     ) {
         self.account = account
         self.generation = generation
@@ -54,6 +56,7 @@ public struct AccountSnapshot: Sendable {
         self.spaces = spaces
         self.revision = revision
         self.changedSpaces = changedSpaces
+        self.discoveringSpaces = discoveringSpaces
     }
 }
 

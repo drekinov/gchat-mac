@@ -68,6 +68,14 @@ public actor AccountSession {
     var updatingThreadRead = false
     /// A save was asked for while one was running, so a `.busy` answer to the running one mustn't end the flush.
     var threadReadRetryRequested = false
+    /// When each thread outside the visible ones last had its read time checked, for the recheck interval.
+    var threadReadsChecked: [ThreadName: Timestamp] = [:]
+    var threadReadsGeneration: Generation?
+    var discoveringThreads = false
+    /// The focused space while some of its threads' read times are still due a check.
+    var discoveringSpace: SpaceName?
+    static let threadReadRecheck = Duration.seconds(600)
+    static let threadReadDiscoveryBudget = 5
     var memberFetches: [SpaceName: Task<Result<Bool, SyncError>, Never>] = [:]
     var nextSidebar: Timestamp?
     var nextFocus: Timestamp?
@@ -137,8 +145,8 @@ public actor AccountSession {
     }
 
     /// The space's unread messages, by the same rule as its unread count.
-    public nonisolated func unread(in space: SpaceName) -> UnreadMessages? {
-        try? engine.unread(in: space)
+    public nonisolated func unread(in space: SpaceName) throws(SyncError) -> UnreadMessages {
+        try engine.unread(in: space)
     }
 
     public func searchMessages(_ query: String, pageToken: String?) async throws(SyncError) -> Page<Message> {
@@ -216,6 +224,7 @@ public actor AccountSession {
     ) {
         let changed = space != focused
         focused = space
+        if changed { discoveringSpace = nil }
         self.visibleThreads = Array(visibleThreads.filter { $0.space == space }.prefix(10))
         let position = threadRead.flatMap { $0.thread.space == space ? $0 : nil }
         if position != openThreadRead {
@@ -690,6 +699,12 @@ public actor AccountSession {
                 await flushThreadRead(generation)
                 guard admitted, focused == space else { return }
             }
+            if case .failure(let error) = await discoverThreadReads(space, generation) {
+                finish(error)
+                if admitted, focused == space { await flushThreadRead(generation) }
+                return
+            }
+            guard admitted, focused == space else { return }
             let reacted = (try? store.messages(in: space, before: nil, limit: 40)) ?? []
             let names = reacted.filter { !$0.reactions.isEmpty && !$0.isDeleted }.suffix(20).map(\.name)
             try await reactions.refreshMine(Array(names), generation)
@@ -699,6 +714,49 @@ public actor AccountSession {
             succeeded(generation)
         } catch {
             finish(error)
+        }
+    }
+
+    /// Checks the read times that decide the focused space's unread replies beyond the visible threads: a few per
+    /// tick, each at most every `threadReadRecheck`. A save that found its thread held by a check runs right after it.
+    func discoverThreadReads(_ space: SpaceName, _ generation: Generation) async -> Result<Void, SyncError> {
+        guard !discoveringThreads else { return .success(()) }
+        discoveringThreads = true
+        defer { discoveringThreads = false }
+        if threadReadsGeneration != generation {
+            threadReadsChecked = [:]
+            threadReadsGeneration = generation
+        }
+        // A store hiccup here only skips this tick's checks; it mustn't mark the account failed.
+        let due = (try? dueThreadReads(in: space)) ?? []
+        if due.isEmpty {
+            discoveringSpace = nil
+            return .success(())
+        }
+        if discoveringSpace != space {
+            discoveringSpace = space
+            publish(generation)
+        }
+        for thread in due.prefix(Self.threadReadDiscoveryBudget) {
+            guard admitted, focused == space, gate.isCurrent(generation) else { return .success(()) }
+            do {
+                if try await engine.refreshThreadReadState(thread, generation) {
+                    threadReadsChecked[thread] = clock.now()
+                }
+            } catch {
+                return .failure(error)
+            }
+            if pendingThreadRead != nil, admitted, focused == space { await flushThreadRead(generation) }
+        }
+        if (try? dueThreadReads(in: space))?.isEmpty ?? true { discoveringSpace = nil }
+        return .success(())
+    }
+
+    private func dueThreadReads(in space: SpaceName) throws(SyncError) -> [ThreadName] {
+        let now = clock.now()
+        return try engine.threadReadCandidates(in: space).filter { thread in
+            !visibleThreads.contains(thread)
+                && (threadReadsChecked[thread].map { $0.adding(Self.threadReadRecheck) <= now } ?? true)
         }
     }
 
@@ -797,7 +855,7 @@ public actor AccountSession {
         snapshots.send(
             AccountSnapshot(
                 account: account, generation: generation, status: status, spaces: spaces, revision: revision,
-                changedSpaces: changedSinceSnapshot))
+                changedSpaces: changedSinceSnapshot, discoveringSpaces: discoveringSpace.map { [$0] } ?? []))
         changedSinceSnapshot = []
     }
 

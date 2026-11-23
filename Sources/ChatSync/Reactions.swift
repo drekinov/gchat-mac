@@ -154,7 +154,7 @@ public final class Reactions: Sendable {
                 let page: Page<Reaction>
                 do throws(ChatAPIError) {
                     page = try await api.listReactions(on: message, user: me, pageToken: token)
-                } catch .notFound {
+                } catch .notFound, .permissionDenied, .failedPrecondition {
                     break
                 } catch {
                     throw .api(error, .listReactions)

@@ -3,19 +3,22 @@ import ChatSync
 import SwiftUI
 
 /// The conversation's unread messages, oldest first, including replies inside threads. Clicking one scrolls to it,
-/// opening its thread when it's a reply. Read from the store each time it opens, so nothing is kept.
+/// opening its thread when it's a reply. Read when it opens and again whenever the conversation changes meanwhile.
 struct UnreadPopover: View {
     let model: AppModel
     let key: SpaceKey
-    /// The list, read before the popover opens so it opens at its full height; nil when the store couldn't be read.
-    let unread: UnreadMessages?
     var members: [Membership] = []
-    var onRetry: () -> Void = {}
-    var onClose: () -> Void
 
-    /// A scroll view's natural height is its rows' height, so with the list already read the popover opens that tall,
-    /// up to this, and scrolls past it.
+    static let rowHeight: CGFloat = 64
+    static let minListHeight: CGFloat = 120
     static let maxListHeight: CGFloat = 420
+
+    /// Fixed while the popover is open, from the count it opened with (nil: full height), so a spinner, an error or a
+    /// growing list leaves its size alone; rows scroll past it.
+    static func listHeight(for count: Int?) -> CGFloat {
+        guard let count else { return maxListHeight }
+        return min(max(CGFloat(min(count, 100)) * rowHeight + 10, minListHeight), maxListHeight)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,23 +26,37 @@ struct UnreadPopover: View {
                 .padding(.top, 14)
                 .padding(.bottom, 10)
                 .padding(.horizontal, 16)
-            if let unread {
-                if unread.messages.isEmpty {
-                    Text("No unread messages").font(.callout).foregroundStyle(.secondary).padding(20)
-                } else {
-                    list(unread)
-                }
-            } else {
-                VStack(spacing: 10) {
-                    Text("Couldn't load the unread messages.").font(.callout).foregroundStyle(.secondary)
-                    Button("Try Again", action: onRetry)
-                }
-                .padding(.horizontal, 20)
-                .padding(.top, 6)
-                .padding(.bottom, 18)
+            content
+                .frame(maxWidth: .infinity)
+                .frame(height: Self.listHeight(for: model.unreadSizedFor))
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Checking threads…").font(.caption).foregroundStyle(.secondary)
             }
+            .padding(.bottom, 8)
+            .opacity(model.unreadIsUpdating ? 1 : 0)
+            .accessibilityHidden(!model.unreadIsUpdating)
         }
         .frame(width: 360)
+    }
+
+    @ViewBuilder private var content: some View {
+        switch model.unreadState {
+        case .loading:
+            ProgressView().controlSize(.small)
+        case .failed:
+            VStack(spacing: 10) {
+                Text("Couldn't load the unread messages.").font(.callout).foregroundStyle(.secondary)
+                Button("Try Again") { model.retryUnread() }
+            }
+            .padding(.horizontal, 20)
+        case .loaded(let unread):
+            if unread.messages.isEmpty {
+                Text("No unread messages").font(.callout).foregroundStyle(.secondary)
+            } else {
+                list(unread)
+            }
+        }
     }
 
     private func list(_ unread: UnreadMessages) -> some View {
@@ -53,18 +70,18 @@ struct UnreadPopover: View {
                         photoURL: model.photoURL(message.sender.name, account: key.account), media: media
                     ) {
                         model.reveal(message)
-                        onClose()
+                        model.closeUnread()
                     }
                 }
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 10)
         }
-        .frame(maxHeight: Self.maxListHeight)
     }
 
     private var title: String {
-        guard let count = unread?.messages.count, count > 0 else { return "Unread messages" }
+        guard case .loaded(let unread) = model.unreadState, unread.messages.count > 0 else { return "Unread messages" }
+        let count = unread.messages.count
         return count == 1 ? "1 unread message" : "\(count) unread messages"
     }
 

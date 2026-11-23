@@ -171,53 +171,21 @@ struct SpaceActions: View {
     let key: SpaceKey
     let members: [Membership]
     @State private var showsDetails = false
-    @State private var showsUnread = false
-    @State private var unreadList: UnreadMessages?
-    @State private var loadingUnread: Task<Void, Never>?
-    @State private var retryAfterClose = false
 
     var body: some View {
         let unread = model.summary(for: key)?.unreadCount ?? 0
-        // The button stays while its list loads, shows or is being retried, even if the count drops meanwhile.
-        if unread > 0 || showsUnread || loadingUnread != nil || retryAfterClose {
+        // The button stays while its list is open, even if the count drops meanwhile.
+        if unread > 0 || model.unreadPopover == key {
             Button {
-                // During a retry the old popover is still closing; its onDisappear starts the new load.
-                guard !retryAfterClose else { return }
-                guard !showsUnread else {
-                    showsUnread = false
-                    return
-                }
-                loadUnread()
+                model.toggleUnread(key)
             } label: {
                 Label("Unread messages", systemImage: "text.bubble")
             }
             .badge(unread)
             .help("Unread messages")
             .accessibilityValue("\(unread) unread")
-            .popover(isPresented: $showsUnread, arrowEdge: .bottom) {
-                UnreadPopover(
-                    model: model, key: key, unread: unreadList, members: members,
-                    onRetry: {
-                        // Closed and reopened, because a popover takes its height when it opens.
-                        retryAfterClose = true
-                        showsUnread = false
-                    },
-                    onClose: { showsUnread = false }
-                )
-                // A retry starts once the old popover has really gone. Otherwise nothing is kept after it closes.
-                .onDisappear {
-                    if retryAfterClose {
-                        retryAfterClose = false
-                        loadUnread()
-                    } else if !showsUnread, loadingUnread == nil {
-                        unreadList = nil
-                    }
-                }
-            }
-            .onDisappear {
-                retryAfterClose = false
-                loadingUnread?.cancel()
-                loadingUnread = nil
+            .popover(isPresented: unreadPresented, arrowEdge: .bottom) {
+                UnreadPopover(model: model, key: key, members: members)
             }
         }
         Button {
@@ -237,17 +205,10 @@ struct SpaceActions: View {
         }
     }
 
-    /// Reads the list, then opens it: a popover sizes itself when it opens. A click while it's reading does nothing.
-    private func loadUnread() {
-        guard loadingUnread == nil else { return }
-        loadingUnread = Task {
-            let list = await model.unreadMessages(for: key)
-            // A cancelled load touches nothing: a newer one may already own the handle.
-            guard !Task.isCancelled else { return }
-            loadingUnread = nil
-            unreadList = list
-            showsUnread = true
-        }
+    private var unreadPresented: Binding<Bool> {
+        Binding(
+            get: { model.unreadPopover == key },
+            set: { shown in if !shown, model.unreadPopover == key { model.closeUnread() } })
     }
 }
 

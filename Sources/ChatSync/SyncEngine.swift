@@ -266,7 +266,8 @@ public struct SyncEngine: Sendable {
                     let refreshed = try await api.getMessage(name)
                     messages.append(refreshed)
                     reactions.append((name, refreshed.reactions))
-                } catch .notFound {
+                } catch .notFound, .permissionDenied, .failedPrecondition {
+                    // A message this account can no longer read mustn't hold up the space's other events.
                     continue
                 } catch {
                     throw .api(error, .readSpace)
@@ -308,17 +309,46 @@ public struct SyncEngine: Sendable {
     }
 
     public func syncThreadReadStates(_ threads: [ThreadName], _ generation: Generation) async throws(SyncError) {
-        for thread in threads {
-            do {
-                try await exclusive("thread-read|\(thread)") { () async throws(SyncError) in
-                    let time = try await threadReadTime(thread)
-                    try commit(generation) { $0.append(.setThreadReadState(thread, time)) }
-                }
-            } catch .busy {
-                continue
-            } catch .api(let error, let operation) where error.spaceImpact(of: operation) == .featureUnavailable {
-                continue
+        for thread in threads { _ = try await refreshThreadReadState(thread, generation) }
+    }
+
+    /// Fetches and stores one thread's read time. False when another lookup or save holds the thread; true for any
+    /// answer, including the thread's read state being unavailable.
+    func refreshThreadReadState(_ thread: ThreadName, _ generation: Generation) async throws(SyncError) -> Bool {
+        do {
+            try await exclusive("thread-read|\(thread)") { () async throws(SyncError) in
+                let time = try await threadReadTime(thread)
+                try commit(generation) { $0.append(.setThreadReadState(thread, time)) }
             }
+            return true
+        } catch .busy {
+            return false
+        } catch .api(let error, let operation) where error.spaceImpact(of: operation) == .featureUnavailable {
+            return true
+        }
+    }
+
+    /// The threads whose read times decide the space's unread replies: each thread among its recent messages with a
+    /// reply from someone else. Threads with no stored time come first, then newest reply first. None when muted.
+    func threadReadCandidates(in space: SpaceName) throws(SyncError) -> [ThreadName] {
+        guard let stored = try read({ () throws(StoreError) in try store.space(space) }),
+            stored.notificationSetting?.isMuted != true
+        else { return [] }
+        let recent = try read { () throws(StoreError) in try store.messages(in: space, before: nil, limit: 100) }
+        var newest: [ThreadName: Timestamp] = [:]
+        for message in recent where message.isThreadReply && !message.isDeleted && message.sender.name != me {
+            guard let thread = message.thread else { continue }
+            newest[thread] = max(newest[thread] ?? message.createTime, message.createTime)
+        }
+        var unfetched: Set<ThreadName> = []
+        for thread in newest.keys where try read({ () throws(StoreError) in try store.threadReadState(thread) }) == nil
+        {
+            unfetched.insert(thread)
+        }
+        return newest.keys.sorted { a, b in
+            let (aNew, bNew) = (unfetched.contains(a), unfetched.contains(b))
+            if aNew != bNew { return aNew }
+            return newest[a, default: Timestamp(seconds: 0)] > newest[b, default: Timestamp(seconds: 0)]
         }
     }
 

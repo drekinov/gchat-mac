@@ -41,8 +41,12 @@ enum StoreReader {
     }
 
     @concurrent
-    static func unread(session: AccountSession, space: SpaceName) async -> UnreadMessages? {
-        session.unread(in: space)
+    static func unread(session: AccountSession, space: SpaceName) async -> Result<UnreadMessages, SyncError> {
+        do throws(SyncError) {
+            return .success(try session.unread(in: space))
+        } catch {
+            return .failure(error)
+        }
     }
 
     @concurrent
