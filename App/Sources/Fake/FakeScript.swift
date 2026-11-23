@@ -12,6 +12,8 @@ enum FakeScript {
         let unread: Int
         var muted = false
         var historyOff = false
+        /// Replies at the end of one thread that stay unread, with the rest of that thread read.
+        var unreadReplies = 0
     }
 
     struct Direct {
@@ -43,7 +45,7 @@ enum FakeScript {
             bot: "Standup Bot",
             spaces: [
                 NamedSpace(title: "Engineering", threaded: true, messages: 40, unread: 4),
-                NamedSpace(title: "Releases", threaded: true, messages: 22, unread: 0),
+                NamedSpace(title: "Releases", threaded: true, messages: 22, unread: 0, unreadReplies: 2),
                 NamedSpace(title: "Design Reviews", threaded: false, messages: 17, unread: 3),
                 NamedSpace(title: "Random", threaded: false, messages: 31, unread: 9, muted: true),
                 NamedSpace(title: "On-call Handover", threaded: false, messages: 8, unread: 0, historyOff: true),

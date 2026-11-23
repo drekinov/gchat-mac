@@ -134,6 +134,11 @@ public actor AccountSession {
         try store.space(space)
     }
 
+    /// The space's unread messages, by the same rule as its unread count.
+    public nonisolated func unread(in space: SpaceName) -> UnreadMessages? {
+        try? engine.unread(in: space)
+    }
+
     public func searchMessages(_ query: String, pageToken: String?) async throws(SyncError) -> Page<Message> {
         guard let generation = gate.current else { throw .retired }
         let page = try await engine.call(.searchMessages) { () async throws(ChatAPIError) in

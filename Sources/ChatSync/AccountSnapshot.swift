@@ -57,21 +57,43 @@ public struct AccountSnapshot: Sendable {
     }
 }
 
+/// A conversation's unread messages, oldest first, by the same rule as its unread count.
+public struct UnreadMessages: Sendable {
+    public var messages: [Message]
+    /// The first message of each thread an unread reply belongs to, when it's among the recent messages.
+    public var roots: [ThreadName: Message]
+
+    public init(messages: [Message] = [], roots: [ThreadName: Message] = [:]) {
+        self.messages = messages
+        self.roots = roots
+    }
+}
+
 enum Unread {
-    /// Top-level messages from others after the space read time; muted spaces count as read.
+    /// Top-level messages from others after the space read time, and replies from others after their thread's read
+    /// time; muted spaces count as read.
+    static func messages(
+        messages: [Message], lastReadTime: Timestamp?, me: UserName, muted: Bool,
+        threadReadTimes: [ThreadName: Timestamp] = [:]
+    ) -> [Message] {
+        guard !muted else { return [] }
+        return messages.filter { message in
+            guard !message.isDeleted, message.sender.name != me else { return false }
+            if message.isThreadReply {
+                guard let thread = message.thread, let threadRead = threadReadTimes[thread] else { return false }
+                return message.createTime > threadRead
+            }
+            guard let lastReadTime else { return true }
+            return message.createTime > lastReadTime
+        }
+    }
+
     static func count(
         messages: [Message], lastReadTime: Timestamp?, me: UserName, muted: Bool,
         threadReadTimes: [ThreadName: Timestamp] = [:]
     ) -> Int {
-        guard !muted else { return 0 }
-        return messages.reduce(0) { count, message in
-            guard !message.isDeleted, message.sender.name != me else { return count }
-            if message.isThreadReply {
-                guard let thread = message.thread, let threadRead = threadReadTimes[thread] else { return count }
-                return message.createTime > threadRead ? count + 1 : count
-            }
-            guard let lastReadTime else { return count + 1 }
-            return message.createTime > lastReadTime ? count + 1 : count
-        }
+        Self.messages(
+            messages: messages, lastReadTime: lastReadTime, me: me, muted: muted, threadReadTimes: threadReadTimes
+        ).count
     }
 }

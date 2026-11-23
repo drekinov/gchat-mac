@@ -346,6 +346,19 @@ final class AppModel {
     private(set) var revealSequence = 0
 
     /// Closes the preview and scrolls to `message`, opening its thread first when it's a reply.
+    /// The conversation's unread messages, read from the store when the unread list opens.
+    func unreadMessages(for key: SpaceKey) async -> UnreadMessages? {
+        guard let session = sessions[key.account] else { return nil }
+        return await StoreReader.unread(session: session, space: key.space)
+    }
+
+    /// Scrolls the open conversation to a message, opening its thread first when it's a reply.
+    func reveal(_ message: Message) {
+        if message.isThreadReply, let thread = message.thread { openThread(thread) }
+        revealedMessage = message.name
+        revealSequence += 1
+    }
+
     func showInConversation(_ message: MessageName) {
         preview = nil
         let loaded = openMessages.first { $0.name == message } ?? threadMessages.first { $0.name == message }

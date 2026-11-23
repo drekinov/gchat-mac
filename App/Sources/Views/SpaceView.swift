@@ -165,14 +165,38 @@ struct SpaceTitle: View {
     }
 }
 
-/// The conversation's toolbar buttons: message search and its details.
+/// The conversation's toolbar buttons: its unread messages while there are any, message search and its details.
 struct SpaceActions: View {
     let model: AppModel
     let key: SpaceKey
     let members: [Membership]
     @State private var showsDetails = false
+    @State private var showsUnread = false
+    @State private var unreadList: UnreadMessages?
 
     var body: some View {
+        let unread = model.summary(for: key)?.unreadCount ?? 0
+        if unread > 0 || showsUnread {
+            Button {
+                guard !showsUnread else {
+                    showsUnread = false
+                    return
+                }
+                // Read first, then open: a popover sizes itself when it opens.
+                Task {
+                    unreadList = await model.unreadMessages(for: key) ?? UnreadMessages()
+                    showsUnread = true
+                }
+            } label: {
+                Label("Unread messages", systemImage: "text.bubble")
+            }
+            .badge(unread)
+            .help("Unread messages")
+            .accessibilityValue("\(unread) unread")
+            .popover(isPresented: $showsUnread, arrowEdge: .bottom) {
+                UnreadPopover(model: model, key: key, preloaded: unreadList) { showsUnread = false }
+            }
+        }
         Button {
             model.showsMessageSearch = true
         } label: {

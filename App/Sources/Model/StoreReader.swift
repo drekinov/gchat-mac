@@ -41,6 +41,11 @@ enum StoreReader {
     }
 
     @concurrent
+    static func unread(session: AccountSession, space: SpaceName) async -> UnreadMessages? {
+        session.unread(in: space)
+    }
+
+    @concurrent
     static func memberships(session: AccountSession, space: SpaceName) async -> [Membership] {
         (try? session.contacts.memberships(in: space)) ?? []
     }

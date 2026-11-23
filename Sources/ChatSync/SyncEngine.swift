@@ -453,7 +453,10 @@ public struct SyncEngine: Sendable {
         return summaries.sorted { ($0.lastActiveTime ?? .init(seconds: 0)) > ($1.lastActiveTime ?? .init(seconds: 0)) }
     }
 
-    func computeDigest(_ stored: StoredSpace, muted: Bool) throws(SyncError) -> SpaceDigest {
+    /// The space's most recent messages, which its unread count covers, with the read times of their threads.
+    func recentMessages(_ stored: StoredSpace) throws(SyncError) -> (
+        messages: [Message], threadReads: [ThreadName: Timestamp]
+    ) {
         let recent = try read { () throws(StoreError) in
             try store.messages(in: stored.space.name, before: nil, limit: 100)
         }
@@ -463,6 +466,28 @@ public struct SyncEngine: Sendable {
                 threadReads[thread] = time
             }
         }
+        return (recent, threadReads)
+    }
+
+    /// The space's unread messages: the same rule over the same recent messages as its unread count.
+    public func unread(in space: SpaceName) throws(SyncError) -> UnreadMessages {
+        guard let stored = try read({ () throws(StoreError) in try store.space(space) }) else {
+            return UnreadMessages()
+        }
+        let (recent, threadReads) = try recentMessages(stored)
+        let unread = Unread.messages(
+            messages: recent, lastReadTime: stored.lastReadTime, me: me,
+            muted: stored.notificationSetting?.isMuted ?? false, threadReadTimes: threadReads)
+        let threads = Set(unread.filter(\.isThreadReply).compactMap(\.thread))
+        var roots: [ThreadName: Message] = [:]
+        for message in recent where !message.isThreadReply {
+            if let thread = message.thread, threads.contains(thread) { roots[thread] = message }
+        }
+        return UnreadMessages(messages: unread, roots: roots)
+    }
+
+    func computeDigest(_ stored: StoredSpace, muted: Bool) throws(SyncError) -> SpaceDigest {
+        let (recent, threadReads) = try recentMessages(stored)
         let unread = Unread.count(
             messages: recent, lastReadTime: stored.lastReadTime, me: me, muted: muted, threadReadTimes: threadReads)
         let last = recent.last { !$0.isDeleted }
