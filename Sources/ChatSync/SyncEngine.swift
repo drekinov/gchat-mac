@@ -328,22 +328,26 @@ public struct SyncEngine: Sendable {
         }
     }
 
+    /// Saves `position` unless Google already has it, or the thread stopped being open meanwhile. Returns whether the
+    /// store was written, so a superseded attempt doesn't make the caller republish.
+    @discardableResult
     func markThreadRead(
         _ position: ThreadReadPosition, _ generation: Generation, stillOpen: () async -> Bool
-    ) async throws(SyncError) {
+    ) async throws(SyncError) -> Bool {
         let thread = position.thread
-        try await exclusive("thread-read|\(thread)") { () async throws(SyncError) in
+        return try await exclusive("thread-read|\(thread)") { () async throws(SyncError) -> Bool in
             guard gate.isCurrent(generation) else { throw .retired }
             let remote = try await threadReadTime(thread)
             var stored = remote
             if remote.map({ $0 < position.upTo }) ?? true {
-                guard await stillOpen(), gate.isCurrent(generation), !Task.isCancelled else { return }
+                guard await stillOpen(), gate.isCurrent(generation), !Task.isCancelled else { return false }
                 stored =
                     try await call(.updateThreadReadState) { () async throws(ChatAPIError) in
                         try await api.updateThreadReadState(thread, lastReadTime: position.upTo)
                     } ?? position.upTo
             }
             try commit(generation) { $0.append(.setThreadReadState(thread, stored)) }
+            return true
         }
     }
 

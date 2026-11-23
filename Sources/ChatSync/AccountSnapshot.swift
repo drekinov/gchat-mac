@@ -77,23 +77,29 @@ enum Unread {
         threadReadTimes: [ThreadName: Timestamp] = [:]
     ) -> [Message] {
         guard !muted else { return [] }
-        return messages.filter { message in
-            guard !message.isDeleted, message.sender.name != me else { return false }
-            if message.isThreadReply {
-                guard let thread = message.thread, let threadRead = threadReadTimes[thread] else { return false }
-                return message.createTime > threadRead
-            }
-            guard let lastReadTime else { return true }
-            return message.createTime > lastReadTime
-        }
+        return messages.filter { isUnread($0, lastReadTime: lastReadTime, me: me, threadReadTimes: threadReadTimes) }
     }
 
+    /// The badge's count: the same rule, without building a list on the sync path.
     static func count(
         messages: [Message], lastReadTime: Timestamp?, me: UserName, muted: Bool,
         threadReadTimes: [ThreadName: Timestamp] = [:]
     ) -> Int {
-        Self.messages(
-            messages: messages, lastReadTime: lastReadTime, me: me, muted: muted, threadReadTimes: threadReadTimes
-        ).count
+        guard !muted else { return 0 }
+        return messages.reduce(into: 0) { count, message in
+            if isUnread(message, lastReadTime: lastReadTime, me: me, threadReadTimes: threadReadTimes) { count += 1 }
+        }
+    }
+
+    static func isUnread(
+        _ message: Message, lastReadTime: Timestamp?, me: UserName, threadReadTimes: [ThreadName: Timestamp]
+    ) -> Bool {
+        guard !message.isDeleted, message.sender.name != me else { return false }
+        if message.isThreadReply {
+            guard let thread = message.thread, let threadRead = threadReadTimes[thread] else { return false }
+            return message.createTime > threadRead
+        }
+        guard let lastReadTime else { return true }
+        return message.createTime > lastReadTime
     }
 }

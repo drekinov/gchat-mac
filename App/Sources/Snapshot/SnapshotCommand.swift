@@ -124,7 +124,7 @@
                 let unread = await model.unreadMessages(for: entry.id)
                 await window(
                     "32-unread.png",
-                    UnreadPopover(model: model, key: entry.id, preloaded: unread) {}
+                    UnreadPopover(model: model, key: entry.id, unread: unread) {}
                         .background(Color(nsColor: .windowBackgroundColor)),
                     NSSize(width: 360, height: 300))
             }
