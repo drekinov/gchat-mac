@@ -225,27 +225,31 @@ public actor AccountSession {
         work.spawn { [weak self] in await self?.focusTick(space, generation) }
     }
 
+    /// Saves the open thread's read position. A newer position that arrives while one is being saved, as it does
+    /// while a jump scrolls the thread's replies into view, is saved straight after it rather than at the next
+    /// focus tick.
     func flushThreadRead(_ generation: Generation) async {
-        guard let position = pendingThreadRead, !updatingThreadRead, admitted, gate.isCurrent(generation) else {
-            return
-        }
+        guard !updatingThreadRead else { return }
         updatingThreadRead = true
         defer { updatingThreadRead = false }
-        do {
-            try await engine.markThreadRead(position, generation) { [weak self] in
-                await self?.openThreadRead == position
-            }
-            if pendingThreadRead == position { pendingThreadRead = nil }
-            didCommit(position.thread.space, generation)
-        } catch {
-            switch error {
-            case .busy, .retired:
-                break
-            case .api(let error, _) where error.isRetryable:
-                backOff(after: error, generation)
-            default:
+        while let position = pendingThreadRead, admitted, gate.isCurrent(generation) {
+            do {
+                try await engine.markThreadRead(position, generation) { [weak self] in
+                    await self?.openThreadRead == position
+                }
                 if pendingThreadRead == position { pendingThreadRead = nil }
-                handle(error, generation)
+                didCommit(position.thread.space, generation)
+            } catch {
+                switch error {
+                case .busy, .retired:
+                    break
+                case .api(let error, _) where error.isRetryable:
+                    backOff(after: error, generation)
+                default:
+                    if pendingThreadRead == position { pendingThreadRead = nil }
+                    handle(error, generation)
+                }
+                return
             }
         }
     }
