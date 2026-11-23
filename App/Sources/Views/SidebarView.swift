@@ -271,7 +271,8 @@ struct InboxRow: View {
     let showsBadge: Bool
     let isSelected: Bool
     var density = SidebarDensity.comfortable
-    /// Two members, drawn overlapping in place of a space's letter once its member list is cached.
+    /// Two members drawn overlapping in place of a space's letter, or a direct message's other person, once the
+    /// member list is cached.
     var faces: [User]?
     var media: MediaLoader?
     var photoURL: (UserName) -> URL? = { _ in nil }
@@ -330,6 +331,8 @@ struct InboxRow: View {
     private func picture(_ title: String, size: CGFloat) -> some View {
         if let faces, faces.count >= 2, kind == .space || kind == .group {
             FaceStack(users: faces, media: media, photoURL: photoURL, size: size)
+        } else if kind == .directMessage, let person = faces?.first {
+            PhotoAvatar(name: title, url: photoURL(person.name), media: media, size: size)
         } else {
             SpaceAvatar(title: title, kind: kind, size: size)
         }

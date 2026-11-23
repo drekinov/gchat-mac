@@ -453,12 +453,13 @@ final class AppModel {
         facesWarmed.insert(account)
         let epoch = Timestamp(seconds: 0)
         let recent = snapshot.spaces.sorted { ($0.lastActiveTime ?? epoch) > ($1.lastActiveTime ?? epoch) }
-        let shown = recent.filter { $0.type == .space || $0.type == .groupChat }.map(\.name)
+        let shown = recent.filter { $0.type != .directMessage || !$0.isBotDM }.map(\.name)
         let spaces = recent.filter { $0.type == .space }.map(\.name)
+        let direct = Set(recent.filter { $0.type == .directMessage }.map(\.name))
         Task {
-            await refreshFaces(account, session: session, spaces: shown)
+            await refreshFaces(account, session: session, spaces: shown, direct: direct)
             await session.prepareMembers(in: spaces)
-            await refreshFaces(account, session: session, spaces: shown)
+            await refreshFaces(account, session: session, spaces: shown, direct: direct)
         }
     }
 
@@ -472,16 +473,19 @@ final class AppModel {
         guard skipped || !snapshot.changedSpaces.isEmpty else { return }
         let changed = snapshot.spaces.filter { summary in
             (skipped || snapshot.changedSpaces.contains(summary.name))
-                && (summary.type == .space || summary.type == .groupChat)
+                && (summary.type != .directMessage || !summary.isBotDM)
                 && summary.membersFetched != nil
                 && previous.spaces.first { $0.name == summary.name }?.membersFetched != summary.membersFetched
         }
         guard !changed.isEmpty else { return }
-        Task { await refreshFaces(snapshot.account, session: session, spaces: changed.map(\.name)) }
+        let direct = Set(changed.filter { $0.type == .directMessage }.map(\.name))
+        Task { await refreshFaces(snapshot.account, session: session, spaces: changed.map(\.name), direct: direct) }
     }
 
-    private func refreshFaces(_ account: AccountID, session: AccountSession, spaces: [SpaceName]) async {
-        let found = await StoreReader.faces(session: session, spaces: spaces)
+    private func refreshFaces(
+        _ account: AccountID, session: AccountSession, spaces: [SpaceName], direct: Set<SpaceName> = []
+    ) async {
+        let found = await StoreReader.faces(session: session, spaces: spaces, direct: direct)
         guard sessions[account] === session else { return }
         for space in spaces { spaceFaces[SpaceKey(account: account, space: space)] = found[space] }
         let cached = photoURLs[account] ?? [:]
