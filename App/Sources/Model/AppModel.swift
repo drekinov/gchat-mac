@@ -8,6 +8,7 @@ import Foundation
 import GoogleChat
 import Observation
 import UniformTypeIdentifiers
+import os
 
 @MainActor @Observable
 final class AppModel {
@@ -132,6 +133,7 @@ final class AppModel {
             await bootLive(promptForNotifications: promptForNotifications)
             return
         }
+        failNextUnreadRead = arguments.contains("--fake-unread-failure")
         if promptForNotifications, bench == nil { await NotificationCenterPoster.requestOnFirstLaunch() }
         let world = await FakeWorld.build(
             accounts: bench?.accounts ?? Self.fakeAccountCount(arguments: arguments),
@@ -384,10 +386,103 @@ final class AppModel {
         pendingReveal = nil
     }
 
-    /// The conversation's unread messages, read from the store when the unread list opens.
-    func unreadMessages(for key: SpaceKey) async -> UnreadMessages? {
-        guard let session = sessions[key.account] else { return nil }
-        return await StoreReader.unread(session: session, space: key.space)
+    // MARK: Unread list
+
+    enum UnreadListState {
+        case loading
+        case loaded(UnreadMessages)
+        case failed
+    }
+
+    /// The conversation whose unread list is open. The model owns it, so the toolbar redrawing can't drop it.
+    private(set) var unreadPopover: SpaceKey?
+    private(set) var unreadState = UnreadListState.loading
+    /// The badge count when the list opened, which sizes it for as long as it stays open.
+    private(set) var unreadSizedFor = 0
+    /// Whether the list shown was read while some of its threads' read times were still due a check.
+    private(set) var unreadReadWhileDiscovering = false
+    @ObservationIgnored private var unreadLoad: Task<Void, Never>?
+    @ObservationIgnored private var unreadSequence = 0
+    /// `--fake-unread-failure`: the first read fails, so Try Again can be checked by hand.
+    @ObservationIgnored private var failNextUnreadRead = false
+    private static let unreadLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "Thimble", category: "unread")
+
+    func toggleUnread(_ key: SpaceKey) {
+        if unreadPopover == key { closeUnread() } else { openUnread(key) }
+    }
+
+    func openUnread(_ key: SpaceKey) {
+        unreadPopover = key
+        unreadState = .loading
+        unreadReadWhileDiscovering = false
+        unreadSizedFor = summary(for: key)?.unreadCount ?? 0
+        reloadUnread()
+    }
+
+    func closeUnread() {
+        unreadLoad?.cancel()
+        unreadLoad = nil
+        unreadSequence += 1
+        unreadPopover = nil
+        unreadState = .loading
+    }
+
+    func retryUnread() {
+        unreadState = .loading
+        reloadUnread()
+    }
+
+    /// Whether the list may still grow: it was read, or its room still is, with thread read times due a check.
+    var unreadIsUpdating: Bool {
+        guard let key = unreadPopover else { return false }
+        return unreadReadWhileDiscovering || isDiscovering(key)
+    }
+
+    private func isDiscovering(_ key: SpaceKey) -> Bool {
+        snapshots[key.account]?.discoveringSpaces.contains(key.space) ?? false
+    }
+
+    /// Reads the open list again. Only the newest read for the same opening and the same session lands; a failed
+    /// refresh keeps the list already shown.
+    private func reloadUnread() {
+        guard let key = unreadPopover else { return }
+        unreadLoad?.cancel()
+        unreadSequence += 1
+        let sequence = unreadSequence
+        guard let session = sessions[key.account] else {
+            unreadState = .failed
+            return
+        }
+        let discovering = isDiscovering(key)
+        let injectFailure = failNextUnreadRead
+        failNextUnreadRead = false
+        unreadLoad = Task {
+            let result =
+                injectFailure
+                ? .failure(.store(.sqlite(code: 1))) : await StoreReader.unread(session: session, space: key.space)
+            guard !Task.isCancelled, sequence == unreadSequence, unreadPopover == key, sessions[key.account] === session
+            else { return }
+            unreadLoad = nil
+            switch result {
+            case .success(let list):
+                unreadState = .loaded(list)
+                unreadReadWhileDiscovering = discovering
+            case .failure(let error):
+                Self.unreadLog.error("Unread list read failed: \(Self.describe(error), privacy: .public)")
+                if case .loaded = unreadState { return }
+                unreadState = .failed
+            }
+        }
+    }
+
+    /// The failure's kind and code only, never content.
+    private static func describe(_ error: SyncError) -> String {
+        switch error {
+        case .store(.sqlite(let code)): "sqlite \(code)"
+        case .store(.crypto(let crypto)): "crypto \(crypto)"
+        case .store(let store): "store \(store)"
+        default: "\(error)"
+        }
     }
 
     /// Scrolls the open conversation to a message from the unread list, opening its thread first when it's a reply.
@@ -494,8 +589,16 @@ final class AppModel {
         warmFaces(id)
         refreshChangedFaces(snapshot, previous: previous)
 
-        guard let key = selection, key.account == id else { return }
         let skipped = previous.map { snapshot.revision > $0.revision + 1 } ?? false
+        if let open = unreadPopover, open.account == id {
+            let wasDiscovering = previous?.discoveringSpaces.contains(open.space) ?? false
+            if snapshot.changedSpaces.contains(open.space) || skipped
+                || wasDiscovering != snapshot.discoveringSpaces.contains(open.space)
+            {
+                reloadUnread()
+            }
+        }
+        guard let key = selection, key.account == id else { return }
         if snapshot.changedSpaces.contains(key.space) || skipped || !openOutbox.isEmpty { requestReload() }
     }
 
@@ -574,6 +677,7 @@ final class AppModel {
         }
         selection = key
         pendingReveal = nil
+        if unreadPopover != nil, unreadPopover != key { closeUnread() }
         endEdits { $0.key != key }
         pendingDelete = nil
         openRole = nil

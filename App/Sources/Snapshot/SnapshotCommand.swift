@@ -121,12 +121,14 @@
                 print("snapshot: Releases unread count: \(entry.summary.unreadCount)")
                 model.select(entry.id)
                 await model.waitUntilSettled(timeout: .seconds(3))
-                let unread = await model.unreadMessages(for: entry.id)
+                model.openUnread(entry.id)
+                let height = UnreadPopover.listHeight(for: model.unreadSizedFor) + 72
                 await window(
                     "32-unread.png",
-                    UnreadPopover(model: model, key: entry.id, unread: unread) {}
+                    UnreadPopover(model: model, key: entry.id)
                         .background(Color(nsColor: .windowBackgroundColor)),
-                    NSSize(width: 360, height: 300))
+                    NSSize(width: 360, height: height))
+                model.closeUnread()
             }
 
             if let entry = model.inbox.first(where: { $0.summary.title == "Engineering" }) {

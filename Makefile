@@ -45,7 +45,7 @@ run:
 	open $(APP)
 
 fake:
-	open $(APP) --args --fake $(if $(ACCOUNTS),--fake-accounts $(ACCOUNTS))
+	open $(APP) --args --fake $(if $(ACCOUNTS),--fake-accounts $(ACCOUNTS)) $(FAKE_FLAGS)
 
 footprint:
 	@footprint -p Thimble || echo "footprint: Thimble is not running"
