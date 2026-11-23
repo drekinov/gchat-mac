@@ -33,7 +33,8 @@ struct MentionEditor {
             if mention.range.upperBound <= prefix { return mention }
             if mention.range.lowerBound >= oldEnd {
                 return MentionText.Mention(
-                    range: (mention.range.lowerBound + delta)..<(mention.range.upperBound + delta), user: mention.user)
+                    range: (mention.range.lowerBound + delta)..<(mention.range.upperBound + delta), user: mention.user,
+                    token: mention.token)
             }
             return nil
         }
@@ -81,7 +82,8 @@ struct MentionEditor {
         units.replaceSubrange(trigger.at..<end, with: Array((token + " ").utf16))
         let updated = String(decoding: units, as: UTF16.self)
         applyEdit(old: text, new: updated)
-        mentions.append(MentionText.Mention(range: trigger.at..<(trigger.at + token.utf16.count), user: user))
+        mentions.append(
+            MentionText.Mention(range: trigger.at..<(trigger.at + token.utf16.count), user: user, token: token))
         return (updated, trigger.at + token.utf16.count + 1)
     }
 

@@ -61,6 +61,17 @@ public struct CreatedMessage: Hashable, Sendable {
     }
 }
 
+/// A message fetched for editing, with Google's markup (`formattedText`), which can hold formatting `text` lacks.
+public struct EditableMessage: Hashable, Sendable {
+    public var message: Message
+    public var formattedText: String?
+
+    public init(message: Message, formattedText: String?) {
+        self.message = message
+        self.formattedText = formattedText
+    }
+}
+
 public struct CustomEmoji: Hashable, Sendable {
     public var name: CustomEmojiName
     public var shortcode: String
@@ -146,6 +157,7 @@ public protocol ChatAPI: Sendable {
         showDeleted: Bool, pageToken: String?
     ) async throws(ChatAPIError) -> Page<Message>
     func getMessage(_ message: MessageName) async throws(ChatAPIError) -> Message
+    func getEditableMessage(_ message: MessageName) async throws(ChatAPIError) -> EditableMessage
     func searchMessages(_ query: String, pageSize: Int, pageToken: String?) async throws(ChatAPIError) -> Page<Message>
 
     /// `start`/`end` must be at most 28 days apart. Batch event payloads are flattened, oldest first.
@@ -165,6 +177,11 @@ public protocol ChatAPI: Sendable {
     func listCustomEmojis(pageToken: String?) async throws(ChatAPIError) -> Page<CustomEmoji>
 
     func createMessage(_ message: NewMessage) async throws(ChatAPIError) -> CreatedMessage
+    /// Replaces the text of one of the user's own messages.
+    func updateMessageText(_ message: MessageName, text: String) async throws(ChatAPIError) -> Message
+    /// `force` also deletes the thread's replies; without it a thread starter with replies fails
+    /// `failedPrecondition`.
+    func deleteMessage(_ message: MessageName, force: Bool) async throws(ChatAPIError)
 
     /// Returns the existing DM with `member` if there is one, otherwise creates it (`spaces.setup`).
     func setUpDirectMessage(with member: DirectMessageMember) async throws(ChatAPIError) -> Space

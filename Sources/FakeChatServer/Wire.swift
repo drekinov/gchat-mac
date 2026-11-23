@@ -73,6 +73,10 @@ struct WireError: Error, Sendable {
         WireError(status: 409, googleStatus: "ALREADY_EXISTS", message: message)
     }
 
+    static func failedPrecondition(_ message: String) -> WireError {
+        WireError(status: 400, googleStatus: "FAILED_PRECONDITION", message: message)
+    }
+
     static func permissionDenied(_ message: String) -> WireError {
         WireError(status: 403, googleStatus: "PERMISSION_DENIED", message: message)
     }

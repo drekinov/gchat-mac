@@ -92,13 +92,35 @@ import Testing
     }
 
     @Test(arguments: Backend.allCases)
-    func newerLiveCopyReplacesTombstone(_ backend: Backend) throws {
+    func liveCopyNeverReplacesTombstone(_ backend: Backend) throws {
         let f = try Fixture(backend)
         try f.commit(.upsertMessages([makeMessage(id: "m", at: 10, deleted: 20)]))
         try f.commit(.upsertMessages([makeMessage(id: "m", at: 10, text: "back", updated: 30)]))
-        let stored = try #require(try f.store.message(messageName("A", "m")))
-        #expect(!stored.isDeleted)
-        #expect(stored.text == "back")
+        try f.commit(
+            .replaceMessages(
+                spaceName("A"), [makeMessage(id: "m", at: 10, text: "back", updated: 40)], coveredBefore: stamp(5)))
+        #expect(try f.store.message(messageName("A", "m"))?.isDeleted == true)
+    }
+
+    @Test(arguments: Backend.allCases)
+    func tombstoneKeepsThreadAndSenderAndReplacesAnEqualTombstone(_ backend: Backend) throws {
+        let f = try Fixture(backend)
+        let reply = makeMessage(id: "r", at: 10, text: "hi", thread: "t")
+        try f.commit(.upsertMessages([reply]))
+        var local = makeMessage(id: "r", at: 10, deleted: 10)
+        local.thread = nil
+        try f.commit(.upsertMessages([local]))
+        var server = makeMessage(id: "r", at: 10, deleted: 10)
+        server.thread = nil
+        server.sender = User(name: UserName(unchecked: "users/unknown"))
+        server.text = "server"
+        try f.commit(.upsertMessages([server]))
+        let stored = try #require(try f.store.message(messageName("A", "r")))
+        #expect(stored.isDeleted)
+        #expect(stored.thread == reply.thread)
+        #expect(stored.isThreadReply)
+        #expect(stored.sender == reply.sender)
+        #expect(stored.text == "server")
     }
 
     @Test(arguments: Backend.allCases)

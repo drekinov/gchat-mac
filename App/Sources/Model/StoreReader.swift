@@ -36,6 +36,11 @@ enum StoreReader {
     }
 
     @concurrent
+    static func myRole(session: AccountSession, space: SpaceName) async -> Membership.Role? {
+        session.myRole(in: space)
+    }
+
+    @concurrent
     static func memberships(session: AccountSession, space: SpaceName) async -> [Membership] {
         (try? session.contacts.memberships(in: space)) ?? []
     }

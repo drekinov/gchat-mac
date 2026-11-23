@@ -526,23 +526,34 @@ public final class SQLiteAccountStore: AccountStore {
         _ messages: [Message], _ c: Connection, rewriteEqual: Bool = false
     ) throws(StoreError) {
         let select = try c.prepare("SELECT version_s, version_n, is_deleted FROM messages WHERE name = ?1")
+        let payload = try c.prepare("SELECT payload FROM messages WHERE name = ?1")
         let insert = try c.prepare(
             """
             INSERT OR REPLACE INTO messages
                 (name, space, thread, create_s, create_n, version_s, version_n, is_deleted, payload)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             """)
-        for message in messages {
-            let name = message.name.rawValue
-            let stored = try select.first([.text(name)]) { ($0.int(0), $0.int(1), $0.int(2) != 0) }
-            let version = message.version
-            if let (storedSeconds, storedNanos, storedDeleted) = stored {
-                let incoming = (version.seconds, Int64(version.nanos))
-                if incoming < (storedSeconds, storedNanos) { continue }
-                if incoming == (storedSeconds, storedNanos), !rewriteEqual, !(message.isDeleted && !storedDeleted) {
-                    continue
+        for incoming in messages {
+            let name = incoming.name.rawValue
+            var message = incoming
+            if let (seconds, nanos, storedDeleted) = try select.first(
+                [.text(name)], { ($0.int(0), $0.int(1), $0.int(2) != 0) })
+            {
+                let older = (incoming.version.seconds, Int64(incoming.version.nanos)) < (seconds, nanos)
+                let equal = (incoming.version.seconds, Int64(incoming.version.nanos)) == (seconds, nanos)
+                switch (storedDeleted, incoming.isDeleted) {
+                case (true, false): continue
+                case (false, false): if older || (equal && !rewriteEqual) { continue }
+                case (true, true): if older { continue }
+                case (false, true): break
+                }
+                // Only a tombstone needs the stored copy: Google's deletion events leave out the thread and sender.
+                if incoming.isDeleted, let sealed = try payload.first([.text(name)], { $0.blob(0) }) {
+                    let stored = try codec.open(sealed, as: Message.self, table: "messages", rowKey: name)
+                    message = Message.merge(incoming, over: stored, rewriteEqual: true) ?? incoming
                 }
             }
+            let version = message.version
             let sealed = try codec.seal(message, table: "messages", rowKey: name)
             try insert.run([
                 .text(name), .text(message.space.rawValue), message.thread.map { .text($0.rawValue) } ?? .null,

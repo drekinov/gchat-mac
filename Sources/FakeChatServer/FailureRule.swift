@@ -4,6 +4,7 @@ import Foundation
 public struct FailureRule: Sendable {
     public enum Route: Sendable, Equatable {
         case any, listSpaces, getSpace, listMessages, getMessage, createMessage, listSpaceEvents, listMembers
+        case updateMessage, deleteMessage
         case getSpaceReadState, updateSpaceReadState, getThreadReadState, getNotificationSetting, listCustomEmojis
         case updateThreadReadState, searchMessages
         case createReaction, deleteReaction, listReactions, uploadAttachment, downloadMedia, setUpSpace, searchDirectory

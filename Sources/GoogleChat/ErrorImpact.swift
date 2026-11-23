@@ -24,6 +24,8 @@ public enum ChatOperation: Sendable, Equatable {
     case getNotificationSetting
     case listCustomEmojis
     case createMessage
+    case updateMessage
+    case deleteMessage
     case setUpDirectMessage
     case searchDirectory
     case createReaction

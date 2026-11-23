@@ -89,8 +89,12 @@ public final class FakeChatServer: Sendable {
         state.withLock { $0.addMember(account.user, to: space, at: at) }
     }
 
-    public func addMember(_ user: User, to space: SpaceName, at: Timestamp? = nil) {
-        state.withLock { $0.addMember(user, to: space, at: at) }
+    public func addMember(_ user: User, to space: SpaceName, role: Membership.Role = .member, at: Timestamp? = nil) {
+        state.withLock { $0.addMember(user, to: space, role: role, at: at) }
+    }
+
+    public func setRole(_ role: Membership.Role, of account: FakeAccount, in space: SpaceName) {
+        state.withLock { $0.setRole(role, of: account.user.name, in: space) }
     }
 
     public func removeMember(_ account: FakeAccount, from space: SpaceName, at: Timestamp? = nil) {

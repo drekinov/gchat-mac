@@ -160,6 +160,7 @@ struct OAuthScopesTests {
         #expect(OAuthScopes.required.contains("openid"))
         #expect(OAuthScopes.required.contains("email"))
         #expect(OAuthScopes.required.contains("https://www.googleapis.com/auth/chat.messages.create"))
+        #expect(OAuthScopes.required.contains("https://www.googleapis.com/auth/chat.messages"))
         #expect(Set(OAuthScopes.required).count == OAuthScopes.required.count)
     }
 
@@ -192,6 +193,14 @@ struct OAuthScopesTests {
     @Test func toleratesRepeatedSpaces() {
         let granted = OAuthScopes.required.joined(separator: "  ") + " "
         #expect(OAuthScopes.missing(from: granted).isEmpty)
+    }
+
+    @Test func aGrantFromBeforeEditingNeedsReconsent() {
+        let previous = OAuthScopes.required.filter { $0 != "https://www.googleapis.com/auth/chat.messages" }
+        #expect(
+            OAuthScopes.missing(from: previous.joined(separator: " ")) == [
+                "https://www.googleapis.com/auth/chat.messages"
+            ])
     }
 
     @Test func similarLookingScopesDoNotCount() {

@@ -81,6 +81,8 @@ extension State {
         case .listMessages(let name): try listMessages(name, incoming, account)
         case .createMessage(let name): try createMessage(name, incoming, account)
         case .getMessage(let name): try getMessage(name, account)
+        case .updateMessage(let name): try updateMessage(name, incoming, account)
+        case .deleteMessage(let name): try deleteMessage(name, incoming, account)
         case .listSpaceEvents(let name): try listSpaceEvents(name, incoming, account)
         case .listMembers(let name): try listMembers(name, incoming, account)
         case .getSpaceReadState(let name, let user): try getSpaceReadState(name, user, account)
@@ -225,6 +227,44 @@ extension State {
         let space = try requireSpace(name.space, account)
         guard let index = space.messageIndex[name] else { throw .notFound("Message not found: \(name)") }
         return .json(wireMessage(space.messages[index].message))
+    }
+
+    /// Only the sender may edit; only `updateMask=text` is supported.
+    private mutating func updateMessage(
+        _ name: MessageName, _ incoming: IncomingRequest, _ account: FakeAccount
+    ) throws(WireError) -> Reply {
+        let record = try requireMessage(name, account)
+        guard record.message.sender.name == account.user.name else {
+            throw .permissionDenied("Only the sender can update this message")
+        }
+        guard incoming.value("updateMask") == "text" else { throw .invalidArgument("Unsupported updateMask") }
+        guard let text = incoming.jsonBody?["text"] as? String else { throw .invalidArgument("Body needs text") }
+        guard text.utf8.count <= 32_000 else { throw .invalidArgument("Message text exceeds 32000 bytes") }
+        let (storedText, mentions) = applyMentions(text)
+        return .json(wireMessage(edit(name, text: storedText, annotations: mentions, at: nil)))
+    }
+
+    /// The sender, or a space manager, may delete. A thread starter with live replies needs `force`.
+    private mutating func deleteMessage(
+        _ name: MessageName, _ incoming: IncomingRequest, _ account: FakeAccount
+    ) throws(WireError) -> Reply {
+        let record = try requireMessage(name, account)
+        let space = try requireSpace(name.space, account)
+        let role = space.members.first { $0.member.name == account.user.name }?.role
+        guard record.message.sender.name == account.user.name || role == .manager || role == .assistantManager else {
+            throw .permissionDenied("The caller does not have permission to delete this message")
+        }
+        let replies = space.messages.map(\.message).filter {
+            !$0.isThreadReply ? false : $0.thread == record.message.thread && !$0.isDeleted && $0.name != name
+        }
+        if !record.message.isThreadReply, !replies.isEmpty {
+            guard incoming.value("force") == "true" else {
+                throw .failedPrecondition("The message has replies; set force to delete them too")
+            }
+            for reply in replies { delete(reply.name, at: nil) }
+        }
+        delete(name, at: nil)
+        return .json([:])
     }
 
     /// Sample mode implements keyword search across the calling account’s eligible spaces.

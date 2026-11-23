@@ -208,6 +208,32 @@ public struct Message: Hashable, Sendable, Codable, Identifiable {
     /// Version stamp for overlap dedupe: a copy replaces another only if it isn't older.
     public var version: Timestamp { max(deleteTime ?? createTime, lastUpdateTime ?? createTime) }
 
+    /// The copy to keep when `incoming` meets `stored`, or nil to keep `stored`. Deletes are terminal: a live copy
+    /// never replaces a tombstone, and a tombstone keeps the sender and thread that Google's sparse deletion events
+    /// leave out.
+    public static func merge(_ incoming: Message, over stored: Message?, rewriteEqual: Bool = false) -> Message? {
+        guard let stored else { return incoming }
+        switch (stored.isDeleted, incoming.isDeleted) {
+        case (true, false):
+            return nil
+        case (false, true):
+            return incoming.keepingIdentity(of: stored)
+        case (true, true):
+            return incoming.version < stored.version ? nil : incoming.keepingIdentity(of: stored)
+        case (false, false):
+            if incoming.version < stored.version { return nil }
+            return incoming.version == stored.version && !rewriteEqual ? nil : incoming
+        }
+    }
+
+    private func keepingIdentity(of stored: Message) -> Message {
+        var merged = self
+        merged.sender = stored.sender
+        merged.thread = stored.thread ?? thread
+        merged.isThreadReply = stored.isThreadReply
+        return merged
+    }
+
     public init(
         name: MessageName, sender: User, createTime: Timestamp, lastUpdateTime: Timestamp? = nil,
         deleteTime: Timestamp? = nil, text: String = "", annotations: [Annotation] = [], thread: ThreadName? = nil,

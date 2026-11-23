@@ -11,6 +11,13 @@ struct ReactionActions {
     /// Everyone who reacted to a message, by emoji, given its current reaction counts; nil when it can't be loaded.
     var reactors: @MainActor (MessageName, [ReactionSummary]) async -> [Emoji: [Reactor]]? = { _, _ in nil }
     var media: MediaLoader?
+    var canEdit: @MainActor (Message) -> Bool = { _ in false }
+    var canDelete: @MainActor (Message) -> Bool = { _ in false }
+    var edit: @MainActor (Message) -> Void = { _ in }
+    /// The second value is the message's reply count, for the confirmation.
+    var delete: @MainActor (Message, Int) -> Void = { _, _ in }
+    /// Messages being edited in a composer right now.
+    var editing: Set<MessageName> = []
 }
 
 /// One person who reacted, as the reaction card shows them.
@@ -297,6 +304,19 @@ struct MessageRow: View {
                     .overlay(Bubble().strokeBorder(Color.secondary.opacity(0.35), style: StrokeStyle(dash: [4])))
             } else {
                 liveContent(message, mine: mine)
+                    .overlay {
+                        if context.actions?.editing.contains(message.name) == true {
+                            RoundedRectangle(cornerRadius: 14).strokeBorder(Theme.accentText, lineWidth: 2)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .contextMenu { messageMenu(message) }
+                if message.lastUpdateTime != nil {
+                    Text("Edited").font(.caption2).foregroundStyle(.secondary)
+                        .help(
+                            message.lastUpdateTime.map { $0.date.formatted(date: .abbreviated, time: .shortened) } ?? ""
+                        )
+                }
             }
         }
         // A zero-width anchor on the bubble's top edge lets the actions spill outward without covering text. It's
@@ -396,6 +416,18 @@ struct MessageRow: View {
                 }
                 .help("Reply in thread")
             }
+            if let actions = context.actions, actions.canEdit(message) || actions.canDelete(message) {
+                Menu {
+                    messageMenu(message)
+                } label: {
+                    Image(systemName: "ellipsis").frame(width: 26, height: 24)
+                }
+                .menuStyle(.button)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("More")
+                .accessibilityLabel("More actions")
+            }
         }
         .buttonStyle(.borderless)
         .padding(2)
@@ -403,6 +435,18 @@ struct MessageRow: View {
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.secondary.opacity(0.25)))
         .shadow(color: .black.opacity(0.08), radius: 4, y: 2)
         .fixedSize()
+    }
+
+    @ViewBuilder
+    private func messageMenu(_ message: Message) -> some View {
+        if let actions = context.actions {
+            if actions.canEdit(message) {
+                Button("Edit") { actions.edit(message) }
+            }
+            if actions.canDelete(message) {
+                Button("Delete…", role: .destructive) { actions.delete(message, row.replies) }
+            }
+        }
     }
 
     private var senderName: String {
