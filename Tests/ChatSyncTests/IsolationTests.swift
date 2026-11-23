@@ -71,6 +71,8 @@ struct IsolationRig: Sendable {
     let sessionB: AccountSession
     let recA: SnapshotRecorder
     let recB: SnapshotRecorder
+    /// A's own, so the test can stop A's time while B keeps running.
+    let clockA: SteppingClock
     let scratch = ScratchDirectory()
     let zed = User(name: UserName(unchecked: "users/777"), displayName: "Zed")
 
@@ -83,11 +85,13 @@ struct IsolationRig: Sendable {
         server.post("seed B", in: spaceB, from: .user(zed))
         server.advance(.seconds(5))
 
-        let clock = SteppingClock(server: server)
+        let clockA = SteppingClock(server: server)
+        let clockB = SteppingClock(server: server)
+        self.clockA = clockA
         let tombstones = LogoutTombstones(root: scratch.url)
         let (sessionA, sessionB) = (
-            Self.makeSession(server, a, storeA, clock, tombstones),
-            Self.makeSession(server, b, storeB, clock, tombstones)
+            Self.makeSession(server, a, storeA, clockA, tombstones),
+            Self.makeSession(server, b, storeB, clockB, tombstones)
         )
         self.sessionA = sessionA
         self.sessionB = sessionB
@@ -132,6 +136,50 @@ struct IsolationRig: Sendable {
         server.requests.filter { $0.account == account }
     }
 
+    /// Stops A's clock during a back-off and walks it to the deadline. A makes no call while a poll is due but the
+    /// back-off stands, and calls again once the deadline arrives.
+    func expectAWaitsOutItsBackoff() async {
+        clockA.hold()
+        defer { clockA.release() }
+        guard let until = await settledBackoffOfA() else {
+            Issue.record("A never settled into a backoff")
+            return
+        }
+        let before = requests(of: a).count
+
+        // A back-off lasts at least a second and polls fall due every 50 ms, so this is past the next poll.
+        clockA.advance(max(.zero, until.offset(from: clockA.now()) - .milliseconds(1)))
+        #expect(await aPolledTheClock(), "A's loop stopped running")
+        #expect(requests(of: a).count == before, "A kept calling the API during its backoff")
+
+        clockA.advance(until.offset(from: clockA.now()))
+        let resumed = await poll { requests(of: a).count > before }
+        #expect(resumed, "A never called again after its backoff")
+    }
+
+    /// With A's clock held: the deadline of a back-off A has finished reacting to, with only its run loop still going.
+    /// A back-off that had already ended makes A call again, and that failure starts a new one.
+    private func settledBackoffOfA() async -> Timestamp? {
+        let work = await sessionA.work
+        let giveUp = ContinuousClock.now + .seconds(10)
+        while ContinuousClock.now < giveUp {
+            if let until = await sessionA.backoffUntil, until > clockA.now(), await aPolledTheClock(), work.count == 1,
+                await sessionA.backoffUntil == until
+            {
+                return until
+            }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        return nil
+    }
+
+    /// True once A's loop has looked at the current time. The first sleep begun from here may follow a look at the
+    /// time from before this call; the second follows one made after it.
+    private func aPolledTheClock() async -> Bool {
+        let sleeps = clockA.sleepsBegun
+        return await poll { clockA.sleepsBegun >= sleeps + 2 }
+    }
+
     func postAndAdvance(_ text: String, in space: SpaceName) {
         server.post(text, in: space, from: .user(zed))
         server.advance(.seconds(5))
@@ -167,9 +215,7 @@ struct IsolationTests {
             if failure.backsOff {
                 let failed = await poll { rig.requests(of: rig.a).contains { $0.status == failure.statusCode } }
                 #expect(failed)
-                let before = rig.requests(of: rig.a).count
-                try await Task.sleep(for: .milliseconds(40))
-                #expect(rig.requests(of: rig.a).count == before, "A kept calling the API during its backoff")
+                await rig.expectAWaitsOutItsBackoff()
                 let published = rig.recA.history.contains {
                     if case .backingOff = $0.status { true } else { false }
                 }

@@ -39,19 +39,32 @@ final class ManualClock: SyncClock {
     var sleeps: [Duration] { state.withLock { $0.sleeps } }
 }
 
-/// Server time plus virtual time that runs ahead by every sleep, so polling loops tick fast.
+/// Server time plus virtual time that runs ahead by every sleep, so polling loops tick fast. While held, only
+/// `advance` moves it, and sleeps still return.
 final class SteppingClock: SyncClock {
+    private struct State {
+        var drift = Duration.zero
+        var held = false
+        var sleepsBegun = 0
+    }
+
     let server: FakeChatServer
-    private let drift = Mutex<Duration>(.zero)
+    private let state = Mutex(State())
 
     init(server: FakeChatServer) { self.server = server }
 
-    func now() -> Timestamp { server.now.adding(drift.withLock { $0 }) }
+    func now() -> Timestamp { server.now.adding(state.withLock { $0.drift }) }
 
     func sleep(for duration: Duration) async throws {
+        state.withLock { $0.sleepsBegun += 1 }
         try await Task.sleep(for: .milliseconds(1))
-        drift.withLock { $0 += duration }
+        state.withLock { if !$0.held { $0.drift += duration } }
     }
+
+    var sleepsBegun: Int { state.withLock { $0.sleepsBegun } }
+    func hold() { state.withLock { $0.held = true } }
+    func release() { state.withLock { $0.held = false } }
+    func advance(_ duration: Duration) { state.withLock { $0.drift += duration } }
 }
 
 /// Server time, with sleeps that really wait.
