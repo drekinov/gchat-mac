@@ -146,6 +146,10 @@ public final class FakeChatServer: Sendable {
         state.withLock { $0.spaces[space]?.readStates[account.user.name] = lastReadTime }
     }
 
+    public func threadReadState(_ account: FakeAccount, thread: ThreadName) -> Timestamp? {
+        state.withLock { $0.spaces[thread.space]?.threadReadStates[thread]?[account.user.name] }
+    }
+
     public func setThreadReadState(_ account: FakeAccount, thread: ThreadName, lastReadTime: Timestamp?) {
         state.withLock {
             $0.spaces[thread.space]?.threadReadStates[thread, default: [:]][account.user.name] = lastReadTime

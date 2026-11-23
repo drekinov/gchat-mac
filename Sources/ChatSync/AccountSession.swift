@@ -66,6 +66,8 @@ public actor AccountSession {
     var openThreadRead: ThreadReadPosition?
     var pendingThreadRead: ThreadReadPosition?
     var updatingThreadRead = false
+    /// A save was asked for while one was running, so a `.busy` answer to the running one mustn't end the flush.
+    var threadReadRetryRequested = false
     var memberFetches: [SpaceName: Task<Result<Bool, SyncError>, Never>] = [:]
     var nextSidebar: Timestamp?
     var nextFocus: Timestamp?
@@ -132,6 +134,11 @@ public actor AccountSession {
 
     public nonisolated func storedSpace(_ space: SpaceName) throws(StoreError) -> StoredSpace? {
         try store.space(space)
+    }
+
+    /// The space's unread messages, by the same rule as its unread count.
+    public nonisolated func unread(in space: SpaceName) -> UnreadMessages? {
+        try? engine.unread(in: space)
     }
 
     public func searchMessages(_ query: String, pageToken: String?) async throws(SyncError) -> Page<Message> {
@@ -225,27 +232,41 @@ public actor AccountSession {
         work.spawn { [weak self] in await self?.focusTick(space, generation) }
     }
 
+    /// Saves the open thread's read position. A newer position that arrives while one is being saved, as it does
+    /// while a jump scrolls the thread's replies into view, is saved straight after it rather than at the next
+    /// focus tick.
     func flushThreadRead(_ generation: Generation) async {
-        guard let position = pendingThreadRead, !updatingThreadRead, admitted, gate.isCurrent(generation) else {
+        guard !updatingThreadRead else {
+            threadReadRetryRequested = true
             return
         }
         updatingThreadRead = true
-        defer { updatingThreadRead = false }
-        do {
-            try await engine.markThreadRead(position, generation) { [weak self] in
-                await self?.openThreadRead == position
-            }
-            if pendingThreadRead == position { pendingThreadRead = nil }
-            didCommit(position.thread.space, generation)
-        } catch {
-            switch error {
-            case .busy, .retired:
-                break
-            case .api(let error, _) where error.isRetryable:
-                backOff(after: error, generation)
-            default:
+        defer {
+            updatingThreadRead = false
+            threadReadRetryRequested = false
+        }
+        while let position = pendingThreadRead, admitted, gate.isCurrent(generation) {
+            threadReadRetryRequested = false
+            do {
+                let wrote = try await engine.markThreadRead(position, generation) { [weak self] in
+                    await self?.openThreadRead == position
+                }
                 if pendingThreadRead == position { pendingThreadRead = nil }
-                handle(error, generation)
+                if wrote { didCommit(position.thread.space, generation) }
+            } catch {
+                switch error {
+                case .busy:
+                    guard threadReadRetryRequested else { return }
+                case .retired:
+                    return
+                case .api(let error, _) where error.isRetryable:
+                    backOff(after: error, generation)
+                    return
+                default:
+                    // This position can't be saved, but a newer one for another thread still can.
+                    if pendingThreadRead == position { pendingThreadRead = nil }
+                    handle(error, generation)
+                }
             }
         }
     }
@@ -635,21 +656,58 @@ public actor AccountSession {
 
     func focusTick(_ space: SpaceName, _ generation: Generation) async {
         guard admitted else { return }
+        var committed = false
+        var finished = false
+        // Ends the tick once. After a commit the space's digest is marked stale before any error is handled, so a
+        // status the error publishes carries the new badge with it; if nothing published, the badge goes out on its
+        // own. A tick that committed nothing only applies its error.
+        func finish(_ error: SyncError? = nil) {
+            guard !finished else { return }
+            finished = true
+            if committed { changedSinceSnapshot.insert(space) }
+            if let error { handle(error, generation, space: space) }
+            if committed, changedSinceSnapshot.contains(space) { publish(generation) }
+        }
+        defer { finish() }
         do {
             try await engine.syncMessages(space, generation)
+            committed = true
             try await engine.syncEvents(space, generation)
             if !unavailable.contains("readState|\(space)") { try await engine.syncReadState(space, generation) }
             guard focused == space else { return }
             await flushThreadRead(generation)
             guard admitted, focused == space else { return }
-            if !visibleThreads.isEmpty { try await engine.syncThreadReadStates(visibleThreads, generation) }
+            if !visibleThreads.isEmpty {
+                // A save that found a thread busy with this check runs once the check lets go of it, rather than at
+                // the next tick. A failed check's error (a rate limit's back-off, say) applies first, and the save then
+                // runs only if the session may still call Google and the space is still open.
+                if case .failure(let error) = await threadReadRefresh(generation) {
+                    finish(error)
+                    if admitted, focused == space { await flushThreadRead(generation) }
+                    return
+                }
+                guard admitted, focused == space else { return }
+                await flushThreadRead(generation)
+                guard admitted, focused == space else { return }
+            }
             let reacted = (try? store.messages(in: space, before: nil, limit: 40)) ?? []
             let names = reacted.filter { !$0.reactions.isEmpty && !$0.isDeleted }.suffix(20).map(\.name)
             try await reactions.refreshMine(Array(names), generation)
-            didCommit(space, generation)
+            // One snapshot carries the new badge and the success status.
+            changedSinceSnapshot.insert(space)
+            finished = true
             succeeded(generation)
         } catch {
-            handle(error, generation, space: space)
+            finish(error)
+        }
+    }
+
+    private func threadReadRefresh(_ generation: Generation) async -> Result<Void, SyncError> {
+        do throws(SyncError) {
+            try await engine.syncThreadReadStates(visibleThreads, generation)
+            return .success(())
+        } catch {
+            return .failure(error)
         }
     }
 

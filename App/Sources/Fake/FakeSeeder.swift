@@ -76,6 +76,19 @@ enum FakeSeeder {
             }
             setReadState(server, account, space, unread: spec.unread)
             if spec.historyOff { server.setHistory(on: false, in: space) }
+            if spec.unreadReplies > 0 {
+                // The thread with the most replies is read up to its last few, like replies arriving overnight.
+                var replies: [ThreadName: [Message]] = [:]
+                for message in server.messages(in: space) where message.isThreadReply {
+                    if let thread = message.thread { replies[thread, default: []].append(message) }
+                }
+                if let (thread, list) = replies.max(by: { $0.value.count < $1.value.count }),
+                    list.count > spec.unreadReplies
+                {
+                    let read = list.sorted { $0.createTime < $1.createTime }[list.count - spec.unreadReplies - 1]
+                    server.setThreadReadState(account, thread: thread, lastReadTime: read.createTime)
+                }
+            }
             if spec.muted {
                 server.setNotificationSetting(
                     account, space: space, SpaceNotificationSetting(level: .off, isMuted: true))

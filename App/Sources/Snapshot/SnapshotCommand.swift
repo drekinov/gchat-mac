@@ -117,6 +117,18 @@
                 }
             }
 
+            if let entry = model.inbox.first(where: { $0.summary.title == "Releases" }) {
+                print("snapshot: Releases unread count: \(entry.summary.unreadCount)")
+                model.select(entry.id)
+                await model.waitUntilSettled(timeout: .seconds(3))
+                let unread = await model.unreadMessages(for: entry.id)
+                await window(
+                    "32-unread.png",
+                    UnreadPopover(model: model, key: entry.id, unread: unread) {}
+                        .background(Color(nsColor: .windowBackgroundColor)),
+                    NSSize(width: 360, height: 300))
+            }
+
             if let entry = model.inbox.first(where: { $0.summary.title == "Engineering" }) {
                 model.select(entry.id)
                 let suite = UserDefaults(suiteName: "io.github.drekinov.gchat-mac.snapshot")

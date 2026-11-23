@@ -165,14 +165,61 @@ struct SpaceTitle: View {
     }
 }
 
-/// The conversation's toolbar buttons: message search and its details.
+/// The conversation's toolbar buttons: its unread messages while there are any, message search and its details.
 struct SpaceActions: View {
     let model: AppModel
     let key: SpaceKey
     let members: [Membership]
     @State private var showsDetails = false
+    @State private var showsUnread = false
+    @State private var unreadList: UnreadMessages?
+    @State private var loadingUnread: Task<Void, Never>?
+    @State private var retryAfterClose = false
 
     var body: some View {
+        let unread = model.summary(for: key)?.unreadCount ?? 0
+        // The button stays while its list loads, shows or is being retried, even if the count drops meanwhile.
+        if unread > 0 || showsUnread || loadingUnread != nil || retryAfterClose {
+            Button {
+                // During a retry the old popover is still closing; its onDisappear starts the new load.
+                guard !retryAfterClose else { return }
+                guard !showsUnread else {
+                    showsUnread = false
+                    return
+                }
+                loadUnread()
+            } label: {
+                Label("Unread messages", systemImage: "text.bubble")
+            }
+            .badge(unread)
+            .help("Unread messages")
+            .accessibilityValue("\(unread) unread")
+            .popover(isPresented: $showsUnread, arrowEdge: .bottom) {
+                UnreadPopover(
+                    model: model, key: key, unread: unreadList, members: members,
+                    onRetry: {
+                        // Closed and reopened, because a popover takes its height when it opens.
+                        retryAfterClose = true
+                        showsUnread = false
+                    },
+                    onClose: { showsUnread = false }
+                )
+                // A retry starts once the old popover has really gone. Otherwise nothing is kept after it closes.
+                .onDisappear {
+                    if retryAfterClose {
+                        retryAfterClose = false
+                        loadUnread()
+                    } else if !showsUnread, loadingUnread == nil {
+                        unreadList = nil
+                    }
+                }
+            }
+            .onDisappear {
+                retryAfterClose = false
+                loadingUnread?.cancel()
+                loadingUnread = nil
+            }
+        }
         Button {
             model.showsMessageSearch = true
         } label: {
@@ -187,6 +234,19 @@ struct SpaceActions: View {
         .help("Conversation details")
         .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
             ConversationDetailsPopover(model: model, key: key, members: members)
+        }
+    }
+
+    /// Reads the list, then opens it: a popover sizes itself when it opens. A click while it's reading does nothing.
+    private func loadUnread() {
+        guard loadingUnread == nil else { return }
+        loadingUnread = Task {
+            let list = await model.unreadMessages(for: key)
+            // A cancelled load touches nothing: a newer one may already own the handle.
+            guard !Task.isCancelled else { return }
+            loadingUnread = nil
+            unreadList = list
+            showsUnread = true
         }
     }
 }
@@ -205,6 +265,28 @@ struct GlassCapsule: ViewModifier {
     }
 }
 
+/// When a waiting jump may be deliverable: when it's made, when the list appears after loading, and whenever the rows
+/// it's waiting for may have arrived. Scrolling by hand while it waits calls it off.
+private struct RevealTriggers: ViewModifier {
+    let model: AppModel
+    let key: SpaceKey
+    let attempt: () -> Void
+    let userScrolled: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: model.revealSequence) { attempt() }
+            .onAppear { attempt() }
+            .onChange(of: model.rowsRevision) { attempt() }
+            .background {
+                ManualScrollWatcher(
+                    sequence: model.revealSequence,
+                    isWaiting: { model.pendingReveal(for: key) != nil },
+                    onScroll: userScrolled)
+            }
+    }
+}
+
 struct MessageList: View {
     let model: AppModel
     let key: SpaceKey
@@ -219,6 +301,8 @@ struct MessageList: View {
     @State private var listFrame = CGRect.zero
     @State private var pendingScroll: ScrollRequest?
     @State private var scrollSequence = 0
+    /// The waiting jump whose scroll is scheduled, so a row update while it waits doesn't restart it.
+    @State private var scheduledReveal: AppModel.PendingReveal?
 
     private static let bottom = "bottom"
     private static let openThread = "open-thread"
@@ -229,6 +313,51 @@ struct MessageList: View {
         } else {
             ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    /// Schedules the waiting jump once its message is in the list: a top-level message among the conversation's rows,
+    /// a reply among its open thread's. The jump stays pending until the scroll is issued, so if a reload removes the
+    /// row during the layout delay, the next row update tries again.
+    private func attemptReveal(_ proxy: ScrollViewProxy) {
+        guard let pending = model.pendingReveal(for: key) else { return }
+        if pendingScroll?.kind == .message {
+            if scheduledReveal == pending { return }
+            // Anything else scheduled is older than this jump, which replaces it even before its own row arrives.
+            cancelScroll()
+        }
+        guard revealTargetLoaded(pending) else { return }
+        let name = pending.message
+        pinned = false
+        scheduledReveal = pending
+        scrollLater(.message, after: .milliseconds(150)) {
+            guard stillWanted(pending) else { return }
+            if model.isThreaded(key), let thread = pending.thread {
+                reveal(thread, proxy)
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled, stillWanted(pending) else { return }
+            }
+            model.revealDelivered(pending)
+            scheduledReveal = nil
+            withAnimation { proxy.scrollTo(name, anchor: .center) }
+        }
+    }
+
+    /// The user took over while a jump was waiting: it won't pull them back.
+    private func abandonReveal() {
+        model.dropPendingReveal()
+        scheduledReveal = nil
+        cancelScroll()
+    }
+
+    private func stillWanted(_ pending: AppModel.PendingReveal) -> Bool {
+        model.pendingReveal(for: key) == pending && revealTargetLoaded(pending)
+    }
+
+    private func revealTargetLoaded(_ pending: AppModel.PendingReveal) -> Bool {
+        if model.isThreaded(key), let thread = pending.thread {
+            return model.openThread == thread && model.threadMessages.contains { $0.name == pending.message }
+        }
+        return model.openMessages.contains { $0.name == pending.message }
     }
 
     private var list: some View {
@@ -311,6 +440,7 @@ struct MessageList: View {
             .overlay(alignment: .bottom) {
                 if !pinned {
                     Button {
+                        model.dropPendingReveal()
                         pinned = true
                         withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
                         // A long jump lands short while rows on the way settle their heights; land on it again.
@@ -343,26 +473,10 @@ struct MessageList: View {
                 guard let thread else { return cancelScroll() }
                 scrollLater(.thread, after: .milliseconds(80)) { withAnimation { reveal(thread, proxy) } }
             }
-            .onChange(of: model.revealSequence) {
-                guard let name = model.revealedMessage else { return }
-                let reply = threaded && (model.openMessages.first { $0.name == name }.map(\.isThreadReply) ?? true)
-                pinned = false
-                scrollLater(.message, after: .milliseconds(150)) {
-                    guard reply, let thread = model.openThread else {
-                        withAnimation { proxy.scrollTo(name, anchor: .center) }
-                        return
-                    }
-                    // A reply's row exists once the thread has loaded it and the list has laid out its first message.
-                    for _ in 0..<20 where !model.threadMessages.contains(where: { $0.name == name }) {
-                        try? await Task.sleep(for: .milliseconds(150))
-                        if Task.isCancelled { return }
-                    }
-                    reveal(thread, proxy)
-                    try? await Task.sleep(for: .milliseconds(150))
-                    guard !Task.isCancelled, model.threadMessages.contains(where: { $0.name == name }) else { return }
-                    withAnimation { proxy.scrollTo(name, anchor: .center) }
-                }
-            }
+            .modifier(
+                RevealTriggers(
+                    model: model, key: key, attempt: { attemptReveal(proxy) }, userScrolled: { abandonReveal() })
+            )
             .onChange(of: model.scrollCommand) {
                 cancelScroll()
                 if model.scrollCommand.toTop, let first = rows.first {

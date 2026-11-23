@@ -21,11 +21,17 @@ final class AppModel {
     var accountFilter: AccountID?
     private(set) var selection: SpaceKey?
     private(set) var loadedKey: SpaceKey?
-    private(set) var openMessages: [Message] = []
+    private(set) var openMessages: [Message] = [] {
+        didSet { rowsRevision &+= 1 }
+    }
     private(set) var openOutbox: [OutboxItem] = []
     private(set) var openMine: [MessageName: [Emoji: ReactionName]] = [:]
     private(set) var openThread: ThreadName?
-    private(set) var threadMessages: [Message] = []
+    private(set) var threadMessages: [Message] = [] {
+        didSet { rowsRevision &+= 1 }
+    }
+    /// Bumped whenever the loaded rows change, including a refreshed window with the same number of messages.
+    private(set) var rowsRevision = 0
     private(set) var isLoading = false
     /// Messages older than the cached window, fetched on demand for the open space only.
     private(set) var history: [Message] = []
@@ -338,19 +344,76 @@ final class AppModel {
     }
 
     func scrollOpenSpace(toTop: Bool) {
+        pendingReveal = nil
         scrollCommand = ScrollCommand(sequence: scrollCommand.sequence + 1, toTop: toTop)
     }
 
     /// A message the open conversation should scroll to, from the image preview's Show in Chat.
-    private(set) var revealedMessage: MessageName?
+    /// Bumped for each jump; the message list then looks at `pendingReveal(for:)`.
     private(set) var revealSequence = 0
+    /// A jump waiting until its message is in the conversation's list: the list may still be loading, or showing an
+    /// older cached window. It's delivered once the message is there, replaced by the next jump, dropped by a newer
+    /// navigation (another conversation or thread, closing the thread, a scroll command), and given up after
+    /// `revealPatience`.
+    @ObservationIgnored private var pendingReveal: PendingReveal?
+    static let revealPatience = Duration.seconds(10)
+
+    struct PendingReveal: Equatable {
+        let key: SpaceKey
+        let message: MessageName
+        /// The thread the message is a reply in; nil for a top-level message.
+        let thread: ThreadName?
+        let deadline: ContinuousClock.Instant
+    }
+
+    func pendingReveal(for key: SpaceKey) -> PendingReveal? {
+        guard let pending = pendingReveal, pending.key == key else { return nil }
+        guard ContinuousClock.now < pending.deadline else {
+            pendingReveal = nil
+            return nil
+        }
+        return pending
+    }
+
+    func revealDelivered(_ pending: PendingReveal) {
+        if pendingReveal == pending { pendingReveal = nil }
+    }
+
+    /// The user went somewhere else, so a jump still waiting for its row no longer applies.
+    func dropPendingReveal() {
+        pendingReveal = nil
+    }
+
+    /// The conversation's unread messages, read from the store when the unread list opens.
+    func unreadMessages(for key: SpaceKey) async -> UnreadMessages? {
+        guard let session = sessions[key.account] else { return nil }
+        return await StoreReader.unread(session: session, space: key.space)
+    }
+
+    /// Scrolls the open conversation to a message from the unread list, opening its thread first when it's a reply.
+    func reveal(_ message: Message) {
+        reveal(message.name, inThread: message.isThreadReply ? message.thread : nil)
+    }
+
+    /// Only a conversation that shows threads opens one for a reply; elsewhere replies are rows in the main list.
+    private func threadToOpen(_ thread: ThreadName?) -> ThreadName? {
+        guard let thread, let key = selection, isThreaded(key) else { return nil }
+        return thread
+    }
 
     /// Closes the preview and scrolls to `message`, opening its thread first when it's a reply.
     func showInConversation(_ message: MessageName) {
         preview = nil
         let loaded = openMessages.first { $0.name == message } ?? threadMessages.first { $0.name == message }
-        if let loaded, loaded.isThreadReply, let thread = loaded.thread { openThread(thread) }
-        revealedMessage = message
+        reveal(message, inThread: loaded?.isThreadReply == true ? loaded?.thread : nil)
+    }
+
+    private func reveal(_ message: MessageName, inThread reply: ThreadName?) {
+        guard let key = selection else { return }
+        let thread = threadToOpen(reply)
+        if let thread { openThread(thread) }
+        pendingReveal = PendingReveal(
+            key: key, message: message, thread: thread, deadline: .now + Self.revealPatience)
         revealSequence += 1
     }
 
@@ -510,6 +573,7 @@ final class AppModel {
             recent = Array(recent.prefix(3))
         }
         selection = key
+        pendingReveal = nil
         endEdits { $0.key != key }
         pendingDelete = nil
         openRole = nil
@@ -542,6 +606,7 @@ final class AppModel {
 
     func openThread(_ thread: ThreadName) {
         guard thread.space == selection?.space, openThread != thread else { return }
+        if pendingReveal?.thread != thread { pendingReveal = nil }
         if let old = openThread { endEdits { $0.thread == old } }
         openThread = thread
         newestVisibleReply = nil
@@ -551,6 +616,7 @@ final class AppModel {
     }
 
     func closeThread() {
+        pendingReveal = nil
         if let old = openThread { endEdits { $0.thread == old } }
         openThread = nil
         newestVisibleReply = nil
