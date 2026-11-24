@@ -60,6 +60,11 @@ final class AppModel {
     @ObservationIgnored private var sessions: [AccountID: AccountSession] = [:]
     @ObservationIgnored private(set) var world: FakeWorld?
     @ObservationIgnored private(set) var live: LiveAccounts?
+    /// Removes copies left by Open, for every account, once they're `ExportDirectory.maxAge` old: at launch, every
+    /// hour, and after the Mac wakes, so they go on time even when nothing else is opened.
+    @ObservationIgnored private var exportSweeper: ExportSweeper?
+    @ObservationIgnored private var exportSweeps: Task<Void, Never>?
+    @ObservationIgnored private var wakeObserver: (any NSObjectProtocol)?
     private var photoURLs: [AccountID: [UserName: URL]] = [:]
     private(set) var isSigningIn = false
     private(set) var signInError: String?
@@ -152,6 +157,7 @@ final class AppModel {
             root: LiveAccounts.defaultRoot(), notifications: notificationPoster(isFake: false))
         self.live = live
         AttachmentStaging.prune()
+        startExportSweeps(root: LiveAccounts.defaultRoot())
         savedClientProject = live.storedClient.map(Self.projectLabel)
         do {
             let report = try await live.manager.startup()
@@ -166,6 +172,23 @@ final class AppModel {
         }
         setAppActive(NSApplication.shared.isActive)
         phase = accounts.isEmpty ? .needsLogin : .running
+    }
+
+    /// Sweeps at launch, then hourly; a wake sweeps straight away, as the hourly wait may have slept through expiries.
+    private func startExportSweeps(root: URL) {
+        let sweeper = ExportSweeper {
+            try? ExportDirectory.pruneAll(root: root, changedBefore: Date().addingTimeInterval(-ExportDirectory.maxAge))
+        }
+        exportSweeper = sweeper
+        exportSweeps = Task {
+            await sweeper.request()
+            await sweeper.repeating(every: .seconds(60 * 60))
+        }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: nil
+        ) { _ in
+            Task { await sweeper.request() }
+        }
     }
 
     private func liveInfo(_ record: AccountRecord) -> AccountInfo {

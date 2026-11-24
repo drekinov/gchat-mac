@@ -68,8 +68,8 @@ enum AttachmentActions {
             return mediaActionFailureText(error)
         }
         guard NSWorkspace.shared.open(url) else {
-            // Nothing will read the copy, so it doesn't wait for logout to be wiped.
-            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+            // The copy stays: it's the attachment's stored one, perhaps with edits made in another app, and pruning
+            // removes it once it has gone unused for a day.
             return "No app on this Mac can open this file"
         }
         return nil

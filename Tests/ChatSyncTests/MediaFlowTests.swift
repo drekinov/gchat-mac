@@ -35,9 +35,9 @@ struct MediaFlowTests {
         }
 
         func loader(
-            redirectHosts: Set<String> = [], capacity: Int = 32 << 20, media: (any ChatMediaAPI)? = nil
+            redirectHosts: Set<String> = [], capacity: Int = 32 << 20, media: (any ChatMediaAPI)? = nil,
+            account: AccountID = AccountID()
         ) throws -> MediaLoader {
-            let account = AccountID()
             let directory = AccountDirectory(root: root, account: account)
             let key = StoreKey.random(for: account)
             _ = try SQLiteAccountStore.open(directory: directory, key: key)
@@ -328,6 +328,74 @@ struct MediaFlowTests {
         #expect(size > 0)
     }
 
+    @Test func openingAnAttachmentAgainReusesItsPath() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("hello pdf".utf8), contentType: "application/pdf", filename: "r.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let attachment = try #require(message.attachments.first)
+        let loader = try rig.loader()
+
+        let first = try await loader.export(attachment)
+        let second = try await loader.export(attachment)
+        #expect(first == second)
+        #expect(try Data(contentsOf: second) == Data("hello pdf".utf8))
+        let unique = try await loader.export(attachment, placement: .unique)
+        #expect(unique != first)
+    }
+
+    @MainActor @Test func theFileWorkOfAnExportRunsOffTheMainActor() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("hello pdf".utf8), contentType: "application/pdf", filename: "r.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let loader = try rig.loader()
+        let onMain = Recorder<Bool>()
+        loader.beforeExportWrite = { onMain.append(Thread.isMainThread) }
+
+        _ = try await loader.export(try #require(message.attachments.first))
+        #expect(onMain.all == [false])
+    }
+
+    @Test func aCallWhoseSessionEndedLeavesTheStoredCopyAlone() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("hello pdf".utf8), contentType: "application/pdf", filename: "r.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let attachment = try #require(message.attachments.first)
+        let loader = try rig.loader()
+        let stored = try await loader.export(attachment)
+        let gate = rig.h.gate
+        loader.afterExportWrite = { gate.retire() }
+
+        await #expect(throws: MediaLoadError.retired) { _ = try await loader.export(attachment) }
+        // Another session may be using it; logout's wipe is what removes it.
+        #expect(try Data(contentsOf: stored) == Data("hello pdf".utf8))
+    }
+
+    @Test func makingACopyRemovesThisAccountsOldCopies() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let account = AccountID()
+        let directory = AccountDirectory(root: rig.root, account: account)
+        try directory.createExports()
+        // A copy nobody has touched for two days, from before this run.
+        let old = directory.exportsURL.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: old, withIntermediateDirectories: false)
+        let oldFile = old.appendingPathComponent("old.pdf")
+        try Data("old".utf8).write(to: oldFile)
+        let twoDaysAgo = Date().addingTimeInterval(-2 * 86_400)
+        try FileManager.default.setAttributes([.modificationDate: twoDaysAgo], ofItemAtPath: oldFile.path)
+        try FileManager.default.setAttributes([.modificationDate: twoDaysAgo], ofItemAtPath: old.path)
+        let media = rig.h.server.addMedia(Data("hello pdf".utf8), contentType: "application/pdf", filename: "r.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let loader = try rig.loader(account: account)
+
+        let url = try await loader.export(try #require(message.attachments.first))
+        #expect(await poll { !FileManager.default.fileExists(atPath: old.path) })
+        #expect(FileManager.default.fileExists(atPath: url.path))
+    }
+
     @Test func redirectedDownloadsGoTokenlessThroughTheAllowlist() async throws {
         let rig = Rig()
         defer { try? FileManager.default.removeItem(at: rig.root) }
@@ -364,15 +432,38 @@ extension MediaFlowTests {
         let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
         let loader = try rig.loader()
         let gate = rig.h.gate
-        loader.afterExportWrite = { gate.retire() }
+        let exports = rig.root.appending(path: "exports")
+        let written = Recorder<Bool>()
+        // Logout starts once the copy is written, as it's about to be handed out.
+        loader.afterExportWrite = {
+            let files = FileManager.default.enumerator(atPath: exports.path)?.compactMap { $0 as? String } ?? []
+            written.append(files.contains { $0.hasSuffix("s.pdf") })
+            gate.retire()
+        }
 
         await #expect(throws: MediaLoadError.retired) {
             _ = try await loader.export(try #require(message.attachments.first))
         }
-        let exported =
+        #expect(written.all == [true])
+        let left =
             FileManager.default.enumerator(atPath: rig.root.appending(path: "exports").path)?
-            .compactMap { $0 as? String }.filter { $0.hasSuffix(".pdf") } ?? []
-        #expect(exported.isEmpty)
+            .compactMap { $0 as? String }.filter { $0.hasSuffix(".pdf") || $0.hasSuffix(".partial") } ?? []
+        #expect(left.isEmpty)
+    }
+
+    @Test func aSessionThatEndsAsTheExportComesBackIsNotOpened() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("secret".utf8), contentType: "application/pdf", filename: "s.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let loader = try rig.loader()
+        let gate = rig.h.gate
+        // Logout starts after the file work handed back the copy, before the caller gets it.
+        loader.beforeExportReturns = { gate.retire() }
+
+        await #expect(throws: MediaLoadError.retired) {
+            _ = try await loader.export(try #require(message.attachments.first))
+        }
     }
 
     @Test func exportAfterRetireDoesNothing() async throws {

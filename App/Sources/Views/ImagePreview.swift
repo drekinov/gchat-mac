@@ -446,7 +446,8 @@ struct ImagePreviewSheet: View {
         Task {
             let written: Bool
             do throws(MediaLoadError) {
-                let url = try await media.export(attachment)
+                // A copy of its own, so removing it can't take away the one Open gave another app.
+                let url = try await media.export(attachment, placement: .unique)
                 written = ImagePasteboard.copy(fileAt: url, contentType: attachment.contentType, shown: shown)
                 // The bytes are on the pasteboard now, so the exported file isn't needed.
                 try? FileManager.default.removeItem(at: url.deletingLastPathComponent())

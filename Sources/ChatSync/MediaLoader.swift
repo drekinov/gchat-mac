@@ -42,8 +42,12 @@ public final class MediaLoader: Sendable {
     let pipeline: ImagePipeline
     let fetcher: SafeFetcher
     let gate: SessionGate
+    /// Removes this account's copies that haven't changed for `ExportDirectory.maxAge`, asked for after each export;
+    /// a burst of exports costs at most two sweeps.
+    let sweeper: ExportSweeper
     private let inflight = Mutex<[String: Download]>([:])
     private let exportHook = Mutex<(@Sendable () -> Void)?>(nil)
+    private let returnHook = Mutex<(@Sendable () -> Void)?>(nil)
     private let exportsInFlight = ExportGuard()
 
     /// A download one caller started and others may wait on, with the size limit it was started with.
@@ -81,13 +85,19 @@ public final class MediaLoader: Sendable {
         inflight.withLock { $0[resource.rawValue]?.maxBytes }
     }
 
+    /// Test seam: runs once the file work has handed back a copy, before the session is checked one last time.
+    var beforeExportReturns: (@Sendable () -> Void)? {
+        get { returnHook.withLock { $0 } }
+        set { returnHook.withLock { $0 = newValue } }
+    }
+
     /// Test seam: runs after the export is registered and its reader opened, before any file is created.
     var beforeExportWrite: (@Sendable () -> Void)? {
         get { beforeHook.withLock { $0 } }
         set { beforeHook.withLock { $0 = newValue } }
     }
 
-    /// Test seam: runs between writing an export and re-checking the session.
+    /// Test seam: runs right before the session is checked for the last time, as a copy is about to be handed out.
     var afterExportWrite: (@Sendable () -> Void)? {
         get { exportHook.withLock { $0 } }
         set { exportHook.withLock { $0 = newValue } }
@@ -103,6 +113,9 @@ public final class MediaLoader: Sendable {
         self.pipeline = pipeline
         self.fetcher = fetcher
         self.gate = gate
+        sweeper = ExportSweeper {
+            try? exports.prune(changedBefore: Date().addingTimeInterval(-ExportDirectory.maxAge))
+        }
     }
 
     /// A display-size image for an uploaded attachment.
@@ -166,9 +179,14 @@ public final class MediaLoader: Sendable {
         }
     }
 
-    /// Decrypts into the account's quarantined exports directory for opening in another app. If the session is
-    /// retired while the file is written, the file is removed again: plaintext never outlives logout's wipe.
-    public func export(_ attachment: Attachment) async throws(MediaLoadError) -> URL {
+    /// Decrypts into the account's quarantined exports directory for opening in another app. By default an
+    /// attachment keeps one copy, which a later export hands back instead of writing another; `.unique` is for a
+    /// caller that deletes its copy right away. A copy is handed out only while the session is current, checked at
+    /// the last moment, so plaintext never outlives logout's wipe and a retired call never touches a copy another
+    /// session may be using.
+    public func export(
+        _ attachment: Attachment, placement: ExportDirectory.Placement = .shared
+    ) async throws(MediaLoadError) -> URL {
         guard let generation = gate.current else { throw .retired }
         let resource = try uploaded(attachment)
         try await ensureCached(resource, contentType: attachment.contentType, maxBytes: Self.maxFileBytes)
@@ -176,19 +194,37 @@ public final class MediaLoader: Sendable {
         // wipe always runs after it.
         guard exportsInFlight.begin(isCurrent: { gate.isCurrent(generation) }) else { throw .retired }
         defer { exportsInFlight.end() }
+        let url = try await writeExport(resource, attachment, placement, generation)
+        // The session may have ended while this call came back from the file work; the copy is then left for
+        // logout's wipe rather than opened.
+        beforeExportReturns?()
+        guard gate.isCurrent(generation) else { throw .retired }
+        Task { await sweeper.request() }
+        return url
+    }
+
+    /// The file work, off the caller's actor: Open runs on the main actor, and this can wait for pruning to let go
+    /// of the export tree.
+    @concurrent
+    private func writeExport(
+        _ resource: MediaResourceName, _ attachment: Attachment, _ placement: ExportDirectory.Placement,
+        _ generation: Generation
+    ) async throws(MediaLoadError) -> URL {
         let reader: MediaReader?
         do { reader = try cache.open(mediaID: resource.rawValue) } catch { throw .cache(error) }
         guard let reader else { throw .cache(.closed) }
         defer { reader.close() }
         beforeExportWrite?()
-        let url: URL
-        do { url = try exports.export(from: reader, filename: attachment.contentName) } catch { throw .export(error) }
-        afterExportWrite?()
-        guard gate.isCurrent(generation) else {
-            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        do {
+            return try exports.export(from: reader, filename: attachment.contentName, placement: placement) { stage in
+                if stage == .handingOut { afterExportWrite?() }
+                return gate.isCurrent(generation)
+            }
+        } catch .withdrawn {
             throw .retired
+        } catch {
+            throw .export(error)
         }
-        return url
     }
 
     /// Streams the decrypted file to a user-chosen location ("Save As…").
