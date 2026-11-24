@@ -16,6 +16,20 @@ public enum MediaLoadError: Error, Sendable, Equatable {
     case retired
 }
 
+extension MediaLoadError {
+    /// The file can't be shown here however often it's loaded: it's too large, in a form the image pipeline
+    /// refuses, or damaged. Retrying won't help, but another app may still open it.
+    public var needsAnotherApp: Bool {
+        switch self {
+        case .image(.tooLarge), .image(.tooManyFrames), .image(.unsupported), .image(.corrupt),
+            .transport(.responseTooLarge), .api(.transport(.responseTooLarge)):
+            true
+        default:
+            false
+        }
+    }
+}
+
 /// Attachments for one account: cached encrypted on first use, decoded through the shared budget, and exported
 /// (quarantined) for opening elsewhere. Cache commits go through the session gate.
 public final class MediaLoader: Sendable {
@@ -28,11 +42,44 @@ public final class MediaLoader: Sendable {
     let pipeline: ImagePipeline
     let fetcher: SafeFetcher
     let gate: SessionGate
-    private let inflight = Mutex<[String: Task<Void, any Error>]>([:])
+    private let inflight = Mutex<[String: Download]>([:])
     private let exportHook = Mutex<(@Sendable () -> Void)?>(nil)
     private let exportsInFlight = ExportGuard()
 
+    /// A download one caller started and others may wait on, with the size limit it was started with.
+    private struct Download: Sendable {
+        let maxBytes: Int
+        let task: Task<Void, any Error>
+        let link: DownloadLink
+    }
+
+    /// What a running download shares with the callers waiting on it: the largest limit among them, and the
+    /// larger attempt that took over if it stopped at its own limit.
+    private final class DownloadLink: Sendable {
+        private let state: Mutex<(wanted: Int, next: Download?)>
+
+        init(wanted: Int) { state = Mutex((wanted, nil)) }
+
+        var wanted: Int { state.withLock { $0.wanted } }
+        var next: Download? { state.withLock { $0.next } }
+
+        func want(_ limit: Int) { state.withLock { $0.wanted = max($0.wanted, limit) } }
+        func hand(to next: Download) { state.withLock { $0.next = next } }
+    }
+
     private let beforeHook = Mutex<(@Sendable () -> Void)?>(nil)
+    private let waitHook = Mutex<(@Sendable () async -> Void)?>(nil)
+
+    /// Test seam: runs, and is awaited, when a caller starts waiting on a download that another caller started.
+    var onWaitForDownload: (@Sendable () async -> Void)? {
+        get { waitHook.withLock { $0 } }
+        set { waitHook.withLock { $0 = newValue } }
+    }
+
+    /// Test seam: the size limit of the download running for `resource`, if there is one.
+    func runningDownloadLimit(_ resource: MediaResourceName) -> Int? {
+        inflight.withLock { $0[resource.rawValue]?.maxBytes }
+    }
 
     /// Test seam: runs after the export is registered and its reader opened, before any file is created.
     var beforeExportWrite: (@Sendable () -> Void)? {
@@ -194,29 +241,76 @@ public final class MediaLoader: Sendable {
         return data
     }
 
-    /// Downloads once even when several views ask at the same time.
+    /// Downloads once even when several views ask at the same time. A caller that allows a larger file than the
+    /// download already running waits for it; if that download stops at its smaller limit, a larger attempt takes
+    /// over and the caller waits for that one, so an export never fails with a thumbnail's size limit.
     func ensureCached(
         _ resource: MediaResourceName, contentType: String, maxBytes: Int
     ) async throws(MediaLoadError) {
         guard let generation = gate.current else { throw .retired }
-        if cache.contains(mediaID: resource.rawValue) { return }
         let key = resource.rawValue
-        let task = inflight.withLock { running -> Task<Void, any Error> in
-            if let existing = running[key] { return existing }
-            let task = Task { [self] in
-                try await self.download(resource, contentType: contentType, maxBytes: maxBytes, generation)
+        if cache.contains(mediaID: key) { return }
+        let joined = inflight.withLock { running -> (download: Download, started: Bool)? in
+            if let existing = running[key] {
+                existing.link.want(maxBytes)
+                return (existing, false)
             }
-            running[key] = task
-            return task
+            // A download can commit and leave the table between the check above and this lock. It commits before
+            // it leaves, so looking again here never starts a second download of a cached file.
+            if cache.contains(mediaID: key) { return nil }
+            let download = startDownload(resource, contentType: contentType, maxBytes: maxBytes, generation)
+            running[key] = download
+            return (download, true)
         }
-        defer { inflight.withLock { if $0[key] == task { $0[key] = nil } } }
-        do {
-            try await task.value
-        } catch let error as MediaLoadError {
-            throw error
-        } catch {
-            throw .retired
+        guard var (download, started) = joined else { return }
+        while true {
+            if !started { await onWaitForDownload?() }
+            switch await download.task.result {
+            case .success:
+                return
+            case .failure(let error as MediaLoadError):
+                // Stopped at a limit smaller than this caller's. The larger attempt that took over is followed
+                // directly, so its result arrives here even if it has already finished and left the table.
+                guard error == .api(.transport(.responseTooLarge)), download.maxBytes < maxBytes else { throw error }
+                guard let next = download.link.next else { throw gate.isCurrent(generation) ? error : .retired }
+                download = next
+                started = false
+            case .failure:
+                throw .retired
+            }
         }
+    }
+
+    /// Starts a download for the caller to put in the table while still holding `inflight`. The download leaves
+    /// the table itself as it finishes, so nobody joins a finished one. If it stops at its limit while a caller
+    /// waiting on it allows more, a larger attempt takes its place in the same step, so nothing smaller can start
+    /// in between.
+    private func startDownload(
+        _ resource: MediaResourceName, contentType: String, maxBytes: Int, _ generation: Generation
+    ) -> Download {
+        let key = resource.rawValue
+        let link = DownloadLink(wanted: maxBytes)
+        let task = Task { [self] in
+            var failure: MediaLoadError?
+            do throws(MediaLoadError) {
+                try await self.download(resource, contentType: contentType, maxBytes: maxBytes, generation)
+            } catch {
+                failure = error
+            }
+            inflight.withLock { running in
+                guard running[key]?.link === link else { return }
+                let wanted = link.wanted
+                if failure == .api(.transport(.responseTooLarge)), wanted > maxBytes, gate.isCurrent(generation) {
+                    let next = startDownload(resource, contentType: contentType, maxBytes: wanted, generation)
+                    link.hand(to: next)
+                    running[key] = next
+                } else {
+                    running[key] = nil
+                }
+            }
+            if let failure { throw failure }
+        }
+        return Download(maxBytes: maxBytes, task: task, link: link)
     }
 
     func download(

@@ -209,9 +209,11 @@ struct AvatarDownloadTests {
         #expect(decoded.image.width <= 64 && decoded.image.width > 0)
     }
 
-    @Test func aBudgetTooSmallForAPhotoIsABudgetError() async throws {
+    @Test func aBudgetTooSmallForAPhotoIsTooLarge() async throws {
         let (loader, root) = try loader(budget: 1024)
         defer { try? FileManager.default.removeItem(at: root) }
-        await #expect(throws: MediaLoadError.image(.budget)) { _ = try await loader.avatar(at: url, maxPixelSize: 64) }
+        await #expect(throws: MediaLoadError.image(.tooLarge)) {
+            _ = try await loader.avatar(at: url, maxPixelSize: 64)
+        }
     }
 }

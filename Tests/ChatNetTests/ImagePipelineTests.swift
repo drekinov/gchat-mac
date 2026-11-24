@@ -154,9 +154,9 @@ extension MemorySensitive {
             }
         }
 
-        @Test func budgetTooSmallForThePeakIsABudgetError() async {
+        @Test func aPeakLargerThanTheWholeBudgetIsTooLarge() async {
             let (pipeline, _) = pipeline(capacity: 10_000)
-            await #expect(throws: ImageError.budget) {
+            await #expect(throws: ImageError.tooLarge) {
                 _ = try await pipeline.thumbnail(from: Fixtures.png(400, 400), maxPixelSize: 400)
             }
         }

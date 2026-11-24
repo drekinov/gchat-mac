@@ -20,11 +20,13 @@ public struct ImageLimits: Sendable, Equatable {
 }
 
 public enum ImageError: Error, Sendable, Equatable {
+    /// Over the byte or pixel limits, the estimated decode peak is larger than the whole memory budget, or the
+    /// decoded image came out larger than estimated.
     case tooLarge
     case tooManyFrames
     case unsupported
     case corrupt
-    /// The estimated peak can never fit the memory budget, or didn't fit in time while other memory was held.
+    /// The memory wasn't free in time while other memory was held. Waiting may help; `.tooLarge` never does.
     case budget
     case cancelled
 }
@@ -107,7 +109,7 @@ public final class ImagePipeline: Sendable {
     }
 
     /// Admits `byteCount` encoded bytes before any of them are allocated. Fails with `.tooLarge` over
-    /// `limits.maxBytes` without touching the budget, and with `.budget` if the budget can never hold them.
+    /// `limits.maxBytes` without touching the budget, or if the budget can never hold them.
     public func reserveEncoded(byteCount: Int) async throws(ImageError) -> EncodedAdmission {
         guard byteCount > 0 else { throw .corrupt }
         guard byteCount <= limits.maxBytes else { throw .tooLarge }
@@ -163,14 +165,15 @@ public final class ImagePipeline: Sendable {
         let working: Reservation
         if let admission {
             guard data.count <= admission.byteCount else { throw .tooLarge }
-            guard admission.byteCount + plan.workspace + plan.output <= budget.capacity else { throw .budget }
+            guard admission.byteCount + plan.workspace + plan.output <= budget.capacity else { throw .tooLarge }
             working = try await reserve(plan.workspace + plan.output, timeout: heldWaitTimeout)
         } else {
             working = try await reserve(data.count + plan.workspace + plan.output)
         }
         let image = try Self.decode(source, index: 0, targetSize: plan.target)
         let actual = image.bytesPerRow * image.height
-        guard actual <= plan.output else { throw .budget }
+        // Larger than estimated for this file and size, which no amount of waiting changes.
+        guard actual <= plan.output else { throw .tooLarge }
         working.shrink(to: actual)
         return DecodedImage(image: image, reservation: working)
     }
@@ -187,7 +190,7 @@ public final class ImagePipeline: Sendable {
         let base: Reservation
         if let admission {
             guard data.count <= admission.byteCount else { throw .tooLarge }
-            guard admission.byteCount + extra <= budget.capacity else { throw .budget }
+            guard admission.byteCount + extra <= budget.capacity else { throw .tooLarge }
             holds.append(admission.reservation)
             base = try await reserve(extra, timeout: heldWaitTimeout)
         } else {
@@ -208,6 +211,9 @@ public final class ImagePipeline: Sendable {
             return try await budget.reserve(bytes)
         } catch is CancellationError {
             throw .cancelled
+        } catch MemoryBudgetError.exceedsCapacity(_, _) {
+            // More than the whole budget, so no amount of waiting makes it fit.
+            throw .tooLarge
         } catch {
             throw .budget
         }
@@ -419,9 +425,10 @@ public final class AnimatedImage: Sendable {
             pool.give(slot)
             throw error
         }
+        // A frame larger than its slot is too large every time; only a slot that's busy is worth waiting for.
         guard image.bytesPerRow * image.height <= slot.bytes else {
             pool.give(slot)
-            throw .budget
+            throw .tooLarge
         }
         let frame = DecodedFrame(image: image, reservation: slot, pool: pool)
         cache.withLock { frames in
