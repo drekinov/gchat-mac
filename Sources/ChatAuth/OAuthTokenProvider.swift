@@ -17,6 +17,8 @@ public actor OAuthTokenProvider: TokenProvider {
     var access: (token: String, expires: Timestamp)?
     /// The single in-flight refresh. Its result is applied exactly once, inside the task, before it is cleared.
     var refreshing: Task<String, any Error>?
+    /// Callers currently awaiting a refresh; tests use it to tell when every caller has joined.
+    var refreshWaiters = 0
     var revoked = false
 
     public init(
@@ -43,6 +45,8 @@ public actor OAuthTokenProvider: TokenProvider {
         }
         if let access, access.expires > clock() { return access.token }
         let task = refreshing ?? startRefresh()
+        refreshWaiters += 1
+        defer { refreshWaiters -= 1 }
         do {
             return try await task.value
         } catch let error as ChatAPIError {

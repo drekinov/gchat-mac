@@ -59,22 +59,26 @@ struct AuthTransportTests {
     }
 
     static var credentialedURL: String {
-        var parts = URLComponents(string: "https://chat.googleapis.com/x")!
+        var parts = URLComponents(string: "https://chat.googleapis.com/rej/credentials")!
         parts.user = "sample"
         parts.password = UUID().uuidString
         return parts.url!.absoluteString
     }
 
     @Test(arguments: [
-        "http://chat.googleapis.com/x", "https://evil.example/x", "https://chat.googleapis.com.evil.example/x",
-        AuthTransportTests.credentialedURL,
+        ("http://chat.googleapis.com/rej/scheme", TransportError.insecureScheme),
+        ("https://evil.example/rej/foreign", .hostNotAllowed),
+        ("https://chat.googleapis.com.evil.example/rej/suffix", .hostNotAllowed),
+        (AuthTransportTests.credentialedURL, .hostNotAllowed),
     ])
-    func rejectsBeforeAnyRequest(url: String) async {
-        let before = StubProtocol.seen.withLock { $0.count }
-        await #expect(throws: TransportError.self) {
-            try await transport.send(HTTPRequest(url: URL(string: url)!))
+    func rejectsBeforeAnyRequest(url: String, error: TransportError) async throws {
+        let target = try #require(URL(string: url))
+        let marker = target.path()
+        route(marker, .init(status: 200, body: Data("{}".utf8)))
+        await #expect(throws: error) {
+            try await transport.send(HTTPRequest(url: target))
         }
-        #expect(StubProtocol.seen.withLock { $0.count } == before)
+        #expect(StubProtocol.seen.withLock { $0.filter { $0.url?.path == marker }.isEmpty })
     }
 
     @Test func redirectIsAnErrorWithLocationAndNotFollowed() async throws {

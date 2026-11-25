@@ -91,6 +91,9 @@ public final class MediaLoader: Sendable {
         set { returnHook.withLock { $0 = newValue } }
     }
 
+    /// Test seam: how many `close` calls are waiting for running exports to finish.
+    var exportCloseWaiters: Int { exportsInFlight.waiterCount }
+
     /// Test seam: runs after the export is registered and its reader opened, before any file is created.
     var beforeExportWrite: (@Sendable () -> Void)? {
         get { beforeHook.withLock { $0 } }
@@ -421,6 +424,8 @@ final class ExportGuard: Sendable {
         }
         for waiter in waiters { waiter() }
     }
+
+    var waiterCount: Int { state.withLock { $0.waiters.count } }
 
     func closeAndWait(timeout: Duration) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in

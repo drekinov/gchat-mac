@@ -65,11 +65,13 @@ extension OAuthNetworkTests {
         }
 
         @Test func expiryCountsFromRequestStartNotResponseArrival() async throws {
-            fake.configure { $0.latency = .milliseconds(250) }
+            fake.holdTokens()
+            defer { fake.releaseTokens() }
             let provider = try provider()
             let pending = Task { await fetchToken(provider) }
-            #expect(await eventually { fake.tokenRequests().count == 1 })
+            try #require(await eventually { fake.parkedTokenResponses == 1 })
             clock.advance(seconds: 200)
+            fake.releaseTokens()
             let first = try await pending.value.get()
             clock.advance(seconds: 3339)
             #expect(try await fetchToken(provider).get() == first)
@@ -86,14 +88,18 @@ extension OAuthNetworkTests {
         }
 
         @Test func concurrentCallsShareOneRefresh() async throws {
-            fake.configure { $0.latency = .milliseconds(300) }
+            fake.holdTokens()
+            defer { fake.releaseTokens() }
             let provider = try provider()
-            let tokens = await withTaskGroup(of: Result<String, ChatAPIError>.self) { group in
+            let (joined, tokens) = await withTaskGroup(of: Result<String, ChatAPIError>.self) { group in
                 for _ in 0..<12 { group.addTask { await fetchToken(provider) } }
+                let joined = await eventuallyAsync { await provider.refreshWaiters == 12 }
+                fake.releaseTokens()
                 var all: [Result<String, ChatAPIError>] = []
                 for await result in group { all.append(result) }
-                return all
+                return (joined, all)
             }
+            try #require(joined)
             let values = try tokens.map { try $0.get() }
             #expect(values.count == 12)
             #expect(Set(values).count == 1)
@@ -101,15 +107,19 @@ extension OAuthNetworkTests {
         }
 
         @Test func concurrentCallsAllFailTogetherAndAllowALaterRetry() async throws {
-            fake.configure { $0.latency = .milliseconds(150) }
+            fake.holdTokens()
+            defer { fake.releaseTokens() }
             let provider = try provider()
             fake.script(.network(.networkConnectionLost))
-            let results = await withTaskGroup(of: Result<String, ChatAPIError>.self) { group in
+            let (joined, results) = await withTaskGroup(of: Result<String, ChatAPIError>.self) { group in
                 for _ in 0..<5 { group.addTask { await fetchToken(provider) } }
+                let joined = await eventuallyAsync { await provider.refreshWaiters == 5 }
+                fake.releaseTokens()
                 var all: [Result<String, ChatAPIError>] = []
                 for await result in group { all.append(result) }
-                return all
+                return (joined, all)
             }
+            try #require(joined)
             #expect(results.allSatisfy { $0 == .failure(.transport(.connectionLost)) })
             #expect(fake.tokenRequests().count == 1)
             #expect(try await fetchToken(provider).get().hasPrefix("at-"))
@@ -254,29 +264,29 @@ extension OAuthNetworkTests {
         }
 
         @Test func rotationArrivingAfterRetireIsNotWritten() async throws {
-            fake.configure {
-                $0.rotateRefreshTokens = true
-                $0.latency = .milliseconds(300)
-            }
+            fake.configure { $0.rotateRefreshTokens = true }
+            fake.holdTokens()
+            defer { fake.releaseTokens() }
             let provider = try provider()
             let pending = Task { await fetchToken(provider) }
-            #expect(await eventually { fake.tokenRequests().count == 1 })
+            try #require(await eventually { fake.parkedTokenResponses == 1 })
             gate.retire()
+            fake.releaseTokens()
             #expect(await pending.value == .failure(.noCredentials))
             #expect(try storedRefreshToken() == refreshToken)
             #expect(await provider.refreshToken == refreshToken)
         }
 
         @Test func retireDuringRefreshAfterLogoutDeleteDoesNotResurrectTheEntry() async throws {
-            fake.configure {
-                $0.rotateRefreshTokens = true
-                $0.latency = .milliseconds(300)
-            }
+            fake.configure { $0.rotateRefreshTokens = true }
+            fake.holdTokens()
+            defer { fake.releaseTokens() }
             let provider = try provider()
             let pending = Task { await fetchToken(provider) }
-            #expect(await eventually { fake.tokenRequests().count == 1 })
+            try #require(await eventually { fake.parkedTokenResponses == 1 })
             gate.retire()
             try vault.delete(account)
+            fake.releaseTokens()
             _ = await pending.value
             #expect(try vault.load(account) == nil)
             #expect(store.storedIDs.isEmpty)

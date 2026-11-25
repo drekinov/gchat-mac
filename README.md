@@ -1,5 +1,7 @@
 # Thimble
 
+[![CI](https://github.com/drekinov/gchat-mac/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/drekinov/gchat-mac/actions/workflows/ci.yml)
+
 Thimble is a native Mac app for Google Chat™. Keep several Google Workspace accounts in one inbox, reply in threads,
 share attachments, and search message history. Each conversation shows which account you’re sending from.
 

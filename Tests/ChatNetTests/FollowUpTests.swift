@@ -97,10 +97,13 @@ extension Fixtures {
     @Test func aTimerFiringBeforeTheWaiterIsQueuedStillTimesOut() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(100)
+        let queuedWhenFired = Mutex<Int?>(nil)
         let outcome = await withTaskGroup(of: String.self) { group in
             group.addTask {
                 do {
-                    _ = try await budget.reserve(50, timeout: .milliseconds(1)) { Thread.sleep(forTimeInterval: 0.1) }
+                    _ = try await budget.reserve(50, timeout: .milliseconds(1)) {
+                        queuedWhenFired.withLock { $0 = budget.waiterCount }
+                    }
                     return "granted"
                 } catch MemoryBudgetError.timedOut {
                     return "timedOut"
@@ -109,7 +112,7 @@ extension Fixtures {
                 }
             }
             group.addTask {
-                try? await Task.sleep(for: .seconds(3))
+                try? await Task.sleep(for: .seconds(10))
                 return "hung"
             }
             let first = await group.next()!
@@ -117,6 +120,7 @@ extension Fixtures {
             return first
         }
         #expect(outcome == "timedOut")
+        #expect(queuedWhenFired.withLock { $0 } == 1)
         held.release()
         #expect(await budget.available == 100)
     }
@@ -134,14 +138,23 @@ extension Fixtures {
     @Test func aTimeoutDoesNotDisturbTheQueueBehindIt() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(90)
-        let behind = Task { try await budget.reserve(5) }
-        try await Task.sleep(for: .milliseconds(20))
-        await #expect(throws: MemoryBudgetError.timedOut) {
-            _ = try await budget.reserve(50, timeout: .milliseconds(50))
+        let (expiry, fire) = AsyncStream<Void>.makeStream()
+        defer { fire.finish() }
+        let head = Task {
+            try await budget.reserve(50, timeout: .milliseconds(1)) {
+                for await _ in expiry {}
+            }
         }
-        held.release()
+        try #require(await waitUntil { budget.waiterCount == 1 })
+        let behind = Task { try await budget.reserve(5) }
+        try #require(await waitUntil { budget.waiterCount == 2 })
+        fire.finish()
+        await #expect(throws: MemoryBudgetError.timedOut) { _ = try await head.value }
+        try #require(await waitUntil { budget.waiterCount == 0 })
         let granted = try await behind.value
         #expect(granted.bytes == 5)
+        #expect(held.bytes == 90)
+        #expect(await budget.available == 5)
     }
 }
 
@@ -208,13 +221,13 @@ extension Fixtures {
         let url = directory.appending(path: "t.bin")
         try Data(repeating: 1, count: 4000).write(to: url)
         HookedBodyProtocol.beforeResponse.withLock {
-            $0 = {
+            $0["/up/late-change"] = {
                 let handle = try? FileHandle(forWritingTo: url)
                 try? handle?.write(contentsOf: Data(repeating: 2, count: 4000))
                 try? handle?.close()
             }
         }
-        defer { HookedBodyProtocol.beforeResponse.withLock { $0 = nil } }
+        defer { HookedBodyProtocol.beforeResponse.withLock { $0["/up/late-change"] = nil } }
         let transport = AuthTransport(allowedHosts: ["chat.googleapis.com"], protocolClasses: [HookedBodyProtocol.self])
         await #expect(throws: TransportError.requestBodyUnavailable) {
             try await transport.send(

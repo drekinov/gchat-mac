@@ -840,7 +840,7 @@ struct SessionNotificationTests {
         await session.start()
         let synced = await recorder.wait { $0.status == .ok && $0.spaces.contains { $0.name == space } }
         #expect(synced != nil)
-        try await Task.sleep(for: .milliseconds(100))
+        try #require(await notifierCaughtUp(session, after: 0))
         #expect(poster.posted.all.isEmpty, "history is never announced")
 
         server.advance(.seconds(1))
@@ -850,11 +850,12 @@ struct SessionNotificationTests {
         #expect(poster.posted.all.first?.body == "Bob: new one")
 
         await session.setFocus(space)
+        let passes = await session.notifyPasses
         server.advance(.seconds(1))
         server.post("while looking", in: space, from: .account(bob))
         server.advance(.seconds(5))
         #expect(await poll { ((try? session.messages(in: space)) ?? []).contains { $0.text == "while looking" } })
-        try await Task.sleep(for: .milliseconds(100))
+        try #require(await notifierCaughtUp(session, after: passes))
         #expect(poster.posted.all.count == 1)
 
         await session.setAppActive(false)
@@ -866,6 +867,16 @@ struct SessionNotificationTests {
 
         recorder.cancel()
         _ = await session.logout(refreshToken: nil)
+    }
+
+    /// True once a notifier pass newer than `passes` has finished and nothing is queued behind it.
+    func notifierCaughtUp(_ session: AccountSession, after passes: UInt64) async -> Bool {
+        await pollAsync {
+            let done = await session.notifyPasses
+            let running = await session.notifyRunning
+            let pending = await session.notifyPending.isEmpty
+            return done > passes && !running && pending
+        }
     }
 }
 

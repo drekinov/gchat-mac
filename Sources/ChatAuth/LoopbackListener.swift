@@ -27,6 +27,7 @@ public final class LoopbackListener: Sendable {
         var result: Result<URLComponents, LoopbackError>?
         var waiter: CheckedContinuation<URLComponents, any Error>?
         var connections: [ObjectIdentifier: NWConnection] = [:]
+        var refused = 0
     }
 
     private init(listener: NWListener, port: UInt16, queue: DispatchQueue, expectedState: String?) {
@@ -122,6 +123,8 @@ public final class LoopbackListener: Sendable {
     }
 
     var openConnections: Int { state.withLock { $0.connections.count } }
+    var refusedConnections: Int { state.withLock { $0.refused } }
+    var hasWaiter: Bool { state.withLock { $0.waiter != nil } }
 
     public func cancel() {
         finish(.failure(.cancelled))
@@ -167,7 +170,10 @@ public final class LoopbackListener: Sendable {
     private func handle(_ connection: NWConnection) {
         let id = ObjectIdentifier(connection)
         let accepted = state.withLock { state -> Bool in
-            guard state.result == nil, state.connections.count < Self.maxConnections else { return false }
+            guard state.result == nil, state.connections.count < Self.maxConnections else {
+                state.refused += 1
+                return false
+            }
             state.connections[id] = connection
             return true
         }

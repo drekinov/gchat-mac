@@ -50,34 +50,44 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
         }
     }
 
+    struct Rejection: Sendable, CustomTestStringConvertible {
+        let target: String
+        let error: TransportError
+        /// False for hosts that fail only because they are missing from the allowlist.
+        var allowHost = true
+
+        var marker: String { URL(string: target)!.path() }
+        var testDescription: String { target }
+    }
+
     @Test(arguments: [
-        "http://media.example.com/sf/x",
-        "https://user@media.example.com/sf/x",
-        "https://user:pw@media.example.com/sf/x",
-        "https://media.example.com:8443/sf/x",
-        "https://evil.example.com/sf/x",
-        "https://media.example.com.evil.example/sf/x",
-        "https://127.0.0.1/sf/x",
-        "https://2130706433/sf/x",
-        "https://127.1/sf/x",
-        "https://0x7f.0.0.1/sf/x",
-        "https://[::1]/sf/x",
-        "https://[::ffff:127.0.0.1]/sf/x",
-        "https://localhost/sf/x",
-        "https://foo.localhost/sf/x",
-        "https://printer.local/sf/x",
-        "https://intranet/sf/x",
+        Rejection(target: "http://media.example.com/sf/rej/scheme", error: .insecureScheme),
+        Rejection(target: "https://user@media.example.com/sf/rej/user", error: .hostNotAllowed),
+        Rejection(target: "https://user:pw@media.example.com/sf/rej/password", error: .hostNotAllowed),
+        Rejection(target: "https://media.example.com:8443/sf/rej/port", error: .hostNotAllowed),
+        Rejection(target: "https://evil.example.com/sf/rej/foreign", error: .hostNotAllowed, allowHost: false),
+        Rejection(
+            target: "https://media.example.com.evil.example/sf/rej/suffix", error: .hostNotAllowed, allowHost: false),
+        Rejection(target: "https://127.0.0.1/sf/rej/v4", error: .hostNotAllowed),
+        Rejection(target: "https://2130706433/sf/rej/v4-integer", error: .hostNotAllowed),
+        Rejection(target: "https://127.1/sf/rej/v4-short", error: .hostNotAllowed),
+        Rejection(target: "https://0x7f.0.0.1/sf/rej/v4-hex", error: .hostNotAllowed),
+        Rejection(target: "https://[::1]/sf/rej/v6", error: .hostNotAllowed),
+        Rejection(target: "https://[::ffff:127.0.0.1]/sf/rej/v6-mapped", error: .hostNotAllowed),
+        Rejection(target: "https://localhost/sf/rej/localhost", error: .hostNotAllowed),
+        Rejection(target: "https://foo.localhost/sf/rej/sub-localhost", error: .hostNotAllowed),
+        Rejection(target: "https://printer.local/sf/rej/mdns", error: .hostNotAllowed),
+        Rejection(target: "https://intranet/sf/rej/single-label", error: .hostNotAllowed),
     ])
-    func rejectsBeforeAnyRequest(target: String) async {
-        let allowEverything: Set<String> = Self.hosts.union([
-            "127.0.0.1", "2130706433", "127.1", "0x7f.0.0.1", "::1", "::ffff:127.0.0.1", "localhost", "foo.localhost",
-            "printer.local", "intranet",
-        ])
-        let before = FetchStubProtocol.seen.withLock { $0.count }
-        await #expect(throws: TransportError.self) {
-            try await fetcher(hosts: allowEverything).fetch(url(target))
+    func rejectsBeforeAnyRequest(_ rejection: Rejection) async throws {
+        let parsed = try #require(URL(string: rejection.target))
+        let host = try #require(parsed.host()?.lowercased())
+        let hosts = rejection.allowHost ? Self.hosts.union([host]) : Self.hosts
+        route(rejection.marker, .init(status: 200, body: Data("leak".utf8)))
+        await #expect(throws: rejection.error) {
+            try await fetcher(hosts: hosts).fetch(parsed)
         }
-        #expect(FetchStubProtocol.seen.withLock { $0.count } == before)
+        #expect(FetchStubProtocol.seen.withLock { $0.filter { $0.url?.path == rejection.marker }.isEmpty })
     }
 
     @Test func schemeFailureIsDistinct() async {

@@ -44,12 +44,19 @@ struct ConnectivityRig: Sendable {
         return await recorder.wait { $0.status == .ok && $0.spaces.contains { $0.name == space } } != nil
     }
 
-    /// Lets the loop settle on frozen time, so a request count stops moving unless something reset the schedule.
-    func settle() async throws { try await Task.sleep(for: .milliseconds(150)) }
+    /// Waits for a loop pass that began after this call to finish, so on frozen time a request count stops moving
+    /// unless something reset the schedule.
+    func settle() async throws {
+        let session = session
+        let start = await session.loopPasses
+        let passed = await pollAsync { await session.loopPasses >= start &+ 2 }
+        try #require(passed, "the polling loop stopped")
+    }
 
     func shutdown() async { _ = await session.logout(refreshToken: nil) }
 
     func rateLimitTheNextTick(retryAfter: Int = 30) async -> Bool {
+        guard await nextSidebar() != nil else { return false }
         server.fail(.rateLimited(route: .listSpaces, retryAfter: retryAfter))
         let seen = recorder.history.count
         server.advance(.seconds(1))
@@ -86,6 +93,7 @@ struct ConnectivityTests {
     @Test func aWakeWhileOfflineOnlyMarksTheCatchUpAndItRunsOnReconnect() async throws {
         let rig = ConnectivityRig()
         #expect(await rig.startAndSync())
+        _ = try #require(await rig.nextSidebar())
         let restarts = Recorder<Int>()
         await rig.session.setEventChannelRestart { restarts.append(1) }
         await rig.session.setConnectivity(.unreachable)
@@ -115,6 +123,7 @@ struct ConnectivityTests {
         let restarts = Recorder<Int>()
         await rig.session.setEventChannelRestart { restarts.append(1) }
         let lists = rig.calls.count("listSpaces")
+        _ = try #require(await rig.nextSidebar())
         rig.barrier.arm()
         rig.server.advance(.seconds(1))
         #expect(await rig.barrier.waitForArrival())
@@ -137,12 +146,11 @@ struct ConnectivityTests {
         await rig.session.setConnectivity(.unreachable)
 
         let item = try await rig.session.send("while away", in: rig.space, thread: nil)
-        try await rig.settle()
+        #expect(await pollAsync { await rig.session.blockedDrains == [rig.space] })
 
         #expect(rig.calls.count("createMessage") == 0)
         let held = try #require(try rig.session.outbox(in: rig.space).first)
         #expect(held.id == item.id && held.state == .queued && held.attempts == 0)
-        #expect(await rig.session.blockedDrains == [rig.space])
 
         await rig.session.setConnectivity(.reachable)
         #expect(await poll { rig.server.messages(in: rig.space).contains { $0.text == "while away" } })
@@ -156,10 +164,10 @@ struct ConnectivityTests {
         #expect(await rig.startAndSync())
         #expect(await rig.rateLimitTheNextTick())
         let deadline = try #require(await rig.session.retryUntil)
+        let lists = rig.calls.count("listSpaces")
 
         await rig.session.setConnectivity(.unreachable)
         await rig.session.setConnectivity(.reachable)
-        let lists = rig.calls.count("listSpaces")
         try await rig.settle()
 
         #expect(await rig.session.retryUntil == deadline)
@@ -182,9 +190,8 @@ struct ConnectivityTests {
         #expect(await rig.rateLimitTheNextTick())
 
         try await rig.session.send("patient", in: rig.space, thread: nil)
-        try await rig.settle()
+        #expect(await pollAsync { await rig.session.blockedDrains == [rig.space] })
         #expect(rig.calls.count("createMessage") == 0)
-        #expect(await rig.session.blockedDrains == [rig.space])
 
         rig.server.advance(.seconds(31))
         #expect(await poll { rig.server.messages(in: rig.space).contains { $0.text == "patient" } })
@@ -195,10 +202,11 @@ struct ConnectivityTests {
     @Test func aStaleOfflineResultFromBeforeAReconnectIsIgnored() async throws {
         let rig = ConnectivityRig()
         #expect(await rig.startAndSync())
+        try #require(await rig.nextSidebar() != nil)
         rig.server.fail(.networkError(.notConnectedToInternet, route: .listSpaces))
         rig.barrier.arm()
         rig.server.advance(.seconds(1))
-        #expect(await rig.barrier.waitForArrival())
+        try #require(await rig.barrier.waitForArrival())
 
         await rig.session.setConnectivity(.unreachable)
         await rig.session.setConnectivity(.reachable)
@@ -206,10 +214,14 @@ struct ConnectivityTests {
         rig.barrier.release()
 
         #expect(await poll { rig.calls.count("listSpaces") > lists }, "the stale result blocked the catch-up")
-        try await rig.settle()
-        #expect(await rig.session.offlineUntil == nil)
-        #expect(await rig.session.offlineFailures == 0)
-        #expect(await rig.session.status == .ok)
+        let session = rig.session
+        let recovered = await pollAsync {
+            let offline = await session.offlineUntil
+            let failures = await session.offlineFailures
+            let status = await session.status
+            return offline == nil && failures == 0 && status == .ok
+        }
+        #expect(recovered, "the stale offline result was applied after the reconnect")
         await rig.shutdown()
     }
 
@@ -234,6 +246,7 @@ struct ConnectivityTests {
     @Test func aCurrentOfflineResultStillBacksOff() async throws {
         let rig = ConnectivityRig()
         #expect(await rig.startAndSync())
+        _ = try #require(await rig.nextSidebar())
         rig.server.fail(.networkError(.notConnectedToInternet, route: .listSpaces))
         rig.server.advance(.seconds(1))
 
@@ -309,6 +322,8 @@ struct ConnectivityTests {
     func aLoginRequirementSurvivesTransportErrorsInEitherOrder(_ authFirst: Bool) async throws {
         let rig = ConnectivityRig()
         #expect(await rig.startAndSync())
+        _ = try #require(await rig.nextSidebar())
+        let lists = rig.calls.count("listSpaces")
         let generation = try #require(rig.session.gate.current)
         let epoch = await rig.session.connectivityEpoch
         let offline = SyncError.api(.transport(.offline), .listSpaces)
@@ -323,7 +338,6 @@ struct ConnectivityTests {
 
         #expect(await rig.session.status == .needsLogin)
         #expect(await rig.session.admitted == false)
-        let lists = rig.calls.count("listSpaces")
         try await rig.settle()
         #expect(rig.calls.count("listSpaces") == lists, "a cleared deadline reopened admission while signed out")
 
