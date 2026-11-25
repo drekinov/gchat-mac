@@ -21,17 +21,32 @@ private func image() async throws -> DecodedImage {
     return DecodedImage(image: try #require(context.makeImage()), reservation: reservation)
 }
 
-/// A scripted fetch: each call takes the next outcome, optionally after `gate` opens.
+/// A scripted fetch: each call takes the next outcome, once `open()` has been called if the script is held.
 private final class Script: Sendable {
+    private struct Hold {
+        var open: Bool
+        var parked: [CheckedContinuation<Void, Never>] = []
+    }
+
     let calls = Atomic<Int>(0)
     let running = Atomic<Int>(0)
     let peak = Atomic<Int>(0)
     let outcomes: Mutex<[Result<Void, MediaLoadError>]>
-    let hold: Duration
+    private let hold: Mutex<Hold>
 
-    init(_ outcomes: [Result<Void, MediaLoadError>], hold: Duration = .zero) {
+    init(_ outcomes: [Result<Void, MediaLoadError>], held: Bool = false) {
         self.outcomes = Mutex(outcomes)
-        self.hold = hold
+        hold = Mutex(Hold(open: !held))
+    }
+
+    /// Lets every parked and later fetch through.
+    func open() {
+        let parked = hold.withLock { hold in
+            hold.open = true
+            defer { hold.parked = [] }
+            return hold.parked
+        }
+        for continuation in parked { continuation.resume() }
     }
 
     var fetch: AvatarLoads.Fetch {
@@ -40,7 +55,13 @@ private final class Script: Sendable {
             let now = self.running.add(1, ordering: .acquiringAndReleasing).newValue
             self.peak.max(now, ordering: .acquiringAndReleasing)
             defer { self.running.subtract(1, ordering: .acquiringAndReleasing) }
-            if self.hold > .zero { try? await Task.sleep(for: self.hold) }
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let go = self.hold.withLock { hold in
+                    if !hold.open { hold.parked.append(continuation) }
+                    return hold.open
+                }
+                if go { continuation.resume() }
+            }
             let next = self.outcomes.withLock { $0.isEmpty ? .success(()) : $0.removeFirst() }
             if case .failure(let error) = next { throw error }
             guard let made = try? await image() else { throw .image(.corrupt) }
@@ -51,47 +72,67 @@ private final class Script: Sendable {
 
 private let noWait: @Sendable (Duration) async throws -> Void = { _ in }
 
+/// Opens `script` after a while, so a regression that waits on it fails its assertions instead of hanging.
+private func watchdog(_ script: Script) -> Task<Void, Never> {
+    Task {
+        try? await Task.sleep(for: .seconds(5))
+        script.open()
+    }
+}
+
 struct AvatarLoadsTests {
-    @Test func callersShareOneDownload() async {
+    @Test func callersShareOneDownload() async throws {
         let loads = AvatarLoads(sleep: noWait)
-        let script = Script([], hold: .milliseconds(50))
+        let script = Script([], held: true)
         let fetch = script.fetch
-        let results = await withTaskGroup(of: Bool.self) { group in
-            for _ in 0..<10 { group.addTask { await loads.load(url, fetch: fetch) != nil } }
-            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
-        }
+        let callers = (0..<10).map { _ in Task { await loads.load(url, fetch: fetch) != nil } }
+        try #require(await pollAsync { await loads.waiterCount(url) == 10 })
+        try #require(await poll { script.running.load(ordering: .acquiring) == 1 })
+        script.open()
+        var results = 0
+        for caller in callers where await caller.value { results += 1 }
         #expect(results == 10)
         #expect(script.calls.load(ordering: .acquiring) == 1)
     }
 
-    @Test func aCancelledCallerLeavesPromptlyAndTheOthersStillGetThePhoto() async {
+    @Test func aCancelledCallerLeavesPromptlyAndTheOthersStillGetThePhoto() async throws {
         let loads = AvatarLoads(sleep: noWait)
-        let script = Script([], hold: .seconds(1))
+        let script = Script([], held: true)
         let fetch = script.fetch
         let leaving = Task { await loads.load(url, fetch: fetch) }
         let staying = Task { await loads.load(url, fetch: fetch) }
-        #expect(await pollAsync { await loads.waiterCount(url) == 2 })
-        #expect(await poll { script.running.load(ordering: .acquiring) == 1 })
+        try #require(await pollAsync { await loads.waiterCount(url) == 2 })
+        try #require(await poll { script.running.load(ordering: .acquiring) == 1 })
+        let guardian = watchdog(script)
+        defer { guardian.cancel() }
         leaving.cancel()
         #expect(await leaving.value == nil)
         #expect(script.running.load(ordering: .acquiring) == 1, "the cancelled caller waited for the download")
+        script.open()
         #expect(await staying.value != nil)
         #expect(script.calls.load(ordering: .acquiring) == 1)
     }
 
-    @Test func nothingIsFetchedWhenEveryCallerLeavesWhileQueued() async {
+    @Test func nothingIsFetchedWhenEveryCallerLeavesWhileQueued() async throws {
         let loads = AvatarLoads(concurrent: 1, sleep: noWait)
-        let blocker = Script([], hold: .milliseconds(200))
+        let blocker = Script([], held: true)
         let other = URL(string: "https://lh3.googleusercontent.com/a/other=s64-c")!
         let busy = Task { await loads.load(other, fetch: blocker.fetch) }
-        try? await Task.sleep(for: .milliseconds(30))
+        try #require(await poll { blocker.running.load(ordering: .acquiring) == 1 })
         let queued = Script([])
         let waiter = Task { await loads.load(url, fetch: queued.fetch) }
-        try? await Task.sleep(for: .milliseconds(30))
+        try #require(await pollAsync { await loads.waiterCount(url) == 1 })
+        let guardian = watchdog(blocker)
+        defer { guardian.cancel() }
         waiter.cancel()
         #expect(await waiter.value == nil)
+        #expect(blocker.running.load(ordering: .acquiring) == 1, "the cancelled caller waited for the slot")
+        blocker.open()
         _ = await busy.value
-        try? await Task.sleep(for: .milliseconds(50))
+        // Slots are granted in order, so the probe runs only after the queued download had its turn.
+        let probe = Script([])
+        let third = URL(string: "https://lh3.googleusercontent.com/a/probe=s64-c")!
+        #expect(await loads.load(third, fetch: probe.fetch) != nil)
         #expect(queued.calls.load(ordering: .acquiring) == 0)
     }
 
@@ -119,24 +160,25 @@ struct AvatarLoadsTests {
         #expect(await loads.load(url, fetch: script.fetch) != nil)
     }
 
-    @Test func atMostFourDownloadsRunAtOnceAndNoSlotIsHeldDuringBackoff() async {
+    @Test func atMostFourDownloadsRunAtOnceAndNoSlotIsHeldDuringBackoff() async throws {
         let gate = Mutex<CheckedContinuation<Void, Never>?>(nil)
         let loads = AvatarLoads(
             concurrent: 4,
             sleep: { _ in await withCheckedContinuation { continuation in gate.withLock { $0 = continuation } } })
         let backingOff = Script([.failure(.transport(.offline))])
         let first = Task { await loads.load(url, fetch: backingOff.fetch) }
-        try? await Task.sleep(for: .milliseconds(30))
-        let script = Script([], hold: .milliseconds(40))
+        try #require(await poll { gate.withLock { $0 != nil } })
+        let script = Script([], held: true)
         let fetch = script.fetch
-        let others = await withTaskGroup(of: Bool.self) { group in
-            for index in 0..<12 {
-                let other = URL(string: "https://lh3.googleusercontent.com/a/\(index)=s64-c")!
-                group.addTask { await loads.load(other, fetch: fetch) != nil }
-            }
-            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        let others = (0..<12).map { index in
+            let other = URL(string: "https://lh3.googleusercontent.com/a/\(index)=s64-c")!
+            return Task { await loads.load(other, fetch: fetch) != nil }
         }
-        #expect(others == 12)
+        try #require(await poll { script.running.load(ordering: .acquiring) >= 4 })
+        script.open()
+        var loaded = 0
+        for other in others where await other.value { loaded += 1 }
+        #expect(loaded == 12)
         #expect(script.peak.load(ordering: .acquiring) == 4)
         gate.withLock { $0?.resume() }
         #expect(await first.value != nil)

@@ -498,16 +498,24 @@ extension MediaFlowTests {
                     Self.removeExportedPDFs(under: root)
                     events.append("wiped")
                 })
-            Thread.sleep(forTimeInterval: 0.15)
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while loader.exportCloseWaiters == 0, ContinuousClock.now < deadline {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            if loader.exportCloseWaiters == 1 { events.append("closeWaiting") }
             events.append("exportWriting")
         }
 
         await #expect(throws: MediaLoadError.retired) {
             _ = try await loader.export(try #require(message.attachments.first))
         }
-        events.append("exportReturned")
         for task in logout.all { await task.value }
-        #expect(events.all.firstIndex(of: "exportReturned")! < events.all.firstIndex(of: "closed")!)
+        let order = events.all
+        try #require(order.contains("closeWaiting"), "close didn't wait for the running export")
+        let writing = try #require(order.firstIndex(of: "exportWriting"))
+        let closed = try #require(order.firstIndex(of: "closed"))
+        #expect(writing < closed)
+        #expect(order.last == "wiped")
         let left =
             FileManager.default.enumerator(atPath: rig.root.path)?.compactMap { $0 as? String }
             .filter { $0.contains("exports/") && $0.hasSuffix(".pdf") } ?? []
