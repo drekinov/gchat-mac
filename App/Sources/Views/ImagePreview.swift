@@ -114,16 +114,20 @@ struct ImagePreviewSheet: View {
     let target: PreviewTarget
     /// Opens the first image at this magnification instead of fitting it (for snapshots).
     var startZoom: CGFloat?
+    /// Opens showing this action error (for snapshots).
+    var startError: String?
     /// Closes the preview and scrolls the conversation to the image's message.
     var onShowInChat: ((MessageName) -> Void)?
     var onClose: () -> Void
+    /// Where the size the sheet was last left at is kept.
+    private let defaults: UserDefaults
 
     @Environment(\.displayScale) private var displayScale
     @Environment(\.isSnapshotMode) private var snapshotMode
     @State private var index: Int
     @State private var decoded: DecodedImage?
     @State private var failure: MediaLoadError?
-    @State private var actionError: String?
+    @State private var actionError = PreviewActionError()
     /// Positions whose file is being exported to open elsewhere.
     @State private var opening: Set<Int> = []
     @State private var copied = false
@@ -133,21 +137,37 @@ struct ImagePreviewSheet: View {
     @State private var zoom = ZoomController()
     @State private var thumbnails: [Int: DecodedImage] = [:]
     @State private var failedThumbnails: Set<Int> = []
+    /// The size the sheet opens at, kept for as long as it's open, so a size saved meanwhile never moves it.
+    @State private var openingSize: CGSize
+    /// How many thumbnails fit the sheet's width; changes only when a resize crosses a threshold.
+    @State private var stripLength: Int
     @FocusState private var focused: Bool
 
-    private static let stripLength = 7
+    /// The floating controls' heights, their distance from the sheet's edges, and the clear space a fitted image
+    /// keeps at the top and bottom so the controls don't cover it.
+    private static let topHeight: CGFloat = 44
+    private static let bottomHeight: CGFloat = 46
+    private static let edgeInset: CGFloat = 12
+    private static let controlsMargin: CGFloat = 64
     private static let thumbnailPixels = 160
     /// A little darker than the window in light mode, so a white screenshot's edges still show.
     private static let stageColor = Theme.dynamic(light: 0xE2_E5E9, dark: 0x15_171A)
 
     init(
-        target: PreviewTarget, startZoom: CGFloat? = nil, onShowInChat: ((MessageName) -> Void)? = nil,
+        target: PreviewTarget, startZoom: CGFloat? = nil, startError: String? = nil,
+        defaults: UserDefaults = .standard, onShowInChat: ((MessageName) -> Void)? = nil,
         onClose: @escaping () -> Void
     ) {
         self.target = target
         self.startZoom = startZoom
+        self.startError = startError
+        _actionError = State(initialValue: PreviewActionError(startError))
+        self.defaults = defaults
         self.onShowInChat = onShowInChat
         self.onClose = onClose
+        let opening = PreviewSheetSize.load(from: defaults, screen: NSScreen.main?.visibleFrame.size)
+        _openingSize = State(initialValue: opening)
+        _stripLength = State(initialValue: ImagePreviewStrip.length(forWidth: opening.width))
         _index = State(initialValue: target.start)
     }
 
@@ -156,47 +176,84 @@ struct ImagePreviewSheet: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            stage
-            if let actionError {
-                Text(actionError).font(.caption).foregroundStyle(Theme.error).padding(8)
+        stage
+            // A frame with no maximum and fitted sizing is what makes a sheet resizable from its edges.
+            .frame(
+                minWidth: PreviewSheetSize.minimum.width, idealWidth: openingSize.width, maxWidth: .infinity,
+                minHeight: PreviewSheetSize.minimum.height, idealHeight: openingSize.height, maxHeight: .infinity
+            )
+            .presentationSizing(.fitted)
+            // Remembered only once the person finishes dragging an edge, never from layout alone: the size it opened
+            // at may be the remembered one shrunk to fit this screen, which should stay remembered for a larger one.
+            .background {
+                ResizeEndObserver { size in
+                    // Snapshots share the app's defaults, so they leave the remembered size alone.
+                    if !snapshotMode { PreviewSheetSize.save(size, to: defaults) }
+                }
             }
-        }
-        .frame(minWidth: 640, idealWidth: 900, minHeight: 480, idealHeight: 640)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .focusable()
-        .focusEffectDisabled()
-        .focused($focused)
-        .onKeyPress(.space) {
-            onClose()
-            return .handled
-        }
-        .onKeyPress(.leftArrow) { show(index - 1) ? .handled : .ignored }
-        .onKeyPress(.rightArrow) { show(index + 1) ? .handled : .ignored }
-        .onExitCommand(perform: onClose)
-        // Edit > Copy (⌘C) reaches the sheet through the responder chain when the menu handles the key first.
-        .onCommand(#selector(NSText.copy(_:))) {
-            if let attachment = current?.attachment { copy(attachment) }
-        }
-        .task { focused = true }
-        .task(id: index) { await loadImage() }
-        .task(id: ThumbnailRequest(strip: strip, ready: decoded != nil || failure != nil)) {
-            await loadThumbnails(ready: decoded != nil || failure != nil)
-        }
-        .task {
-            try? await Task.sleep(for: .seconds(6))
-            if !Task.isCancelled { withAnimation { showsHint = false } }
-        }
-        .onDisappear(perform: releaseAll)
+            .onGeometryChange(for: Int.self) {
+                ImagePreviewStrip.length(forWidth: $0.size.width)
+            } action: {
+                stripLength = $0
+            }
+            .focusable()
+            .focusEffectDisabled()
+            .focused($focused)
+            .onKeyPress(.space) {
+                onClose()
+                return .handled
+            }
+            .onKeyPress(.leftArrow) { show(index - 1) ? .handled : .ignored }
+            .onKeyPress(.rightArrow) { show(index + 1) ? .handled : .ignored }
+            .onExitCommand(perform: onClose)
+            // Edit > Copy (⌘C) reaches the sheet through the responder chain when the menu handles the key first.
+            .onCommand(#selector(NSText.copy(_:))) {
+                if let attachment = current?.attachment { copy(attachment) }
+            }
+            .task { focused = true }
+            .task(id: index) { await loadImage() }
+            .task(id: ThumbnailRequest(strip: strip, ready: decoded != nil || failure != nil)) {
+                await loadThumbnails(ready: decoded != nil || failure != nil)
+            }
+            .task {
+                try? await Task.sleep(for: .seconds(6))
+                if !Task.isCancelled { withAnimation { showsHint = false } }
+            }
+            // An error sits over the image's lower edge, so it fades like the hint; a new one starts its own time.
+            .task(id: actionError.shown) {
+                guard actionError.text != nil else { return }
+                try? await Task.sleep(for: .seconds(6))
+                if !Task.isCancelled { withAnimation { actionError.clear() } }
+            }
+            .onDisappear(perform: releaseAll)
     }
 
-    // MARK: Toolbar
+    // MARK: Floating controls
 
-    private var header: some View {
-        HStack(spacing: 12) {
-            SheetCloseButton(action: onClose)
+    /// The file and who sent it on the left, what you can do with it on the right. The name gives way first.
+    private var topBar: some View {
+        GlassGroup(solid: snapshotMode) {
+            HStack(alignment: .top, spacing: 8) {
+                CappedWidth(maxWidth: 440) { titleCapsule }
+                Spacer(minLength: 0)
+                if let attachment = current?.attachment { actions(attachment).fixedSize() }
+            }
+        }
+    }
+
+    private var titleCapsule: some View {
+        HStack(spacing: 10) {
+            Button(role: .close, action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 30, height: 30)
+                    .background(Color.primary.opacity(0.08), in: Circle())
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.cancelAction)
+            .help("Close (Esc)")
+            .accessibilityLabel("Close")
             VStack(alignment: .leading, spacing: 1) {
                 Text(current.map { RemoteText.title($0.attachment.contentName) } ?? "GIF")
                     .font(.headline)
@@ -206,43 +263,74 @@ struct ImagePreviewSheet: View {
                     Text(byline).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            if let attachment = current?.attachment {
-                ZoomControls(zoom: zoom).disabled(decoded == nil)
-                HStack(spacing: 6) {
-                    Button {
-                        copy(attachment)
-                    } label: {
-                        Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                    }
-                    .keyboardShortcut("c")
-                    .help("Copy (⌘C)")
-                    Button {
-                        let position = index
-                        Task {
-                            let error = await AttachmentActions.saveAs(attachment, media: target.media)
-                            if index == position { actionError = error }
-                        }
-                    } label: {
-                        Label("Save As…", systemImage: "square.and.arrow.down")
-                    }
-                    .keyboardShortcut("s", modifiers: [.command, .shift])
-                    .help("Save As… (⇧⌘S)")
-                    if let onShowInChat, let message = current?.origin.message {
-                        Button {
-                            onShowInChat(message)
-                        } label: {
-                            Label("Show in Chat", systemImage: "bubble.left")
-                        }
-                        .help("Close the preview and scroll to this message")
-                    }
+        }
+        .padding(.leading, 7)
+        .padding(.trailing, 16)
+        .frame(minHeight: Self.topHeight)
+        .modifier(FloatingBackground(cornerRadius: Self.topHeight / 2, solid: snapshotMode))
+    }
+
+    /// Icons only at every width; each one's name and shortcut are in its tooltip.
+    private func actions(_ attachment: Attachment) -> some View {
+        HStack(spacing: 2) {
+            Button {
+                copy(attachment)
+            } label: {
+                Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+            }
+            .keyboardShortcut("c")
+            .help(copied ? "Copied" : "Copy (⌘C)")
+            Button {
+                let position = index
+                Task {
+                    let error = await AttachmentActions.saveAs(attachment, media: target.media)
+                    if index == position { actionError.show(error) }
                 }
-                .labelStyle(.titleAndIcon)
+            } label: {
+                Label("Save As…", systemImage: "square.and.arrow.down")
+            }
+            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .help("Save As… (⇧⌘S)")
+            if let onShowInChat, let message = current?.origin.message {
+                Button {
+                    onShowInChat(message)
+                } label: {
+                    Label("Show in Chat", systemImage: "bubble.left")
+                }
+                .help("Show in Chat: close the preview and scroll to this message")
             }
         }
-        .padding(.leading, 14)
-        .padding(.trailing, 16)
-        .padding(.vertical, 10)
+        .labelStyle(.iconOnly)
+        .buttonStyle(FloatingButtonStyle())
+        .padding(.horizontal, 8)
+        .frame(minHeight: Self.topHeight)
+        .modifier(FloatingBackground(cornerRadius: Self.topHeight / 2, solid: snapshotMode))
+    }
+
+    /// An error or the zoom hint, then the strip and the zoom controls.
+    private var bottomBar: some View {
+        VStack(spacing: 8) {
+            if let message = actionError.text {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(Theme.error)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .modifier(FloatingBackground(cornerRadius: 14, solid: snapshotMode))
+                    .transition(.opacity)
+            } else if showsHint, !zoom.hasZoomed, decoded != nil {
+                hint.transition(.opacity)
+            }
+            GlassGroup(solid: snapshotMode) {
+                HStack(spacing: 8) {
+                    if target.items.count > 1 { navigator }
+                    if current?.attachment != nil {
+                        ZoomControls(zoom: zoom, solid: snapshotMode).disabled(decoded == nil)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: Stage
@@ -252,26 +340,23 @@ struct ImagePreviewSheet: View {
             Self.stageColor
             content
         }
-        .overlay(alignment: .bottom) {
-            if target.items.count > 1 { navigator.padding(.bottom, 14) }
-        }
-        .overlay(alignment: .topTrailing) {
-            if showsHint, !zoom.hasZoomed, decoded != nil {
-                hint.padding(12).transition(.opacity)
-            }
-        }
+        // The controls float over the image; the gaps between them still reach it, for panning and double-clicks.
+        .overlay(alignment: .top) { topBar.padding(Self.edgeInset) }
+        .overlay(alignment: .bottom) { bottomBar.padding(Self.edgeInset) }
         .clipped()
     }
 
     @ViewBuilder
     private var content: some View {
         if let gifURL = target.gifURL {
-            AnimatedGifView(url: gifURL, media: target.media, maxSide: 640).padding(12)
+            AnimatedGifView(url: gifURL, media: target.media, maxSide: 640)
+                .padding(.horizontal, 12)
+                .padding(.vertical, Self.controlsMargin)
         } else if let decoded {
-            // A strip of thumbnails floats over the bottom edge; a fitted image stays clear of it.
+            // Controls float over the top and bottom edges; a fitted image stays clear of them.
             ZoomableImage(
                 image: decoded.image, controller: zoom,
-                fitMargin: CGSize(width: 20, height: target.items.count > 1 ? 72 : 20),
+                fitMargin: CGSize(width: 20, height: Self.controlsMargin),
                 startMagnification: index == target.start ? startZoom : nil)
         } else if let failure {
             VStack(spacing: 12) {
@@ -292,46 +377,47 @@ struct ImagePreviewSheet: View {
         Text("Zoom with a pinch, ⌘-scroll, or ⌘+ and ⌘−. Double-click switches between fit and 100%.")
             .font(.caption)
             .foregroundStyle(.secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .modifier(FloatingBackground(cornerRadius: 8, solid: snapshotMode))
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .modifier(FloatingBackground(cornerRadius: 14, solid: snapshotMode))
     }
 
     // MARK: Previous and next
 
     private var navigator: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             Button("Previous Image", systemImage: "chevron.left") { show(index - 1) }
                 .disabled(index == 0)
                 .help("Previous (←)")
             ForEach(strip, id: \.self) { thumbnail($0) }
-            Button("Next Image", systemImage: "chevron.right") { show(index + 1) }
-                .disabled(index >= target.items.count - 1)
-                .help("Next (→)")
             Text("\(index + 1) of \(target.items.count)")
                 .font(.caption)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-                .padding(.trailing, 4)
+                .padding(.horizontal, 2)
+            Button("Next Image", systemImage: "chevron.right") { show(index + 1) }
+                .disabled(index >= target.items.count - 1)
+                .help("Next (→)")
         }
         .labelStyle(.iconOnly)
-        .buttonStyle(.borderless)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .modifier(FloatingBackground(cornerRadius: 14, solid: snapshotMode))
+        .buttonStyle(FloatingButtonStyle())
+        .padding(.horizontal, 7)
+        .frame(minHeight: Self.bottomHeight)
+        .modifier(FloatingBackground(cornerRadius: Self.bottomHeight / 2, solid: snapshotMode))
     }
 
     /// The strip's images: a few around the current one, so a long conversation decodes only that many.
     private var strip: Range<Int> {
         let count = target.items.count
         guard count > 1 else { return 0..<0 }
-        let lower = max(0, min(index - Self.stripLength / 2, count - Self.stripLength))
-        return lower..<min(count, lower + Self.stripLength)
+        let lower = max(0, min(index - stripLength / 2, count - stripLength))
+        return lower..<min(count, lower + stripLength)
     }
 
     private func thumbnail(_ position: Int) -> some View {
         let selected = position == index
-        let shape = RoundedRectangle(cornerRadius: 6)
+        let shape = RoundedRectangle(cornerRadius: 8)
         let name = RemoteText.title(target.items[position].attachment.contentName)
         return Button {
             show(position)
@@ -344,7 +430,7 @@ struct ImagePreviewSheet: View {
                     Image(systemName: "photo").font(.caption).foregroundStyle(.secondary)
                 }
             }
-            .frame(width: 52, height: 36)
+            .frame(width: 48, height: 34)
             .clipShape(shape)
             .overlay(
                 shape.strokeBorder(
@@ -364,7 +450,7 @@ struct ImagePreviewSheet: View {
         decoded?.reservation.release()
         decoded = nil
         failure = nil
-        actionError = nil
+        actionError.clear()
         copied = false
         index = position
         return true
@@ -394,7 +480,7 @@ struct ImagePreviewSheet: View {
             let error = await AttachmentActions.open(attachment, media: target.media)
             opening.remove(position)
             // Moving to another image cleared the error line, and this result isn't about that image.
-            if index == position { actionError = error }
+            if index == position { actionError.show(error) }
         }
     }
 
@@ -452,16 +538,16 @@ struct ImagePreviewSheet: View {
                 // The bytes are on the pasteboard now, so the exported file isn't needed.
                 try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
             } catch {
-                if index == position { actionError = mediaActionFailureText(error) }
+                if index == position { actionError.show(mediaActionFailureText(error)) }
                 return
             }
             // Another image is showing now; its error line and Copy button aren't about this one.
             guard index == position else { return }
             guard written else {
-                actionError = "Couldn't copy this image"
+                actionError.show("Couldn't copy this image")
                 return
             }
-            actionError = nil
+            actionError.clear()
             copied = true
             copies += 1
             let copy = copies
@@ -472,42 +558,84 @@ struct ImagePreviewSheet: View {
     }
 }
 
+/// Reports the content size of the window it's in each time a live resize ends: once per drag of an edge, and
+/// only for a resize the person made.
+private struct ResizeEndObserver: NSViewRepresentable {
+    let onEnd: (CGSize) -> Void
+
+    func makeNSView(context: Context) -> ObserverView { ObserverView(onEnd: onEnd) }
+
+    func updateNSView(_ view: ObserverView, context: Context) { view.onEnd = onEnd }
+
+    final class ObserverView: NSView {
+        var onEnd: (CGSize) -> Void
+
+        init(onEnd: @escaping (CGSize) -> Void) {
+            self.onEnd = onEnd
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            super.viewWillMove(toWindow: newWindow)
+            let center = NotificationCenter.default
+            center.removeObserver(self, name: NSWindow.didEndLiveResizeNotification, object: nil)
+            if let newWindow {
+                center.addObserver(
+                    self, selector: #selector(endedLiveResize), name: NSWindow.didEndLiveResizeNotification,
+                    object: newWindow)
+            }
+        }
+
+        @objc private func endedLiveResize(_ notification: Notification) {
+            guard let window else { return }
+            onEnd(window.contentRect(forFrameRect: window.frame).size)
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
 /// Zoom out, the percentage (click for actual size), zoom in, and Fit. A view of its own, so the stream of
 /// magnification changes during a pinch redraws only these controls rather than the whole sheet.
 private struct ZoomControls: View {
     let zoom: ZoomController
+    let solid: Bool
+    private static let height: CGFloat = 46
 
     var body: some View {
-        HStack(spacing: 8) {
-            ControlGroup {
-                Button("Zoom Out", systemImage: "minus") { zoom.zoomOut() }
-                    .keyboardShortcut("-")
-                    .disabled(!zoom.canZoomOut)
-                    .help("Zoom Out (⌘−)")
-                Button {
-                    zoom.actualSize()
-                } label: {
-                    Text(percent).monospacedDigit().frame(minWidth: 40)
-                }
-                .keyboardShortcut("0")
-                .help("Actual Size (⌘0)")
-                .accessibilityLabel("Zoom \(percent)")
-                .accessibilityHint("Shows the image at actual size")
-                Button("Zoom In", systemImage: "plus") { zoom.zoomIn() }
-                    .keyboardShortcut("+")
-                    .disabled(!zoom.canZoomIn)
-                    .help("Zoom In (⌘+)")
+        HStack(spacing: 2) {
+            Button("Zoom Out", systemImage: "minus") { zoom.zoomOut() }
+                .keyboardShortcut("-")
+                .disabled(!zoom.canZoomOut)
+                .help("Zoom Out (⌘−)")
+            Button {
+                zoom.actualSize()
+            } label: {
+                Text(percent).monospacedDigit().frame(minWidth: 40)
             }
-            .labelStyle(.iconOnly)
-            .fixedSize()
-            Toggle(isOn: Binding(get: { zoom.isFit }, set: { if $0 { zoom.fit() } })) {
-                Label("Fit", systemImage: "arrow.up.left.and.down.right.magnifyingglass")
-            }
-            .toggleStyle(.button)
-            .labelStyle(.titleAndIcon)
-            .keyboardShortcut("9")
-            .help("Zoom to Fit (⌘9)")
+            .keyboardShortcut("0")
+            .help("Actual Size (⌘0)")
+            .accessibilityLabel("Zoom \(percent)")
+            .accessibilityHint("Shows the image at actual size")
+            Button("Zoom In", systemImage: "plus") { zoom.zoomIn() }
+                .keyboardShortcut("+")
+                .disabled(!zoom.canZoomIn)
+                .help("Zoom In (⌘+)")
+            Divider().frame(height: 16).padding(.horizontal, 3)
+            Button("Zoom to Fit", systemImage: "arrow.up.left.and.down.right.magnifyingglass") { zoom.fit() }
+                .buttonStyle(FloatingButtonStyle(selected: zoom.isFit))
+                .keyboardShortcut("9")
+                .help("Zoom to Fit (⌘9)")
+                .accessibilityAddTraits(zoom.isFit ? .isSelected : [])
         }
+        .labelStyle(.iconOnly)
+        .buttonStyle(FloatingButtonStyle())
+        .padding(.horizontal, 7)
+        .frame(minHeight: Self.height)
+        .modifier(FloatingBackground(cornerRadius: Self.height / 2, solid: solid))
+        .fixedSize()
         .background {
             // ⌘= zooms in as well, so the shortcut works without Shift on keyboards where + needs it.
             Button("Zoom In") { zoom.zoomIn() }
@@ -519,6 +647,71 @@ private struct ZoomControls: View {
     }
 
     private var percent: String { "\(Int((zoom.magnification * 100).rounded()))%" }
+}
+
+/// A borderless button for the floating controls: a soft highlight on hover and press, and a steady one when
+/// `selected` (Fit while the image is fitted).
+private struct FloatingButtonStyle: ButtonStyle {
+    var selected = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        FloatingButton(configuration: configuration, selected: selected)
+    }
+
+    private struct FloatingButton: View {
+        let configuration: Configuration
+        let selected: Bool
+        @Environment(\.isEnabled) private var isEnabled
+        @State private var hovering = false
+
+        var body: some View {
+            configuration.label
+                .font(.system(size: 13, weight: .medium))
+                .frame(minWidth: 30, minHeight: 28)
+                .padding(.horizontal, 2)
+                .contentShape(Capsule())
+                .background(Color.primary.opacity(fill), in: Capsule())
+                .opacity(isEnabled ? 1 : 0.35)
+                .onHover { hovering = $0 }
+        }
+
+        private var fill: Double {
+            if configuration.isPressed { return 0.16 }
+            if selected { return 0.1 }
+            return hovering && isEnabled ? 0.07 : 0
+        }
+    }
+}
+
+/// Lets glass shapes that sit side by side render and blend as one group. Snapshots draw no glass, so they skip it.
+private struct GlassGroup<Content: View>: View {
+    let solid: Bool
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        if solid {
+            content
+        } else {
+            GlassEffectContainer(spacing: 8) { content }
+        }
+    }
+}
+
+/// Gives its one subview the width it wants, up to `maxWidth` and the width offered, so a short title keeps a
+/// short capsule and a long one stops at the cap and truncates.
+private struct CappedWidth: Layout {
+    let maxWidth: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let view = subviews.first else { return .zero }
+        let ideal = view.sizeThatFits(.unspecified).width
+        let width = min(ideal, maxWidth, proposal.width ?? .infinity)
+        return view.sizeThatFits(ProposedViewSize(width: width, height: proposal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size))
+    }
 }
 
 /// Puts an image on the pasteboard at full quality: the original file under its own type, plus a PNG of the
