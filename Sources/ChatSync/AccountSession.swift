@@ -88,6 +88,8 @@ public actor AccountSession {
     var notifyForced = false
     var notifyRetryArmed = false
     var notifyRetryAttempts = 0
+    /// Finished notifier passes, so a caller can wait until the notifier has seen a commit.
+    var notifyPasses: UInt64 = 0
     var owedSyncWanted = false
     var owedSyncArmed = false
     var owedFirstRequest: Timestamp?
