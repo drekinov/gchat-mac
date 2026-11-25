@@ -377,8 +377,17 @@ public actor AccountSession {
 
     /// "Post as new message" for a reply whose thread is gone.
     @discardableResult
-    public func repostAsNewMessage(_ failed: OutboxItem) throws(SyncError) -> OutboxItem {
+    public func repostAsNewMessage(_ failed: OutboxItem) throws(SyncError) -> OutboxItem? {
         guard let generation = gate.current else { throw .retired }
+        // A second activation finds the failed item already replaced.
+        let current: [OutboxItem]
+        do { current = try store.outbox() } catch { throw .store(error) }
+        guard
+            current.contains(where: {
+                guard $0.id == failed.id, case .failed = $0.state else { return false }
+                return true
+            })
+        else { return nil }
         let item = try sends.enqueue(
             text: failed.payload.text, space: failed.space, thread: nil, attachments: failed.payload.attachments,
             clearsDraft: false, replacing: failed.id, generation)
@@ -534,6 +543,8 @@ public actor AccountSession {
             return handle(error, generation, epoch: epoch)
         }
         guard let outcomes else { return }
+        // Published with this commit, so composers pick up a failed send's text straight away.
+        if outcomes.values.contains(where: { if case .failed = $0 { true } else { false } }) { draftRevision += 1 }
         didCommit(space, generation)
         var retryAt: Timestamp?
         var held = false
@@ -548,9 +559,7 @@ public actor AccountSession {
                 held = true
             case .notAdmitted:
                 held = true
-            case .failed:
-                draftRevision += 1
-            case .sent, .retired:
+            case .sent, .failed, .retired:
                 break
             }
         }

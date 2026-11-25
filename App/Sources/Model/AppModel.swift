@@ -1085,6 +1085,9 @@ final class AppModel {
         return saved
     }
 
+    /// Nothing unsaved or in flight in any composer.
+    var draftsSettled: Bool { composerDrafts.values.allSatisfy(\.isSettled) }
+
     func cancelQuit() {
         for drafts in composerDrafts.values { drafts.isQuitting = false }
     }

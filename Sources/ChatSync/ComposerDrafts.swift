@@ -55,6 +55,7 @@ public final class ComposerDrafts {
     @ObservationIgnored private var entries: [DraftKey: ComposerDraft] = [:]
     @ObservationIgnored private var stored: Set<DraftKey> = []
     @ObservationIgnored private var tail: Task<Void, Never>?
+    @ObservationIgnored private var queued = 0
     @ObservationIgnored private let storage: @MainActor () -> (any DraftStorage)?
     @ObservationIgnored private let adopt: @MainActor ([PendingAttachment]) -> [PendingAttachment]
     @ObservationIgnored private let saveDelay: Duration
@@ -166,7 +167,7 @@ public final class ComposerDrafts {
                 entry.dirty = entry.revision != submitted
             } else {
                 entry.attachments = attachments + entry.attachments
-                if entry.text.isEmpty { entry.text = text }
+                entry.text = entry.text.isEmpty ? text : text.isEmpty ? entry.text : text + "\n" + entry.text
                 entry.changed()
             }
             await save(key, entry)
@@ -192,16 +193,20 @@ public final class ComposerDrafts {
     }
 
     /// Re-reads which composers have stored drafts, and gives a loaded, untouched, empty composer the draft the
-    /// session wrote for it (a failed send's text).
+    /// session wrote for it (a failed send's text). Drafts of composers not loaded yet get their files readied too.
     public func reload() {
         enqueue { [self] in
             guard let storage = storage(), let all = try? await storage.drafts() else { return }
             stored = Set(all.map { DraftKey(space: $0.space, thread: $0.thread) })
             for saved in all {
                 let key = DraftKey(space: saved.space, thread: saved.thread)
-                guard let entry = entries[key], entry.hydrated, !entry.dirty, !entry.claimed, entry.isEmpty else {
+                guard let entry = entries[key], entry.hydrated else {
+                    var readied = saved
+                    readied.attachments = adopt(saved.attachments)
+                    if readied.attachments != saved.attachments { try? await storage.save(readied) }
                     continue
                 }
+                guard !entry.dirty, !entry.claimed, entry.isEmpty else { continue }
                 let attachments = adopt(saved.attachments)
                 entry.text = saved.text
                 entry.attachments = attachments
@@ -214,6 +219,11 @@ public final class ComposerDrafts {
         }
     }
 
+    /// Nothing unsaved, typed or queued: quitting now loses nothing.
+    public var isSettled: Bool {
+        queued == 0 && entries.values.allSatisfy { !$0.dirty && !$0.claimed }
+    }
+
     /// Waits for everything queued so far.
     public func settle() async {
         await run {}
@@ -222,17 +232,15 @@ public final class ComposerDrafts {
     // MARK: Queue
 
     private func enqueue(_ operation: @escaping @MainActor () async -> Void) {
-        let previous = tail
-        tail = Task { @MainActor in
-            await previous?.value
-            await operation()
-        }
+        _ = schedule(operation)
     }
 
     private func schedule<T: Sendable>(_ operation: @escaping @MainActor () async -> T) -> Task<T, Never> {
         let previous = tail
-        let task = Task { @MainActor in
+        queued += 1
+        let task = Task { @MainActor [weak self] in
             await previous?.value
+            defer { self?.queued -= 1 }
             return await operation()
         }
         tail = Task { _ = await task.value }

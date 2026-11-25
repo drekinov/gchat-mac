@@ -383,6 +383,7 @@ struct ComposerView: View {
 
     private var canSend: Bool {
         if let edit { return !edit.saving && edit.basedOn != nil }
+        guard restored else { return false }
         return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !draft.attachments.isEmpty
     }
@@ -446,7 +447,7 @@ struct ComposerView: View {
         trigger = nil
         Task {
             // The draft store gives the text back on failure; its mentions only the composer knows.
-            if await !sending.value, draft.text == outgoing {
+            if await !sending.value, edit == nil, draft.text == outgoing {
                 text = outgoing
                 mentionEditor = sentMentions
             }

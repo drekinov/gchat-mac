@@ -1,39 +1,44 @@
 import AppKit
 
-/// Every graceful quit (⌘Q, the menus, the Dock, logout) saves the drafts first. A save that fails or takes too
-/// long asks before quitting.
+/// With unsaved drafts a quit is cancelled, the drafts saved, and the app quits again; main-actor work may not run in
+/// `.terminateLater`'s modal loop. A save that fails or takes too long asks first.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor static weak var model: AppModel?
     static let saveDeadline: Duration = .seconds(5)
 
-    /// The quit attempt still waiting for its answer; each attempt replies once.
+    /// The save still running for a quit; each one settles once.
     @MainActor private var attempt: UUID?
+    @MainActor private var confirmed = false
 
     @MainActor func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model = Self.model else { return .terminateNow }
+        guard let model = Self.model, !confirmed, !model.draftsSettled else { return .terminateNow }
+        guard attempt == nil else { return .terminateCancel }
         let id = UUID()
         attempt = id
         Task { @MainActor in self.finish(id, saved: await model.prepareToQuit()) }
-        // Unstructured, so a save stuck in the store can't hold the answer back.
         Task { @MainActor in
             try? await Task.sleep(for: Self.saveDeadline)
             self.finish(id, saved: false)
         }
-        return .terminateLater
+        return .terminateCancel
     }
 
     @MainActor private func finish(_ id: UUID, saved: Bool) {
         guard attempt == id else { return }
         attempt = nil
-        guard !saved else { return NSApp.reply(toApplicationShouldTerminate: true) }
-        let alert = NSAlert()
-        alert.messageText = "Some drafts couldn't be saved"
-        alert.informativeText = "Quitting now loses their latest changes."
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Quit Anyway")
-        let quit = alert.runModal() == .alertSecondButtonReturn
-        if !quit { Self.model?.cancelQuit() }
-        NSApp.reply(toApplicationShouldTerminate: quit)
+        if !saved {
+            let alert = NSAlert()
+            alert.messageText = "Some drafts couldn't be saved"
+            alert.informativeText = "Quitting now loses their latest changes."
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Quit Anyway")
+            guard alert.runModal() == .alertSecondButtonReturn else {
+                Self.model?.cancelQuit()
+                return
+            }
+        }
+        confirmed = true
+        NSApp.terminate(nil)
     }
 }
 

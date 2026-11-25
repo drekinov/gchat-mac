@@ -233,6 +233,47 @@ struct ComposerDraftsTests {
         #expect(await storage.row(key)?.attachments.map(\.filename) == ["a.pdf", "b.pdf"])
     }
 
+    @Test func aFailedSendKeepsTextTypedWhileItWasPending() async {
+        await drafts.hydrate(key)
+        drafts.setText("first", for: key)
+        let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
+        let (proceed, proceedContinuation) = AsyncStream<Void>.makeStream()
+        let sending = Task {
+            await drafts.send(key) { _ in
+                enteredContinuation.yield()
+                for await _ in proceed { break }
+                return false
+            }?.value ?? false
+        }
+        for await _ in entered { break }
+        drafts.setText("second", for: key)
+        proceedContinuation.yield()
+
+        #expect(await !sending.value)
+        #expect(drafts.draft(key).text == "first\nsecond")
+    }
+
+    @Test func reloadReadiesTheFilesOfDraftsNotOpenedYet() async {
+        await storage.put(stored("waiting", files: [draftFile("gone.pdf"), draftFile("kept.pdf")], at: thread))
+        let drafts = ComposerDrafts(
+            adopt: { $0.filter { $0.filename != "gone.pdf" } }, storage: { [storage] in storage })
+
+        drafts.reload()
+        await drafts.settle()
+
+        #expect(await storage.row(thread)?.attachments.map(\.filename) == ["kept.pdf"])
+        #expect(drafts.hasDraft(in: Self.room))
+    }
+
+    @Test func settledOnlyWithNothingUnsavedOrQueued() async {
+        await drafts.hydrate(key)
+        #expect(drafts.isSettled)
+        drafts.setText("typing", for: key)
+        #expect(!drafts.isSettled)
+        #expect(await drafts.flush())
+        #expect(drafts.isSettled)
+    }
+
     @Test func reloadGivesAnOpenEmptyComposerItsRecoveredDraft() async {
         await drafts.hydrate(key)
         await drafts.hydrate(thread)
