@@ -48,7 +48,7 @@ struct LoopbackListenerTests {
     @Test func cancelWakesWaiter() async throws {
         let listener = try await LoopbackListener.start()
         let callback = Task { try await listener.callback(timeout: .seconds(5)) }
-        try await Task.sleep(for: .milliseconds(20))
+        try #require(await eventually { listener.hasWaiter })
         listener.cancel()
         await #expect(throws: LoopbackError.cancelled) { try await callback.value }
     }
@@ -56,7 +56,8 @@ struct LoopbackListenerTests {
     @Test func taskCancellationWakesWaiter() async throws {
         let listener = try await LoopbackListener.start()
         let task = Task { try await listener.callback(timeout: .seconds(5)) }
-        try await Task.sleep(for: .milliseconds(20))
+        defer { listener.cancel() }
+        try #require(await eventually { listener.hasWaiter })
         task.cancel()
         await #expect(throws: LoopbackError.cancelled) { try await task.value }
     }

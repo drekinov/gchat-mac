@@ -92,18 +92,21 @@ extension OAuthNetworkTests {
 struct LoopbackConnectionTests {
     @Test func idleConnectionsAreCappedAndClosedOnFinish() async throws {
         let listener = try await LoopbackListener.start(expectedState: "s")
+        defer { listener.cancel() }
         let port = try #require(listener.redirectURI.port.flatMap { NWEndpoint.Port(rawValue: UInt16($0)) })
         var idle: [NWConnection] = []
+        defer { for connection in idle { connection.cancel() } }
         for _ in 0..<(LoopbackListener.maxConnections + 4) {
             let connection = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
             connection.start(queue: .global())
             idle.append(connection)
         }
-        try await Task.sleep(for: .milliseconds(200))
+        let settled = await eventually { listener.openConnections + listener.refusedConnections == idle.count }
+        try #require(settled)
         #expect(listener.openConnections == LoopbackListener.maxConnections)
+        #expect(listener.refusedConnections == 4)
         listener.cancel()
         #expect(listener.openConnections == 0)
-        for connection in idle { connection.cancel() }
     }
 
     @Test func singleValuedAndStateChecks() {

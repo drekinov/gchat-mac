@@ -32,6 +32,15 @@ func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool) async 
     return condition()
 }
 
+func eventuallyAsync(timeout: Duration = .seconds(5), _ condition: () async -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    return await condition()
+}
+
 func percentDecodedForm(_ text: String) -> [String: String] {
     var result: [String: String] = [:]
     for pair in text.split(separator: "&", omittingEmptySubsequences: true) {
@@ -118,6 +127,8 @@ final class FakeGoogleOAuth: Sendable {
         var tokenScripts: [(grant: Grant?, reply: Reply)] = []
         var userinfoScripts: [Reply] = []
         var counter = 0
+        var holdingTokens = false
+        var parked: [@Sendable () -> Void] = []
     }
 
     let clientID: String
@@ -139,6 +150,31 @@ final class FakeGoogleOAuth: Sendable {
     func script(_ reply: Reply, for grant: Grant? = nil, times: Int = 1) {
         state.withLock { state in
             for _ in 0..<times { state.tokenScripts.append((grant, reply)) }
+        }
+    }
+
+    /// Parks `/token` responses until `releaseTokens()`, so a test can act while a refresh is in flight.
+    func holdTokens() {
+        state.withLock { $0.holdingTokens = true }
+    }
+
+    /// Delivers every parked `/token` response and stops holding new ones.
+    func releaseTokens() {
+        let parked = state.withLock { state in
+            state.holdingTokens = false
+            defer { state.parked = [] }
+            return state.parked
+        }
+        for deliver in parked { deliver() }
+    }
+
+    var parkedTokenResponses: Int { state.withLock { $0.parked.count } }
+
+    func park(path: String, _ deliver: @escaping @Sendable () -> Void) -> Bool {
+        state.withLock { state in
+            guard state.holdingTokens, path == "/token" else { return false }
+            state.parked.append(deliver)
+            return true
         }
     }
 
@@ -371,6 +407,7 @@ final class FakeGoogleOAuthProtocol: URLProtocol, @unchecked Sendable {
                 client?.urlProtocolDidFinishLoading(self)
             }
         }
+        if fake.park(path: url.path, deliver) { return }
         if plan.delay > .zero {
             let (seconds, attoseconds) = plan.delay.components
             let interval = Double(seconds) + Double(attoseconds) / 1e18
