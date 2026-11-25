@@ -13,6 +13,7 @@ func mediaFailureText(_ error: MediaLoadError) -> String {
         switch api {
         case .permissionDenied: "You don't have access to this file"
         case .notFound: "This file is no longer available"
+        case .transport(.responseTooLarge): "This file is too large to display"
         case .transport, .rateLimited: "Couldn't download (network problem)"
         case .unauthorized, .noCredentials: "Sign-in needed"
         default: "Couldn't download this file"
@@ -34,6 +35,15 @@ func mediaFailureText(_ error: MediaLoadError) -> String {
     }
 }
 
+/// For Open, Save As… and Copy, which download the whole file rather than display it, so a size limit there is
+/// about downloading.
+func mediaActionFailureText(_ error: MediaLoadError) -> String {
+    switch error {
+    case .transport(.responseTooLarge), .api(.transport(.responseTooLarge)): "This file is too large to download"
+    default: mediaFailureText(error)
+    }
+}
+
 /// Aspect ratios seen so far, so a row scrolled back into view gets a placeholder of the right shape.
 @MainActor
 enum ImageAspect {
@@ -51,13 +61,18 @@ enum AttachmentActions {
     /// Decrypts into the quarantined exports directory, then opens with the default app.
     @MainActor
     static func open(_ attachment: Attachment, media: MediaLoader) async -> String? {
+        let url: URL
         do {
-            let url = try await media.export(attachment)
-            NSWorkspace.shared.open(url)
-            return nil
+            url = try await media.export(attachment)
         } catch {
-            return mediaFailureText(error)
+            return mediaActionFailureText(error)
         }
+        guard NSWorkspace.shared.open(url) else {
+            // The copy stays: it's the attachment's stored one, perhaps with edits made in another app, and pruning
+            // removes it once it has gone unused for a day.
+            return "No app on this Mac can open this file"
+        }
+        return nil
     }
 
     @MainActor
@@ -69,7 +84,7 @@ enum AttachmentActions {
             try await media.save(attachment, to: url)
             return nil
         } catch {
-            return mediaFailureText(error)
+            return mediaActionFailureText(error)
         }
     }
 
@@ -103,12 +118,13 @@ struct InlineImageView: View {
     @Environment(\.displayScale) private var scale
     @State private var phase: Phase = .idle
     @State private var task: Task<Void, Never>?
-    @State private var menuError: String?
+    @State private var actionError: String?
+    @State private var opening = false
 
     private enum Phase {
         case idle, loading
         case loaded(DecodedImage)
-        case failed(String)
+        case failed(MediaLoadError)
     }
 
     private var key: String {
@@ -136,30 +152,12 @@ struct InlineImageView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.25)))
                 .onTapGesture(perform: onOpen)
-                .contextMenu {
-                    Button("Open") { Task { menuError = await AttachmentActions.open(attachment, media: media) } }
-                    Button("Save As…") { Task { menuError = await AttachmentActions.saveAs(attachment, media: media) } }
-                }
+                .contextMenu { fileMenu }
                 .help(RemoteText.title(attachment.contentName))
                 .accessibilityLabel("Image \(RemoteText.title(attachment.contentName))")
                 .accessibilityAddTraits(.isButton)
-        case .failed(let text):
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(RemoteText.title(attachment.contentName)).font(.callout).lineLimit(1).truncationMode(.middle)
-                    Text(text).font(.caption).foregroundStyle(.secondary)
-                }
-                Button("Retry") {
-                    phase = .idle
-                    start()
-                }.controlSize(.small)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .frame(maxWidth: 360, alignment: .leading)
-            .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.25)))
+        case .failed(let error):
+            failureCard(error)
         default:
             let ratio = ImageAspect.ratio(key) ?? 1.6
             let width: CGFloat = ratio < 1 ? 160 : 240
@@ -170,6 +168,55 @@ struct InlineImageView: View {
             .aspectRatio(ratio, contentMode: .fit)
             .frame(idealWidth: width, maxWidth: width)
             .accessibilityLabel("Loading image")
+        }
+    }
+
+    /// An image that can't be shown here opens in another app instead, from a click anywhere on the card. Anything
+    /// else offers to load it again.
+    private func failureCard(_ error: MediaLoadError) -> some View {
+        let opensElsewhere = error.needsAnotherApp
+        return HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(RemoteText.title(attachment.contentName)).font(.callout).lineLimit(1).truncationMode(.middle)
+                Text(actionError ?? mediaFailureText(error)).font(.caption).foregroundStyle(.secondary)
+            }
+            if opensElsewhere {
+                Button(opening ? "Opening…" : "Open", action: open)
+                    .controlSize(.small)
+                    .disabled(opening)
+            } else {
+                Button("Retry") {
+                    actionError = nil
+                    phase = .idle
+                    start()
+                }.controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(maxWidth: 360, alignment: .leading)
+        .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.25)))
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onTapGesture { if opensElsewhere { open() } }
+        .contextMenu { fileMenu }
+        .help(opensElsewhere ? "Open in the default app" : RemoteText.title(attachment.contentName))
+    }
+
+    @ViewBuilder
+    private var fileMenu: some View {
+        Button("Open", action: open).disabled(opening)
+        Button("Save As…") { Task { actionError = await AttachmentActions.saveAs(attachment, media: media) } }
+    }
+
+    /// Exports the file and opens it with the default app. Nothing here decodes it, so size limits don't apply.
+    private func open() {
+        guard !opening else { return }
+        opening = true
+        Task {
+            actionError = await AttachmentActions.open(attachment, media: media)
+            opening = false
         }
     }
 
@@ -199,7 +246,7 @@ struct InlineImageView: View {
                 ImageAspect.remember(key, CGFloat(decoded.image.width) / CGFloat(max(decoded.image.height, 1)))
                 phase = .loaded(decoded)
             } catch let error as MediaLoadError {
-                if !Task.isCancelled { phase = .failed(mediaFailureText(error)) }
+                if !Task.isCancelled { phase = .failed(error) }
             } catch {
                 phase = .idle
             }
@@ -293,12 +340,20 @@ struct AnimatedGifView: View {
                     index = (index + 1) % animation.frameCount
                 }
             } catch let error as MediaLoadError {
-                failure = mediaFailureText(error)
+                stop(mediaFailureText(error))
             } catch let error as ImageError {
-                failure = mediaFailureText(.image(error))
+                stop(mediaFailureText(.image(error)))
             } catch {
                 // Cancelled while sleeping.
             }
         }
+    }
+
+    /// Playback has ended on an error: the message replaces the last frame, which also gives back its memory.
+    /// A run that was cancelled (the window went inactive, or the view left) leaves what's shown alone.
+    private func stop(_ message: String) {
+        guard !Task.isCancelled else { return }
+        frame = nil
+        failure = message
     }
 }

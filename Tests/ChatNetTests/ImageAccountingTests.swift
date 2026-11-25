@@ -158,9 +158,26 @@ extension Fixtures {
         _ = first
     }
 
-    @Test func anAdmissionLargerThanTheBudgetFailsImmediately() async {
+    @Test func anAdmissionLargerThanTheBudgetIsTooLargeAtOnce() async {
         let (pipeline, _) = pipeline(capacity: 1 << 20)
-        await #expect(throws: ImageError.budget) { _ = try await pipeline.reserveEncoded(byteCount: 2 << 20) }
+        await #expect(throws: ImageError.tooLarge) { _ = try await pipeline.reserveEncoded(byteCount: 2 << 20) }
+    }
+
+    @Test func anAdmittedImageWhosePeakCannotFitIsTooLargeAtOnce() async throws {
+        let data = Fixtures.png(400, 300)
+        let (pipeline, budget) = pipeline(capacity: data.count + 1000)
+        let admission = try await pipeline.reserveEncoded(byteCount: data.count)
+        let clock = ContinuousClock()
+        let start = clock.now
+        var caught: ImageError?
+        do {
+            _ = try await pipeline.thumbnail(from: data, admission: admission, maxPixelSize: 100)
+        } catch {
+            caught = error
+        }
+        #expect(caught == .tooLarge)
+        #expect(clock.now - start < .seconds(1))
+        #expect(await budget.available == data.count + 1000)
     }
 
     @Test func decodingWithAnAdmissionReleasesItAfterwards() async throws {
@@ -293,18 +310,18 @@ extension Fixtures {
         squatter.release()
     }
 
-    @Test func anAnimationWhoseCombinedPeakExceedsTheBudgetFailsImmediately() async {
+    @Test func anAnimationWhoseCombinedPeakExceedsTheBudgetIsTooLargeAtOnce() async {
         let (pipeline, budget) = pipeline(capacity: 100_000)
         let clock = ContinuousClock()
         let start = clock.now
-        await #expect(throws: ImageError.budget) {
+        await #expect(throws: ImageError.tooLarge) {
             _ = try await pipeline.animation(from: Fixtures.gif(frames: 4, size: 64), maxPixelSize: 64)
         }
         #expect(clock.now - start < .seconds(1))
         #expect(await budget.available == 100_000)
     }
 
-    @Test func anAdmittedAnimationWhosePeakCannotFitFailsImmediately() async throws {
+    @Test func anAdmittedAnimationWhosePeakCannotFitIsTooLargeAtOnce() async throws {
         let data = Fixtures.gif(frames: 4, size: 64)
         let (pipeline, budget) = pipeline(capacity: data.count + 1000)
         let admission = try await pipeline.reserveEncoded(byteCount: data.count)
@@ -316,7 +333,7 @@ extension Fixtures {
         } catch {
             caught = error
         }
-        #expect(caught == .budget)
+        #expect(caught == .tooLarge)
         #expect(clock.now - start < .seconds(1))
         #expect(await budget.available == data.count + 1000)
     }

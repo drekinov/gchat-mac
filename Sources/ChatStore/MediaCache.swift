@@ -557,7 +557,8 @@ public final class MediaReader: Sendable {
     /// Plaintext length recorded when the entry was written.
     public let plaintextBytes: Int
     private let cache: MediaCache
-    private let hash: String
+    /// The entry's keyed name, which doesn't reveal the media ID. Exports name the attachment's folder with it.
+    let hash: String
     private let readerID: Int
     private let device: dev_t
     private let inode: ino_t

@@ -34,15 +34,17 @@ struct MediaFlowTests {
             return url
         }
 
-        func loader(redirectHosts: Set<String> = []) throws -> MediaLoader {
-            let account = AccountID()
+        func loader(
+            redirectHosts: Set<String> = [], capacity: Int = 32 << 20, media: (any ChatMediaAPI)? = nil,
+            account: AccountID = AccountID()
+        ) throws -> MediaLoader {
             let directory = AccountDirectory(root: root, account: account)
             let key = StoreKey.random(for: account)
             _ = try SQLiteAccountStore.open(directory: directory, key: key)
             let cache = try MediaCache(directory: directory, key: key)
             return MediaLoader(
-                media: client, cache: cache, exports: ExportDirectory(directory: directory),
-                pipeline: ImagePipeline(budget: MemoryBudget(capacity: 32 << 20)),
+                media: media ?? client, cache: cache, exports: ExportDirectory(directory: directory),
+                pipeline: ImagePipeline(budget: MemoryBudget(capacity: capacity)),
                 fetcher: SafeFetcher(allowedHosts: redirectHosts, protocolClasses: [FakeMediaHost.self]), gate: h.gate)
         }
     }
@@ -98,6 +100,222 @@ struct MediaFlowTests {
         #expect(downloads() == 1)
     }
 
+    @Test func anImageTooLargeToShowStillExportsForAnotherApp() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let png = FakeMedia.png(width: 400, height: 300)
+        let media = rig.h.server.addMedia(png, contentType: "image/png", filename: "big.png")
+        let message = rig.h.server.postMedia([media], text: "pic", in: rig.team, from: .account(rig.h.bob))
+        let attachment = try #require(message.attachments.first)
+        // Room for the file, but never for decoding it.
+        let loader = try rig.loader(capacity: png.count + 1000)
+
+        var caught: MediaLoadError?
+        do {
+            _ = try await loader.image(attachment, maxPixelSize: 200)
+        } catch {
+            caught = error
+        }
+        #expect(caught == .image(.tooLarge))
+        #expect(caught?.needsAnotherApp == true)
+        let url = try await loader.export(attachment)
+        #expect(try Data(contentsOf: url) == png)
+    }
+
+    @Test func anExportWaitingOnAnImageSizedDownloadStillGetsTheWholeFile() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        // Over what an inline image may be, well within what an export allows.
+        let server = HeldDownloads(size: MediaLoader.maxImageBytes + 1, bytes: Data("whole file".utf8))
+        // Lets anything still held finish if a setup step stops the test, so it fails rather than hangs.
+        defer { server.release() }
+        let loader = try rig.loader(media: server)
+        let waits = Recorder<Int>()
+        loader.onWaitForDownload = { waits.append(1) }
+        let resource = try #require(MediaResourceName("media/large-photo"))
+        let attachment = Attachment(contentName: "photo.webp", contentType: "image/webp", source: .uploaded(resource))
+
+        let image = Task { () -> MediaLoadError? in
+            do throws(MediaLoadError) {
+                _ = try await loader.image(attachment, maxPixelSize: 200)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        try #require(await poll { server.limits.count == 1 })
+        let export = Task { try await loader.export(attachment) }
+        // The export is waiting on the image's download before that download fails for size.
+        try #require(await poll { !waits.all.isEmpty })
+        server.release()
+
+        #expect(await image.value == .api(.transport(.responseTooLarge)))
+        let url = try await export.value
+        #expect(try Data(contentsOf: url) == Data("whole file".utf8))
+        #expect(server.limits == [MediaLoader.maxImageBytes, MediaLoader.maxFileBytes])
+        #expect(loader.runningDownloadLimit(resource) == nil)
+    }
+
+    @Test func theLargerDownloadReplacesTheFailedOneAtOnceAndLaterRequestsJoinIt() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let server = HeldDownloads(size: MediaLoader.maxImageBytes + 1, bytes: Data("whole file".utf8))
+        // Lets anything still held finish if a setup step stops the test, so it fails rather than hangs.
+        defer { server.release() }
+        let loader = try rig.loader(media: server)
+        let waits = Recorder<Int>()
+        loader.onWaitForDownload = { waits.append(1) }
+        let resource = try #require(MediaResourceName("media/large-photo"))
+        let attachment = Attachment(contentName: "photo.webp", contentType: "image/webp", source: .uploaded(resource))
+        let image = {
+            Task { () -> MediaLoadError? in
+                do throws(MediaLoadError) {
+                    _ = try await loader.image(attachment, maxPixelSize: 200)
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+        }
+
+        let first = image()
+        try #require(await poll { server.heldCount == 1 })
+        let export = Task { try await loader.export(attachment) }
+        try #require(await poll { waits.all.count == 1 })
+        // The image-sized download stops at its limit and the export's larger one takes its place, still held.
+        server.releaseHeld()
+        #expect(await first.value == .api(.transport(.responseTooLarge)))
+        // Already in place when the first caller hears back, so nothing smaller can start in between.
+        #expect(loader.runningDownloadLimit(resource) == MediaLoader.maxFileBytes)
+        try #require(await poll { server.heldCount == 1 })
+        // Another view asks for the image now: it waits on the larger download rather than starting a new one.
+        // Three waits: the export on the first download, then the export and the new request on the larger one.
+        let second = image()
+        try #require(await poll { waits.all.count == 3 })
+        #expect(server.limits.count == 2)
+        server.release()
+
+        let url = try await export.value
+        #expect(try Data(contentsOf: url) == Data("whole file".utf8))
+        // The cached bytes aren't an image, which is fine here: no third download was made for it.
+        #expect(await second.value?.needsAnotherApp == true)
+        #expect(server.limits == [MediaLoader.maxImageBytes, MediaLoader.maxFileBytes])
+        #expect(loader.runningDownloadLimit(resource) == nil)
+    }
+
+    /// The export pauses as it starts waiting on the image's download and resumes only after the larger attempt
+    /// that took over has finished, successfully or rate-limited, and left the table.
+    @Test(arguments: [nil, ChatAPIError.rateLimited(retryAfter: .seconds(30))] as [ChatAPIError?])
+    func aCallerResumingAfterTheLargerAttemptFinishedGetsItsResult(_ failure: ChatAPIError?) async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let server = HeldDownloads(
+            size: MediaLoader.maxImageBytes + 1, bytes: Data("whole file".utf8),
+            failures: failure.map { [MediaLoader.maxFileBytes: $0] } ?? [:])
+        defer { server.release() }
+        let loader = try rig.loader(media: server)
+        let (resume, resumer) = AsyncStream<Void>.makeStream()
+        defer { resumer.finish() }
+        let waits = Recorder<Int>()
+        loader.onWaitForDownload = {
+            waits.append(1)
+            if waits.all.count == 1 {
+                for await _ in resume { break }
+            }
+        }
+        let resource = try #require(MediaResourceName("media/large-photo"))
+        let attachment = Attachment(contentName: "photo.webp", contentType: "image/webp", source: .uploaded(resource))
+
+        let image = Task { () -> MediaLoadError? in
+            do throws(MediaLoadError) {
+                _ = try await loader.image(attachment, maxPixelSize: 200)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        try #require(await poll { server.heldCount == 1 })
+        let export = Task { () -> Result<URL, MediaLoadError> in
+            do throws(MediaLoadError) {
+                return .success(try await loader.export(attachment))
+            } catch {
+                return .failure(error)
+            }
+        }
+        try #require(await poll { waits.all.count == 1 })
+        server.release()
+        #expect(await image.value == .api(.transport(.responseTooLarge)))
+        try #require(await poll { server.limits.count == 2 && loader.runningDownloadLimit(resource) == nil })
+        resumer.yield()
+
+        switch await export.value {
+        case .success(let url):
+            #expect(failure == nil)
+            #expect(try Data(contentsOf: url) == Data("whole file".utf8))
+        case .failure(let error):
+            #expect(error == failure.map { .api($0) })
+        }
+        #expect(server.limits == [MediaLoader.maxImageBytes, MediaLoader.maxFileBytes])
+        #expect(loader.runningDownloadLimit(resource) == nil)
+    }
+
+    @Test func aLargerCallerDoesNotRetryAFailureALargerLimitCannotFix() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        // Fails the image-sized download the way a rate-limited server would.
+        let server = HeldDownloads(
+            size: 1, bytes: Data(), failures: [MediaLoader.maxImageBytes: .rateLimited(retryAfter: .seconds(30))])
+        defer { server.release() }
+        let loader = try rig.loader(media: server)
+        let waits = Recorder<Int>()
+        loader.onWaitForDownload = { waits.append(1) }
+        let resource = try #require(MediaResourceName("media/photo"))
+        let attachment = Attachment(contentName: "photo.png", contentType: "image/png", source: .uploaded(resource))
+
+        let image = Task { () -> MediaLoadError? in
+            do throws(MediaLoadError) {
+                _ = try await loader.image(attachment, maxPixelSize: 200)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        try #require(await poll { server.heldCount == 1 })
+        let export = Task { () -> MediaLoadError? in
+            do throws(MediaLoadError) {
+                _ = try await loader.export(attachment)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        try #require(await poll { waits.all.count == 1 })
+        server.release()
+
+        #expect(await image.value == .api(.rateLimited(retryAfter: .seconds(30))))
+        #expect(await export.value == .api(.rateLimited(retryAfter: .seconds(30))))
+        #expect(server.limits == [MediaLoader.maxImageBytes])
+    }
+
+    @Test(arguments: [
+        (MediaLoadError.image(.tooLarge), true),
+        (.image(.tooManyFrames), true),
+        (.image(.unsupported), true),
+        (.image(.corrupt), true),
+        (.transport(.responseTooLarge), true),
+        (.api(.transport(.responseTooLarge)), true),
+        (.image(.budget), false),
+        (.image(.cancelled), false),
+        (.transport(.offline), false),
+        (.api(.transport(.offline)), false),
+        (.api(.rateLimited(retryAfter: nil)), false),
+        (.api(.unauthorized), false),
+        (.retired, false),
+    ])
+    func onlyFailuresThatRetryingCantFixNeedAnotherApp(_ error: MediaLoadError, _ expected: Bool) {
+        #expect(error.needsAnotherApp == expected)
+    }
+
     @Test func exportIsQuarantined() async throws {
         let rig = Rig()
         defer { try? FileManager.default.removeItem(at: rig.root) }
@@ -108,6 +326,74 @@ struct MediaFlowTests {
         #expect(try Data(contentsOf: url) == Data("hello pdf".utf8))
         let size = getxattr(url.path, ExportDirectory.quarantineAttribute, nil, 0, 0, 0)
         #expect(size > 0)
+    }
+
+    @Test func openingAnAttachmentAgainReusesItsPath() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("hello pdf".utf8), contentType: "application/pdf", filename: "r.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let attachment = try #require(message.attachments.first)
+        let loader = try rig.loader()
+
+        let first = try await loader.export(attachment)
+        let second = try await loader.export(attachment)
+        #expect(first == second)
+        #expect(try Data(contentsOf: second) == Data("hello pdf".utf8))
+        let unique = try await loader.export(attachment, placement: .unique)
+        #expect(unique != first)
+    }
+
+    @MainActor @Test func theFileWorkOfAnExportRunsOffTheMainActor() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("hello pdf".utf8), contentType: "application/pdf", filename: "r.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let loader = try rig.loader()
+        let onMain = Recorder<Bool>()
+        loader.beforeExportWrite = { onMain.append(Thread.isMainThread) }
+
+        _ = try await loader.export(try #require(message.attachments.first))
+        #expect(onMain.all == [false])
+    }
+
+    @Test func aCallWhoseSessionEndedLeavesTheStoredCopyAlone() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("hello pdf".utf8), contentType: "application/pdf", filename: "r.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let attachment = try #require(message.attachments.first)
+        let loader = try rig.loader()
+        let stored = try await loader.export(attachment)
+        let gate = rig.h.gate
+        loader.afterExportWrite = { gate.retire() }
+
+        await #expect(throws: MediaLoadError.retired) { _ = try await loader.export(attachment) }
+        // Another session may be using it; logout's wipe is what removes it.
+        #expect(try Data(contentsOf: stored) == Data("hello pdf".utf8))
+    }
+
+    @Test func makingACopyRemovesThisAccountsOldCopies() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let account = AccountID()
+        let directory = AccountDirectory(root: rig.root, account: account)
+        try directory.createExports()
+        // A copy nobody has touched for two days, from before this run.
+        let old = directory.exportsURL.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: old, withIntermediateDirectories: false)
+        let oldFile = old.appendingPathComponent("old.pdf")
+        try Data("old".utf8).write(to: oldFile)
+        let twoDaysAgo = Date().addingTimeInterval(-2 * 86_400)
+        try FileManager.default.setAttributes([.modificationDate: twoDaysAgo], ofItemAtPath: oldFile.path)
+        try FileManager.default.setAttributes([.modificationDate: twoDaysAgo], ofItemAtPath: old.path)
+        let media = rig.h.server.addMedia(Data("hello pdf".utf8), contentType: "application/pdf", filename: "r.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let loader = try rig.loader(account: account)
+
+        let url = try await loader.export(try #require(message.attachments.first))
+        #expect(await poll { !FileManager.default.fileExists(atPath: old.path) })
+        #expect(FileManager.default.fileExists(atPath: url.path))
     }
 
     @Test func redirectedDownloadsGoTokenlessThroughTheAllowlist() async throws {
@@ -146,15 +432,38 @@ extension MediaFlowTests {
         let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
         let loader = try rig.loader()
         let gate = rig.h.gate
-        loader.afterExportWrite = { gate.retire() }
+        let exports = rig.root.appending(path: "exports")
+        let written = Recorder<Bool>()
+        // Logout starts once the copy is written, as it's about to be handed out.
+        loader.afterExportWrite = {
+            let files = FileManager.default.enumerator(atPath: exports.path)?.compactMap { $0 as? String } ?? []
+            written.append(files.contains { $0.hasSuffix("s.pdf") })
+            gate.retire()
+        }
 
         await #expect(throws: MediaLoadError.retired) {
             _ = try await loader.export(try #require(message.attachments.first))
         }
-        let exported =
+        #expect(written.all == [true])
+        let left =
             FileManager.default.enumerator(atPath: rig.root.appending(path: "exports").path)?
-            .compactMap { $0 as? String }.filter { $0.hasSuffix(".pdf") } ?? []
-        #expect(exported.isEmpty)
+            .compactMap { $0 as? String }.filter { $0.hasSuffix(".pdf") || $0.hasSuffix(".partial") } ?? []
+        #expect(left.isEmpty)
+    }
+
+    @Test func aSessionThatEndsAsTheExportComesBackIsNotOpened() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("secret".utf8), contentType: "application/pdf", filename: "s.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let loader = try rig.loader()
+        let gate = rig.h.gate
+        // Logout starts after the file work handed back the copy, before the caller gets it.
+        loader.beforeExportReturns = { gate.retire() }
+
+        await #expect(throws: MediaLoadError.retired) {
+            _ = try await loader.export(try #require(message.attachments.first))
+        }
     }
 
     @Test func exportAfterRetireDoesNothing() async throws {
@@ -224,5 +533,71 @@ extension MediaFlowTests {
         }
         let files = FileManager.default.enumerator(atPath: rig.root.path)?.compactMap { $0 as? String } ?? []
         #expect(!files.contains { $0.contains("exports/") && $0.hasSuffix(".pdf") })
+    }
+}
+
+/// A media server with one file of `size` bytes whose downloads wait until `release()`. Only `bytes` are
+/// delivered, so a large file costs nothing to fake.
+final class HeldDownloads: ChatMediaAPI {
+    private struct State {
+        var limits: [Int] = []
+        var held: [CheckedContinuation<Void, Never>] = []
+        var released = false
+    }
+
+    let size: Int
+    let bytes: Data
+    /// Thrown, by size limit, by downloads once they're let through, instead of delivering anything.
+    let failures: [Int: ChatAPIError]
+    private let state = Mutex(State())
+
+    init(size: Int, bytes: Data, failures: [Int: ChatAPIError] = [:]) {
+        self.size = size
+        self.bytes = bytes
+        self.failures = failures
+    }
+
+    /// The size limit of each download, in the order they started.
+    var limits: [Int] { state.withLock { $0.limits } }
+
+    /// Lets every download through, now and from now on.
+    func release() { resume(andStopHolding: true) }
+
+    /// Lets the downloads waiting now through; later ones still wait.
+    func releaseHeld() { resume(andStopHolding: false) }
+
+    private func resume(andStopHolding stop: Bool) {
+        let held = state.withLock { state -> [CheckedContinuation<Void, Never>] in
+            if stop { state.released = true }
+            defer { state.held = [] }
+            return state.held
+        }
+        for continuation in held { continuation.resume() }
+    }
+
+    var heldCount: Int { state.withLock { $0.held.count } }
+
+    func uploadAttachment(
+        to space: SpaceName, file: URL, filename: String, contentType: String
+    ) async throws(ChatAPIError) -> UploadedAttachment {
+        throw .noCredentials
+    }
+
+    func downloadMedia(
+        _ resource: MediaResourceName, maxBytes: Int, onChunk: @escaping @Sendable (Data) throws -> Void
+    ) async throws(ChatAPIError) -> MediaDownload {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let go = state.withLock { state -> Bool in
+                state.limits.append(maxBytes)
+                guard !state.released else { return true }
+                state.held.append(continuation)
+                return false
+            }
+            if go { continuation.resume() }
+        }
+        if let failure = failures[maxBytes] { throw failure }
+        guard size <= maxBytes else { throw .transport(.responseTooLarge) }
+        do { try onChunk(bytes) } catch { throw .transport(.sinkFailed) }
+        return MediaDownload(byteCount: bytes.count)
     }
 }

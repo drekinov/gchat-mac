@@ -8,7 +8,7 @@ private func contents(_ url: URL) -> [String] {
     ((try? FileManager.default.subpathsOfDirectory(atPath: url.path)) ?? []).sorted()
 }
 
-private func makeVictim(in f: Fixture) throws -> URL {
+func makeVictim(in f: Fixture) throws -> URL {
     let victim = f.temp.url.appendingPathComponent("victim", isDirectory: true)
     try FileManager.default.createDirectory(
         at: victim, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
@@ -53,10 +53,44 @@ private func makeVictim(in f: Fixture) throws -> URL {
                 at: folder.appendingPathComponent("x.bin"), withDestinationURL: target)
         }
         let exports = ExportDirectory(directory: f.directory, seams: seams)
+        let link = f.directory.exportsURL.appendingPathComponent(reader.hash).appendingPathComponent("x.bin")
 
         #expect(throws: ExportError.self) { try exports.export(from: reader, filename: "x.bin") }
         #expect(try Data(contentsOf: target) == Data("original".utf8))
-        #expect(contents(f.directory.exportsURL).isEmpty)
+        // Left as it was, never followed: cleanup removes only what the export itself made.
+        #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == target.path)
+        #expect(!contents(f.directory.exportsURL).contains { $0.hasSuffix(".partial") })
+    }
+
+    @Test func aSymlinkInPlaceOfAPreviousCopyIsRefusedNotFollowed() throws {
+        let (f, exports, cache, reader) = try exportFixture(pattern(100))
+        let victim = try makeVictim(in: f)
+        let target = victim.appendingPathComponent("target.txt")
+        try Data("original".utf8).write(to: target)
+        let url = try exports.export(from: reader, filename: "x.bin")
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.createSymbolicLink(at: url, withDestinationURL: target)
+        let again = try #require(try cache.open(mediaID: "media/x"))
+
+        #expect(throws: ExportError.io(code: Int(EEXIST))) { try exports.export(from: again, filename: "x.bin") }
+        #expect(try Data(contentsOf: target) == Data("original".utf8))
+        #expect(quarantine(of: target) == nil)
+        #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == target.path)
+        #expect(!contents(f.directory.exportsURL).contains { $0.hasSuffix(".partial") })
+    }
+
+    @Test func aHardLinkInPlaceOfACopyIsRefusedAndTheOtherFileIsUntouched() throws {
+        let (f, exports, cache, reader) = try exportFixture(pattern(100))
+        let a = try exports.export(from: reader, filename: "x.bin")
+        let outside = f.temp.url.appendingPathComponent("outside.txt")
+        try Data("elsewhere".utf8).write(to: outside)
+        try FileManager.default.removeItem(at: a)
+        #expect(link(outside.path, a.path) == 0)
+        let again = try #require(try cache.open(mediaID: "media/x"))
+
+        #expect(throws: ExportError.io(code: Int(EMLINK))) { try exports.export(from: again, filename: "x.bin") }
+        #expect(quarantine(of: outside) == nil)
+        #expect(try Data(contentsOf: outside) == Data("elsewhere".utf8))
     }
 
     @Test func aFolderSwappedForASymlinkAfterCreationIsDetected() throws {

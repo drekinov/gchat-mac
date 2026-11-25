@@ -122,9 +122,13 @@ struct ImagePreviewSheet: View {
     @Environment(\.isSnapshotMode) private var snapshotMode
     @State private var index: Int
     @State private var decoded: DecodedImage?
-    @State private var failure: String?
+    @State private var failure: MediaLoadError?
     @State private var actionError: String?
+    /// Positions whose file is being exported to open elsewhere.
+    @State private var opening: Set<Int> = []
     @State private var copied = false
+    /// Counts successful copies, so only the latest one's timer clears "Copied".
+    @State private var copies = 0
     @State private var showsHint = true
     @State private var zoom = ZoomController()
     @State private var thumbnails: [Int: DecodedImage] = [:]
@@ -214,7 +218,11 @@ struct ImagePreviewSheet: View {
                     .keyboardShortcut("c")
                     .help("Copy (⌘C)")
                     Button {
-                        Task { actionError = await AttachmentActions.saveAs(attachment, media: target.media) }
+                        let position = index
+                        Task {
+                            let error = await AttachmentActions.saveAs(attachment, media: target.media)
+                            if index == position { actionError = error }
+                        }
                     } label: {
                         Label("Save As…", systemImage: "square.and.arrow.down")
                     }
@@ -266,7 +274,15 @@ struct ImagePreviewSheet: View {
                 fitMargin: CGSize(width: 20, height: target.items.count > 1 ? 72 : 20),
                 startMagnification: index == target.start ? startZoom : nil)
         } else if let failure {
-            Label(failure, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.secondary)
+            VStack(spacing: 12) {
+                Label(mediaFailureText(failure), systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.secondary)
+                if failure.needsAnotherApp, let attachment = current?.attachment {
+                    Button(opening.contains(index) ? "Opening…" : "Open") { open(attachment) }
+                        .disabled(opening.contains(index))
+                        .help("Open in the default app")
+                }
+            }
         } else {
             ProgressView()
         }
@@ -366,7 +382,19 @@ struct ImagePreviewSheet: View {
             }
             decoded = image
         } catch {
-            if !Task.isCancelled { failure = mediaFailureText(error) }
+            if !Task.isCancelled { failure = error }
+        }
+    }
+
+    /// For an image the preview can't show: the default app opens the exported file without decoding it here.
+    private func open(_ attachment: Attachment) {
+        let position = index
+        guard opening.insert(position).inserted else { return }
+        Task {
+            let error = await AttachmentActions.open(attachment, media: target.media)
+            opening.remove(position)
+            // Moving to another image cleared the error line, and this result isn't about that image.
+            if index == position { actionError = error }
         }
     }
 
@@ -414,25 +442,32 @@ struct ImagePreviewSheet: View {
     private func copy(_ attachment: Attachment) {
         let media = target.media
         let shown = decoded?.image
+        let position = index
         Task {
             let written: Bool
             do throws(MediaLoadError) {
-                let url = try await media.export(attachment)
+                // A copy of its own, so removing it can't take away the one Open gave another app.
+                let url = try await media.export(attachment, placement: .unique)
                 written = ImagePasteboard.copy(fileAt: url, contentType: attachment.contentType, shown: shown)
                 // The bytes are on the pasteboard now, so the exported file isn't needed.
                 try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
             } catch {
-                actionError = mediaFailureText(error)
+                if index == position { actionError = mediaActionFailureText(error) }
                 return
             }
+            // Another image is showing now; its error line and Copy button aren't about this one.
+            guard index == position else { return }
             guard written else {
                 actionError = "Couldn't copy this image"
                 return
             }
             actionError = nil
             copied = true
+            copies += 1
+            let copy = copies
             try? await Task.sleep(for: .seconds(1.5))
-            copied = false
+            // A later copy shows its own confirmation for its full time.
+            if copies == copy { copied = false }
         }
     }
 }
