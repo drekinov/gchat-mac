@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor private var confirmed = false
 
     @MainActor func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model = Self.model, !confirmed, !model.draftsSettled else { return .terminateNow }
+        guard let model = Self.model, !confirmed, !model.draftsSettled, !Self.systemQuit else { return .terminateNow }
         guard attempt == nil else { return .terminateCancel }
         let id = UUID()
         attempt = id
@@ -21,6 +21,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.finish(id, saved: false)
         }
         return .terminateCancel
+    }
+
+    /// Logout, restart and shutdown carry a quit reason; cancelling them would stop the whole system operation.
+    @MainActor private static var systemQuit: Bool {
+        NSAppleEventManager.shared().currentAppleEvent?.attributeDescriptor(forKeyword: kAEQuitReason) != nil
     }
 
     @MainActor private func finish(_ id: UUID, saved: Bool) {

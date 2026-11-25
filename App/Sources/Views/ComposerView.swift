@@ -39,7 +39,7 @@ struct ComposerView: View {
     private var composerID: ComposerID { ComposerID(key: key, thread: thread) }
     private var draft: ComposerDraft { model.composerDraft(composerID) }
     /// Off until the stored draft has loaded, and while the app quits; editing a sent message isn't a draft.
-    private var editable: Bool { previewMode || edit != nil || model.isComposerEditable(composerID) }
+    private var editable: Bool { previewMode || edit != nil || restored && model.isComposerEditable(composerID) }
 
     var body: some View {
         let items = mentionItems
