@@ -7,12 +7,13 @@ struct SpaceView: View {
     let key: SpaceKey
     @Environment(\.isSnapshotMode) private var snapshotMode
     @Environment(\.titlebarHeight) private var titlebarHeight
-    @State private var dropTargeted = false
+    /// Rows of the conversation a drag is over; the composer shows its drop outline while there's at least one.
+    @State private var dropRows: Set<AnyHashable> = []
     @State private var members: [Membership] = []
 
     var body: some View {
         VStack(spacing: 0) {
-            MessageList(model: model, key: key, dropTargeted: $dropTargeted)
+            MessageList(model: model, key: key, dropRows: $dropRows)
                 // The title is centred over the conversation, not the window. Offscreen snapshots have no toolbar,
                 // so they also show the buttons here.
                 .safeAreaBar(edge: .top, spacing: 0) {
@@ -34,7 +35,7 @@ struct SpaceView: View {
                         // Solid, like the window, so messages scrolling under it never show through the title.
                         .background(Color(nsColor: .textBackgroundColor))
                 }
-            ComposerView(model: model, key: key, thread: nil, conversationDropTargeted: dropTargeted)
+            ComposerView(model: model, key: key, thread: nil, conversationDropTargeted: !dropRows.isEmpty)
         }
         .background(Color(nsColor: .textBackgroundColor))
         .toolbar {
@@ -251,13 +252,11 @@ private struct RevealTriggers: ViewModifier {
 struct MessageList: View {
     let model: AppModel
     let key: SpaceKey
-    @Binding var dropTargeted: Bool
+    @Binding var dropRows: Set<AnyHashable>
     /// Follows the newest message until the user scrolls away; content growing (cards, late layout) keeps it.
     @State private var pinned = true
-    /// Rows a drag is over; the composer shows its drop outline while there's at least one.
-    @State private var dropRows = 0
-    /// The same for the open thread's rows and its reply field.
-    @State private var threadDropRows = 0
+    /// The open thread's rows a drag is over; its reply field shows the drop outline while there's at least one.
+    @State private var threadDropRows: Set<AnyHashable> = []
     @State private var threadViewport = ThreadViewport()
     @State private var listFrame = CGRect.zero
     @State private var pendingScroll: ScrollRequest?
@@ -333,7 +332,7 @@ struct MessageList: View {
         return ScrollViewReader { proxy in
             List {
                 if !rows.isEmpty {
-                    takesDrops(historyHeader.frame(maxWidth: .infinity))
+                    takesDrops(historyHeader.frame(maxWidth: .infinity), id: "history")
                         .listRowSeparator(.hidden)
                 }
                 ForEach(rows) { row in
@@ -341,7 +340,8 @@ struct MessageList: View {
                     takesDrops(
                         MessageRow(
                             row: row, context: context, onOpenThread: threaded ? { toggle($0) } : nil,
-                            threadOpen: isOpen)
+                            threadOpen: isOpen),
+                        id: row.id
                     )
                     .listRowSeparator(.hidden)
                     .id(row.id)
@@ -372,11 +372,12 @@ struct MessageList: View {
                             item: item, context: context,
                             onRepost: { Task { await model.repostAsNewMessage(item, key: key) } },
                             onDiscard: { Task { await model.discard(item, key: key) } }
-                        )
+                        ),
+                        id: item.id
                     )
                     .listRowSeparator(.hidden)
                 }
-                takesDrops(Color.clear.frame(height: 1))
+                takesDrops(Color.clear.frame(height: 1), id: Self.bottom)
                     .listRowSeparator(.hidden)
                     .id(Self.bottom)
             }
@@ -430,7 +431,7 @@ struct MessageList: View {
             .onChange(of: model.openMessages.last?.id) { scroll(proxy, animated: true) }
             .onChange(of: model.openOutbox.count) { scroll(proxy, animated: true) }
             .onChange(of: model.openThread) { _, thread in
-                threadDropRows = 0
+                threadDropRows = []
                 guard let thread else { return cancelScroll() }
                 scrollLater(.thread, after: .milliseconds(80)) { withAnimation { reveal(thread, proxy) } }
             }
@@ -465,15 +466,8 @@ struct MessageList: View {
 
     /// Drops on the conversation's rows attach to its composer. Each row takes them itself: the list routes drops
     /// to its rows, and an open thread's rows send theirs to the thread instead.
-    private func takesDrops<V: View>(_ row: V) -> some View {
-        row.dropDestination(for: DroppedFile.self) { drops, _ in
-            dropRows = 0
-            dropTargeted = false
-            return model.addDroppedFiles(drops, to: ComposerID(key: key, thread: nil))
-        } isTargeted: { over in
-            dropRows = max(0, dropRows + (over ? 1 : -1))
-            dropTargeted = dropRows > 0
-        }
+    private func takesDrops<V: View>(_ row: V, id: AnyHashable) -> some View {
+        row.acceptsDrops(id: id, over: $dropRows) { model.addDroppedFiles($0, to: ComposerID(key: key, thread: nil)) }
     }
 
     /// Scrolls an open thread into view by its first message, which the list knows by id even off screen; the
@@ -590,4 +584,20 @@ private struct ScrollRequest {
     let selection: SpaceKey?
     let thread: ThreadName?
     let task: Task<Void, Never>
+}
+
+extension View {
+    /// Takes dropped files for `perform`, keeping `rows` to the rows a drag is over. A row removed or scrolled away
+    /// under a drag never reports it leaving, so disappearing counts as leaving.
+    func acceptsDrops(
+        id: AnyHashable, over rows: Binding<Set<AnyHashable>>, perform: @escaping ([DroppedFile]) -> Bool
+    ) -> some View {
+        dropDestination(for: DroppedFile.self) { drops, _ in
+            rows.wrappedValue = []
+            return perform(drops)
+        } isTargeted: { over in
+            if over { rows.wrappedValue.insert(id) } else { rows.wrappedValue.remove(id) }
+        }
+        .onDisappear { rows.wrappedValue.remove(id) }
+    }
 }
