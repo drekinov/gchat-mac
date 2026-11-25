@@ -10,6 +10,9 @@ struct GChatApp: App {
         _model = State(initialValue: model)
         responder = NotificationResponder.install(model: model)
         AppAppearance.applyStored()
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { _ in MainActor.assumeIsolated { model.shutdown() } }
     }
 
     var body: some Scene {

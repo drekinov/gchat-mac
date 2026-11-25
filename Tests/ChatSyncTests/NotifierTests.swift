@@ -8,17 +8,30 @@ import Testing
 
 @testable import ChatSync
 
+/// Records every attempt; `posted` holds only the accepted ones. `outcome` decides each attempt.
 final class RecordingPoster: NotificationPoster {
+    let attempted = Recorder<ChatNotification>()
     let posted = Recorder<ChatNotification>()
     let removedMessages = Recorder<[MessageName]>()
     let removedAccounts = Recorder<AccountID>()
+    private let decide = Mutex<@Sendable (ChatNotification) -> PostOutcome>({ _ in .accepted })
 
-    func post(_ request: ChatNotification) async { posted.append(request) }
+    func setOutcome(_ outcome: @escaping @Sendable (ChatNotification) -> PostOutcome) {
+        decide.withLock { $0 = outcome }
+    }
+
+    func post(_ request: ChatNotification) async -> PostOutcome {
+        attempted.append(request)
+        let outcome = decide.withLock { $0 }(request)
+        if outcome == .accepted { posted.append(request) }
+        return outcome
+    }
+
     func remove(account: AccountID) async { removedAccounts.append(account) }
     func remove(messages: [MessageName]) async { removedMessages.append(messages) }
 }
 
-/// Retires the gate on the first message read, i.e. between the notifier's scan and its commit.
+/// Retires the gate on the first message read, i.e. between the notifier's scan and its first post.
 final class RetiringStore: AccountStore {
     let base: any AccountStore
     let gate: SessionGate
@@ -33,7 +46,15 @@ final class RetiringStore: AccountStore {
     func space(_ name: SpaceName) throws(StoreError) -> StoredSpace? { try base.space(name) }
 
     func messages(in space: SpaceName, before: Timestamp?, limit: Int) throws(StoreError) -> [Message] {
-        let result = try base.messages(in: space, before: before, limit: limit)
+        try base.messages(in: space, before: before, limit: limit)
+    }
+
+    func messages(inThread thread: ThreadName, limit: Int) throws(StoreError) -> [Message] {
+        try base.messages(inThread: thread, limit: limit)
+    }
+
+    func message(_ name: MessageName) throws(StoreError) -> Message? {
+        let result = try base.message(name)
         if armed.withLock({ armed in
             defer { armed = false }
             return armed
@@ -43,11 +64,6 @@ final class RetiringStore: AccountStore {
         return result
     }
 
-    func messages(inThread thread: ThreadName, limit: Int) throws(StoreError) -> [Message] {
-        try base.messages(inThread: thread, limit: limit)
-    }
-
-    func message(_ name: MessageName) throws(StoreError) -> Message? { try base.message(name) }
     func checkpoint(_ space: SpaceName, _ stream: SyncStream) throws(StoreError) -> Timestamp? {
         try base.checkpoint(space, stream)
     }
@@ -57,7 +73,8 @@ final class RetiringStore: AccountStore {
     func outbox() throws(StoreError) -> [OutboxItem] { try base.outbox() }
     func isNotified(_ message: MessageName) throws(StoreError) -> Bool { try base.isNotified(message) }
     func meta(_ key: String) throws(StoreError) -> String? { try base.meta(key) }
-    func write(_ batch: StoreWrite, gate: SessionGate, generation: Generation) throws(StoreError) {
+    func metas(prefix: String) throws(StoreError) -> [String: String] { try base.metas(prefix: prefix) }
+    func write(_ batch: StoreWrite, gate: SessionGate, generation: Generation) throws(StoreError) -> StoreWriteResult {
         try base.write(batch, gate: gate, generation: generation)
     }
 }
@@ -91,8 +108,10 @@ struct NotifyRig: Sendable {
     var generation: Generation { gate.current! }
     var spaces: [SpaceName] { [team, dm] }
 
-    func makeNotifier(over store: any AccountStore) -> Notifier {
-        Notifier(account: account, store: store, gate: gate, me: alice.user.name, poster: poster, clock: clock)
+    func makeNotifier(over store: any AccountStore, poster: RecordingPoster? = nil) -> Notifier {
+        Notifier(
+            account: account, store: store, gate: gate, me: alice.user.name, poster: poster ?? self.poster,
+            clock: clock)
     }
 
     func settle() async throws {
@@ -120,14 +139,16 @@ struct NotifyRig: Sendable {
 
     @discardableResult
     func bobPosts(
-        _ text: String, in space: SpaceName? = nil, thread: ThreadName? = nil, annotations: [Annotation] = []
+        _ text: String, in space: SpaceName? = nil, thread: ThreadName? = nil, annotations: [Annotation] = [],
+        at: Timestamp? = nil
     ) -> Message {
-        server.post(text, in: space ?? team, from: .account(bob), thread: thread, annotations: annotations)
+        server.post(text, in: space ?? team, from: .account(bob), thread: thread, annotations: annotations, at: at)
     }
 
+    @discardableResult
     func process(
         _ spaces: Set<SpaceName>? = nil, focus: SpaceName? = nil, active: Bool = true, with notifier: Notifier? = nil
-    ) async {
+    ) async -> NotifyPass {
         await (notifier ?? self.notifier).process(
             spaces: spaces ?? Set(self.spaces), generation: generation,
             context: NotifierContext(focusedSpace: focus, appIsActive: active))
@@ -135,8 +156,17 @@ struct NotifyRig: Sendable {
 
     var bodies: [String] { poster.posted.all.map(\.body) }
 
+    func pending(_ space: SpaceName) throws -> NotifyRecord? { try store.notifyRecords()[space] }
+
     var mention: [Annotation] {
         [Annotation(kind: .userMention(alice.user.name), startIndex: 0, length: 5)]
+    }
+
+    /// Marks the space's cached window stale, so its next sync reseeds the newest messages.
+    func forceReseed(_ space: SpaceName) throws {
+        try store.write(gate: gate, generation: generation) {
+            $0.append(.setMeta(key: SyncEngine.formatKey(space), value: "stale"))
+        }
     }
 }
 
@@ -150,22 +180,22 @@ struct NotifierTests {
 
         await rig.process()
 
-        #expect(rig.poster.posted.all.isEmpty)
-        #expect(try rig.store.meta(Notifier.markKey(rig.team)) == nil)
+        #expect(rig.poster.attempted.all.isEmpty)
+        #expect(try rig.store.notifyRecords().isEmpty)
     }
 
-    @Test func firstPassSetsMarksWithoutPosting() async throws {
+    @Test func historyFromBeforeTheFirstSyncIsNeverQueued() async throws {
         let rig = NotifyRig()
         rig.bobPosts("history 1")
         rig.bobPosts("history 2", in: rig.dm)
         try await rig.settle()
         try rig.firstSyncDone()
+        try await rig.settle()
 
         await rig.process()
 
-        #expect(rig.poster.posted.all.isEmpty)
-        #expect(try rig.store.meta(Notifier.markKey(rig.team)) != nil)
-        #expect(try rig.store.meta(Notifier.markKey(rig.dm)) != nil)
+        #expect(rig.poster.attempted.all.isEmpty)
+        #expect(try rig.store.notifyRecords().isEmpty)
     }
 
     @Test func newMessagesPostOnceAndSurviveARestart() async throws {
@@ -177,14 +207,17 @@ struct NotifierTests {
 
         let message = rig.bobPosts("lunch?")
         try await rig.settle()
+        #expect(try rig.pending(rig.team)?.messages(in: rig.team) == [message.name])
         await rig.process()
         #expect(rig.bodies == ["Bob: lunch?"])
         let posted = try #require(rig.poster.posted.all.first)
         #expect(posted.title == "Team")
         #expect(posted.message == message.name)
+        #expect(posted.identifier == message.name.rawValue)
         #expect(posted.account == rig.account)
         #expect(posted.threadIdentifier == rig.team.rawValue)
         #expect(try rig.store.isNotified(message.name))
+        #expect(try rig.store.notifyRecords().isEmpty)
 
         await rig.process()
         #expect(rig.bodies.count == 1)
@@ -193,18 +226,15 @@ struct NotifierTests {
         await rig.process(with: restarted)
         #expect(rig.bodies.count == 1)
 
-        try rig.store.write(gate: rig.gate, generation: rig.generation) {
-            $0.append(.setMeta(key: Notifier.markKey(rig.team), value: nil))
-        }
+        try await rig.settle()
         await rig.process(with: restarted)
-        #expect(rig.bodies.count == 1, "the notified table alone must stop a repeat")
+        #expect(rig.bodies.count == 1, "the overlap refetch doesn't queue a stored message again")
     }
 
     @Test func directMessagesUseTheMessageTextAsTheBody() async throws {
         let rig = NotifyRig()
         try await rig.settle()
         try rig.firstSyncDone()
-        await rig.process()
 
         rig.bobPosts("ping", in: rig.dm)
         try await rig.settle()
@@ -218,7 +248,6 @@ struct NotifierTests {
         let rig = NotifyRig()
         try await rig.settle()
         try rig.firstSyncDone()
-        await rig.process()
 
         rig.bobPosts(String(repeating: "x", count: 500), in: rig.dm)
         try await rig.settle()
@@ -231,12 +260,12 @@ struct NotifierTests {
         let rig = NotifyRig()
         try await rig.settle()
         try rig.firstSyncDone()
-        await rig.process()
 
         rig.bobPosts("seen")
         try await rig.settle()
         await rig.process(focus: rig.team, active: true)
-        #expect(rig.poster.posted.all.isEmpty)
+        #expect(rig.poster.attempted.all.isEmpty)
+        #expect(try rig.pending(rig.team) == nil)
 
         rig.bobPosts("elsewhere", in: rig.dm)
         try await rig.settle()
@@ -258,13 +287,32 @@ struct NotifierTests {
         try await rig.settle()
         try rig.firstSyncDone()
         try rig.configure(rig.team, level, muted: true)
-        await rig.process()
 
         rig.bobPosts("hello", annotations: rig.mention)
         try await rig.settle()
         await rig.process()
 
-        #expect(rig.poster.posted.all.isEmpty)
+        #expect(rig.poster.attempted.all.isEmpty)
+        #expect(try rig.store.notifyRecords().isEmpty, "ineligible messages never reach the queue")
+    }
+
+    @Test(arguments: [(NotificationLevel.all, true), (.off, false)])
+    func aSettingChangedAfterQueueingIsHonouredAtPostTime(_ level: NotificationLevel, _ muted: Bool) async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+        try rig.configure(rig.team, .all)
+        for index in 0..<7 { rig.bobPosts("queued \(index)") }
+        try await rig.settle()
+        rig.bobPosts("single", in: rig.dm)
+        try await rig.settle()
+        try rig.configure(rig.team, level, muted: muted)
+        try rig.configure(rig.dm, level, muted: muted)
+        #expect(try rig.pending(rig.team) != nil)
+
+        await rig.process()
+        #expect(rig.poster.posted.all.isEmpty, "a preview reached a silenced space")
+        #expect(try rig.store.notifyRecords().isEmpty)
     }
 
     @Test func offNeverNotifies() async throws {
@@ -273,14 +321,13 @@ struct NotifierTests {
         try rig.firstSyncDone()
         try rig.configure(rig.team, .off)
         try rig.configure(rig.dm, .off)
-        await rig.process()
 
         rig.bobPosts("hello", annotations: rig.mention)
         rig.bobPosts("hello", in: rig.dm)
         try await rig.settle()
         await rig.process()
 
-        #expect(rig.poster.posted.all.isEmpty)
+        #expect(rig.poster.attempted.all.isEmpty)
     }
 
     @Test func forYouNotifiesForMentionsAndDirectMessages() async throws {
@@ -289,7 +336,6 @@ struct NotifierTests {
         try rig.firstSyncDone()
         try rig.configure(rig.team, .forYou)
         try rig.configure(rig.dm, .forYou)
-        await rig.process()
 
         rig.bobPosts("chatter")
         rig.bobPosts("@Alice look", annotations: rig.mention)
@@ -309,7 +355,6 @@ struct NotifierTests {
         try await rig.settle()
         try rig.firstSyncDone()
         try rig.configure(rig.team, .mainConversations)
-        await rig.process()
 
         rig.bobPosts("reply to mine", thread: mine.thread)
         rig.bobPosts("reply to theirs", thread: theirs.thread)
@@ -326,72 +371,335 @@ struct NotifierTests {
         let theirs = rig.bobPosts("their post")
         try await rig.settle()
         try rig.firstSyncDone()
-        await rig.process()
 
         rig.bobPosts("before I joined", thread: theirs.thread)
         try await rig.settle()
         await rig.process()
-        #expect(rig.poster.posted.all.isEmpty)
+        #expect(rig.poster.attempted.all.isEmpty)
 
         rig.server.post("me too", in: rig.team, from: .account(rig.alice), thread: theirs.thread)
-        try await rig.settle()
-        await rig.process()
         rig.bobPosts("after I joined", thread: theirs.thread)
         try await rig.settle()
         await rig.process()
-        #expect(rig.bodies == ["Bob: after I joined"])
+        #expect(rig.bodies == ["Bob: after I joined"], "participation counts the batch being committed")
     }
 
-    @Test func sixMessagesInOnePassBecomeOneSummaryPerSpace() async throws {
+    @Test func moreThanFiveInASpaceBecomeOneSummaryForThatSpaceOnly() async throws {
         let rig = NotifyRig()
         try await rig.settle()
         try rig.firstSyncDone()
-        await rig.process()
 
-        for index in 0..<4 { rig.bobPosts("t\(index)") }
+        for index in 0..<5 { rig.bobPosts("t\(index)") }
         rig.bobPosts("d0", in: rig.dm)
         try await rig.settle()
         await rig.process()
-        #expect(rig.bodies.count == 5, "five messages stay individual")
+        #expect(rig.bodies.count == 6, "five messages in a space stay individual")
 
-        for index in 0..<5 { rig.bobPosts("u\(index)") }
+        for index in 0..<6 { rig.bobPosts("u\(index)") }
         rig.bobPosts("d1", in: rig.dm)
         try await rig.settle()
         await rig.process()
 
-        let summaries = Array(rig.poster.posted.all.dropFirst(5))
-        #expect(Set(summaries.map(\.body)) == ["5 new messages in Team", "1 new message in Direct message"])
-        #expect(summaries.allSatisfy { $0.message == nil })
-        #expect(Set(summaries.map(\.identifier)).count == 2)
-        let stored = try rig.store.messages(in: rig.team, before: nil, limit: 100)
-        for message in stored { #expect(try rig.store.isNotified(message.name)) }
+        let later = Array(rig.poster.posted.all.dropFirst(6))
+        #expect(Set(later.map(\.body)) == ["6 new messages in Team", "d1"])
+        #expect(later.first { $0.space == rig.team }?.message == nil)
+        #expect(try rig.store.notifyRecords().isEmpty)
     }
 
-    @Test func summariesAreCappedAtFivePerPass() async throws {
+    @Test func moreThanTwentyPendingCollapseIntoAnOverflowSummary() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        for index in 0..<25 { rig.bobPosts("m\(index)") }
+        try await rig.settle()
+        #expect(try rig.pending(rig.team) == NotifyRecord(ids: [], overflow: 25))
+        await rig.process()
+
+        #expect(rig.bodies == ["25 new messages in Team"])
+        #expect(try rig.store.notifyRecords().isEmpty)
+    }
+
+    @Test func candidatesArrivingDuringAPostAreCountedOnce() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+        for index in 0..<5 { rig.bobPosts("m\(index)") }
+        try await rig.settle()
+        let late = (0..<18).map { MessageName(unchecked: "\(rig.team.rawValue)/messages/late\($0)") }
+        let first = Mutex(true)
+        let (store, gate, generation, team) = (rig.store, rig.gate, rig.generation, rig.team)
+        rig.poster.setOutcome { _ in
+            if first.withLock({ $0 }) {
+                first.withLock { $0 = false }
+                _ = try? store.write(gate: gate, generation: generation) { $0.append(.addNotifyCandidates(team, late)) }
+            }
+            return .accepted
+        }
+        await rig.process()
+        #expect(rig.bodies.count == 5)
+
+        await rig.process()
+        #expect(rig.bodies.last == "18 new messages in Team")
+        #expect(try rig.store.notifyRecords().isEmpty)
+    }
+
+    @Test func aPassPostsAtMostTenAndTheRestFollow() async throws {
         let rig = NotifyRig()
         var extra: [SpaceName] = []
-        for index in 0..<7 {
+        for index in 0..<12 {
             extra.append(rig.server.addSpace(.space, displayName: "Room \(index)", members: [rig.alice, rig.bob]))
         }
         try await rig.settle()
         try rig.firstSyncDone()
         for space in extra { try await rig.engine.syncMessages(space, rig.generation) }
-        await rig.process(Set(extra))
 
         for space in extra { rig.bobPosts("hello", in: space) }
         rig.server.advance(.seconds(5))
         for space in extra { try await rig.engine.syncMessages(space, rig.generation) }
-        await rig.process(Set(extra))
+        let first = await rig.process(Set(extra))
+        #expect(rig.poster.posted.all.count == 10)
+        #expect(first.more)
 
-        #expect(rig.poster.posted.all.count == 5)
-        #expect(rig.poster.posted.all.allSatisfy { $0.message == nil })
+        let second = await rig.process(Set(extra))
+        #expect(rig.poster.posted.all.count == 12)
+        #expect(!second.more)
+        #expect(Set(rig.poster.posted.all.map(\.space)) == Set(extra))
+    }
+
+    @Test func partialSuccessKeepsOnlyTheFailedPostPending() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        let failing = rig.bobPosts("flaky")
+        rig.bobPosts("fine")
+        try await rig.settle()
+        rig.poster.setOutcome { $0.message == failing.name ? .retryable("notifications.1") : .accepted }
+        let pass = await rig.process()
+
+        #expect(pass.retry)
+        #expect(rig.bodies == ["Bob: fine"])
+        #expect(try rig.pending(rig.team)?.messages(in: rig.team) == [failing.name])
+        #expect(try !rig.store.isNotified(failing.name))
+
+        rig.poster.setOutcome { _ in .accepted }
+        let retried = await rig.process([])
+        #expect(!retried.retry)
+        #expect(rig.bodies == ["Bob: fine", "Bob: flaky"])
+        #expect(try rig.store.notifyRecords().isEmpty)
+    }
+
+    @Test func suppressedPostsAreNotRetried() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        let message = rig.bobPosts("quiet please")
+        try await rig.settle()
+        rig.poster.setOutcome { _ in .suppressed }
+        let pass = await rig.process()
+
+        #expect(!pass.retry)
+        #expect(try rig.store.notifyRecords().isEmpty)
+        #expect(try !rig.store.isNotified(message.name))
+    }
+
+    @Test func aRestartBeforeTheRetryStillPosts() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        rig.bobPosts("during an outage")
+        try await rig.settle()
+        rig.poster.setOutcome { _ in .retryable("notifications.1") }
+        await rig.process()
+        #expect(rig.bodies.isEmpty)
+
+        let fresh = RecordingPoster()
+        await rig.process([], with: rig.makeNotifier(over: rig.store, poster: fresh))
+        #expect(fresh.posted.all.map(\.body) == ["Bob: during an outage"])
+    }
+
+    @Test func aFailedSummaryStaysNextToASuccessfulOne() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        for index in 0..<25 {
+            rig.bobPosts("t\(index)")
+            rig.bobPosts("d\(index)", in: rig.dm)
+        }
+        try await rig.settle()
+        let team = rig.team
+        rig.poster.setOutcome { $0.space == team ? .retryable("notifications.1") : .accepted }
+        let pass = await rig.process()
+
+        #expect(pass.retry)
+        #expect(rig.bodies == ["25 new messages in Direct message"])
+        #expect(try rig.pending(rig.dm) == nil)
+        #expect(try rig.pending(rig.team)?.overflow == 25)
+
+        rig.poster.setOutcome { _ in .accepted }
+        await rig.process([])
+        #expect(rig.bodies.last == "25 new messages in Team")
+        #expect(try rig.store.notifyRecords().isEmpty)
+    }
+
+    @Test func aLargeCatchUpCountsEligibleMessagesOnly() async throws {
+        let rig = NotifyRig()
+        let root = rig.bobPosts("their thread")
+        try await rig.settle()
+        try rig.firstSyncDone()
+        try rig.configure(rig.team, .mainConversations)
+
+        for index in 0..<300 {
+            rig.bobPosts("top \(index)")
+            rig.bobPosts("reply \(index)", thread: root.thread)
+        }
+        try await rig.settle()
+        await rig.process()
+
+        #expect(rig.bodies == ["300 new messages in Team"], "pruned rows are still counted, suppressed ones never")
+    }
+
+    @Test func aLateMessageFoundByReconcileBehindTheCatchUpIsNotified() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+        let early = rig.clock.now()
+        rig.bobPosts("before", at: early)
+        rig.bobPosts("after", at: early.adding(.seconds(5)))
+        rig.server.advance(.seconds(10))
+        try await rig.engine.syncMessages(rig.team, rig.generation)
+        await rig.process()
+
+        let late = rig.bobPosts("late", at: early.adding(.seconds(1)))
+        try await rig.engine.syncEvents(rig.team, rig.generation)
+        #expect(try rig.store.message(late.name) != nil)
+        await rig.process()
+        #expect(rig.bodies == ["Bob: before", "Bob: after", "Bob: late"])
+
+        try await rig.settle()
+        await rig.process()
+        #expect(rig.bodies.count == 3)
+    }
+
+    @Test func aReconcileAfterALargeCatchUpPostsNoSecondSummary() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+        for index in 0..<600 { rig.bobPosts("m\(index)") }
+        rig.server.advance(.seconds(5))
+        try await rig.engine.syncMessages(rig.team, rig.generation)
+        await rig.process()
+        #expect(rig.bodies == ["600 new messages in Team"])
+
+        try await rig.engine.syncEvents(rig.team, rig.generation)
+        await rig.process()
+        #expect(rig.bodies == ["600 new messages in Team"], "pruned rows were decided once already")
+        #expect(try rig.store.notifyRecords().isEmpty)
+    }
+
+    @Test func aRecoveredOlderMessageIsStillNotified() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+        let early = rig.clock.now()
+        rig.server.advance(.seconds(10))
+        rig.bobPosts("newer")
+        try await rig.settle()
+        await rig.process()
+        #expect(rig.bodies == ["Bob: newer"])
+
+        let late = rig.bobPosts("late", at: early.adding(.seconds(1)))
+        _ = try rig.engine.recordEvents(
+            [.messagesCreated(space: rig.team, messages: [late.name], time: late.createTime)], rig.generation)
+        try await rig.settle()
+        #expect(try rig.store.message(late.name) != nil)
+        #expect(try rig.store.owed(rig.team) == nil)
+        await rig.process()
+
+        #expect(rig.bodies == ["Bob: newer", "Bob: late"])
+    }
+
+    @Test func aReseedGapIsSummarized() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        for index in 0..<60 { rig.server.post("mine \(index)", in: rig.team, from: .account(rig.alice)) }
+        try rig.forceReseed(rig.team)
+        try await rig.settle()
+        #expect(try rig.pending(rig.team) == NotifyRecord(gap: true))
+        await rig.process()
+
+        #expect(rig.bodies == ["New messages in Team"])
+        #expect(rig.poster.posted.all.first?.message == nil)
+        #expect(try rig.store.notifyRecords().isEmpty)
+    }
+
+    @Test func aReseedGapCountsTheSeededCandidates() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        for index in 0..<60 { rig.bobPosts("b\(index)") }
+        try rig.forceReseed(rig.team)
+        try await rig.settle()
+        await rig.process()
+
+        #expect(rig.bodies == ["50 new messages in Team"])
+    }
+
+    @Test func aPageCapFallbackFlagsTheGapAndClearsTheListingRow() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        let count = SyncEngine.maxCatchUpPages * SyncEngine.pageSize + 1
+        for index in 0..<count { rig.bobPosts("flood \(index)") }
+        rig.server.advance(.seconds(5))
+        _ = try await rig.engine.syncSpaces(rig.generation)
+        #expect(try rig.store.owed(rig.team) != nil)
+        try await rig.engine.syncMessages(rig.team, rig.generation)
+
+        #expect(try rig.store.owed(rig.team) == nil, "the newest seeded message reaches the listing boundary")
+        #expect(try rig.pending(rig.team) == NotifyRecord(ids: [], overflow: SyncEngine.initialMessages, gap: true))
+        await rig.process()
+        #expect(rig.bodies == ["50 new messages in Team"])
+    }
+
+    @Test func aReseedGapIsSuppressedDuringTheFirstSyncWhenMutedAndInFocus() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        for index in 0..<60 { rig.bobPosts("before \(index)") }
+        try rig.forceReseed(rig.team)
+        try await rig.settle()
+        #expect(try rig.pending(rig.team) == nil, "no gap before the first sync completes")
+
+        try rig.firstSyncDone()
+        try rig.configure(rig.team, .all, muted: true)
+        for index in 0..<60 { rig.bobPosts("muted \(index)") }
+        try rig.forceReseed(rig.team)
+        try await rig.settle()
+        #expect(try rig.pending(rig.team) == nil, "no gap while muted")
+
+        try rig.configure(rig.team, .all, muted: false)
+        for index in 0..<60 { rig.server.post("mine \(index)", in: rig.team, from: .account(rig.alice)) }
+        try rig.forceReseed(rig.team)
+        try await rig.settle()
+        #expect(try rig.pending(rig.team)?.gap == true)
+        await rig.process(focus: rig.team, active: true)
+
+        #expect(rig.poster.attempted.all.isEmpty)
+        #expect(try rig.store.notifyRecords().isEmpty)
     }
 
     @Test func aRetiredGenerationPostsAndCommitsNothing() async throws {
         let rig = NotifyRig()
         try await rig.settle()
         try rig.firstSyncDone()
-        await rig.process()
 
         let message = rig.bobPosts("too late")
         try await rig.settle()
@@ -402,28 +710,52 @@ struct NotifierTests {
             spaces: [rig.team], generation: old, context: NotifierContext(focusedSpace: nil, appIsActive: true))
 
         #expect(rig.gate.isCurrent(old) == false)
-        #expect(rig.poster.posted.all.isEmpty)
+        #expect(rig.poster.attempted.all.isEmpty)
         #expect(try rig.store.isNotified(message.name) == false)
+        #expect(try rig.store.notifyRecords()[rig.team]?.messages(in: rig.team) == [message.name])
+    }
+
+    @Test func aCrashAfterPostingRepostsUnderTheSameIdentifier() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        let message = rig.bobPosts("posted, then crashed")
+        try await rig.settle()
+        let gate = rig.gate
+        rig.poster.setOutcome { _ in
+            gate.retire()
+            return .accepted
+        }
+        await rig.process()
+        #expect(try rig.pending(rig.team)?.messages(in: rig.team) == [message.name])
+
+        _ = rig.gate.activate()
+        rig.poster.setOutcome { _ in .accepted }
+        await rig.process([], with: rig.makeNotifier(over: rig.store))
+        #expect(Set(rig.poster.posted.all.map(\.identifier)) == [message.name.rawValue])
+        #expect(try rig.store.notifyRecords().isEmpty)
     }
 
     @Test func aGenerationRetiredBeforeTheCallDoesNothing() async throws {
         let rig = NotifyRig()
         try await rig.settle()
         try rig.firstSyncDone()
+        rig.bobPosts("pending")
+        try await rig.settle()
         let old = rig.generation
         rig.gate.retire()
         await rig.notifier.process(
             spaces: [rig.team], generation: old, context: NotifierContext(focusedSpace: nil, appIsActive: true))
 
-        #expect(rig.poster.posted.all.isEmpty)
-        #expect(try rig.store.meta(Notifier.markKey(rig.team)) == nil)
+        #expect(rig.poster.attempted.all.isEmpty)
+        #expect(try rig.store.notifyRecords()[rig.team] != nil)
     }
 
     @Test func deletingANotifiedMessageRequestsItsRemoval() async throws {
         let rig = NotifyRig()
         try await rig.settle()
         try rig.firstSyncDone()
-        await rig.process()
 
         let message = rig.bobPosts("oops")
         try await rig.settle()
@@ -440,12 +772,26 @@ struct NotifierTests {
         #expect(rig.poster.removedMessages.all.count == 1)
     }
 
+    @Test func aMessageDeletedBeforeItsPostIsDropped() async throws {
+        let rig = NotifyRig()
+        try await rig.settle()
+        try rig.firstSyncDone()
+
+        let message = rig.bobPosts("gone soon")
+        try await rig.settle()
+        rig.server.delete(message.name)
+        try await rig.settle()
+        await rig.process()
+
+        #expect(rig.poster.attempted.all.isEmpty)
+        #expect(try rig.store.notifyRecords().isEmpty)
+    }
+
     @Test func deletingAMessageThatNeverNotifiedRequestsNothing() async throws {
         let rig = NotifyRig()
         try await rig.settle()
         try rig.firstSyncDone()
         try rig.configure(rig.team, .all, muted: true)
-        await rig.process()
 
         let message = rig.bobPosts("quiet")
         try await rig.settle()
@@ -454,7 +800,7 @@ struct NotifierTests {
         try await rig.settle()
         await rig.process()
 
-        #expect(rig.poster.posted.all.isEmpty)
+        #expect(rig.poster.attempted.all.isEmpty)
         #expect(rig.poster.removedMessages.all.isEmpty)
     }
 
@@ -520,5 +866,89 @@ struct SessionNotificationTests {
 
         recorder.cancel()
         _ = await session.logout(refreshToken: nil)
+    }
+}
+
+struct SessionNotificationRetryTests {
+    struct World {
+        let server = FakeChatServer()
+        let alice: FakeAccount
+        let bob: FakeAccount
+        let spaces: [SpaceName]
+        let scratch = ScratchDirectory()
+        let poster = RecordingPoster()
+        let session: AccountSession
+
+        init(spaces count: Int, clock: (FakeChatServer) -> any SyncClock) {
+            alice = server.addAccount(displayName: "Alice")
+            bob = server.addAccount(displayName: "Bob")
+            var spaces: [SpaceName] = []
+            for index in 0..<count {
+                spaces.append(server.addSpace(.space, displayName: "Room \(index)", members: [alice, bob]))
+            }
+            self.spaces = spaces
+            server.advance(.seconds(5))
+            var timing = SessionTiming.fast
+            timing.sidebarInterval = .seconds(3600)
+            timing.inactiveSidebarInterval = .seconds(3600)
+            session = AccountSession(
+                account: AccountID(), me: alice.user.name,
+                api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: alice.token)),
+                store: InMemoryAccountStore(), clock: clock(server),
+                logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
+                timing: timing, notifications: poster)
+        }
+
+        /// Starts the session, waits for the first sync, then posts one message per space and catches up.
+        func startAndPost() async -> Bool {
+            let recorder = SnapshotRecorder(session.snapshots.values)
+            defer { recorder.cancel() }
+            await session.start()
+            guard await recorder.wait(where: { $0.status == .ok && $0.spaces.count == spaces.count }) != nil else {
+                return false
+            }
+            server.advance(.seconds(1))
+            for space in spaces { server.post("hello", in: space, from: .account(bob)) }
+            server.advance(.seconds(5))
+            await session.systemDidWake()
+            return true
+        }
+    }
+
+    @Test func failingPostsAtTheCapDoNotSpin() async throws {
+        let world = World(spaces: 12, clock: { RealSleepClock(server: $0) })
+        world.poster.setOutcome { _ in .retryable("notifications.1") }
+        #expect(await world.startAndPost())
+        #expect(await poll { world.poster.attempted.all.count >= Notifier.maxPerPass })
+        try await Task.sleep(for: .milliseconds(300))
+
+        #expect(world.poster.attempted.all.count <= 3 * Notifier.maxPerPass)
+        #expect(world.poster.posted.all.isEmpty)
+        _ = await world.session.logout(refreshToken: nil)
+    }
+
+    @Test func tenFailingSpacesDoNotStarveAHealthyOne() async throws {
+        let world = World(spaces: Notifier.maxPerPass + 1, clock: { RealSleepClock(server: $0) })
+        let healthy = try #require(world.spaces.max())
+        world.poster.setOutcome { $0.space == healthy ? .accepted : .retryable("notifications.1") }
+        #expect(await world.startAndPost())
+
+        #expect(await poll(timeout: .seconds(2)) { world.poster.posted.all.map(\.space) == [healthy] })
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(world.poster.attempted.all.count <= 3 * (Notifier.maxPerPass + 1))
+        _ = await world.session.logout(refreshToken: nil)
+    }
+
+    @Test func theRetryTimerPostsWithoutANewCommit() async throws {
+        let world = World(spaces: 1, clock: { SteppingClock(server: $0) })
+        let failing = Mutex(true)
+        world.poster.setOutcome { _ in failing.withLock { $0 } ? .retryable("notifications.1") : .accepted }
+        #expect(await world.startAndPost())
+        #expect(await poll { !world.poster.attempted.all.isEmpty })
+        failing.withLock { $0 = false }
+
+        #expect(await poll { world.poster.posted.all.count == 1 })
+        #expect(world.poster.posted.all.first?.body == "Bob: hello")
+        _ = await world.session.logout(refreshToken: nil)
     }
 }

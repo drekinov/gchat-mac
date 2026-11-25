@@ -1,0 +1,7 @@
+{
+  "name": "operations/op-2",
+  "done": true,
+  "response": {
+    "@type": "type.googleapis.com/google.protobuf.Empty"
+  }
+}

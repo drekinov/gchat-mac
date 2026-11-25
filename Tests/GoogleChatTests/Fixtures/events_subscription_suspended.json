@@ -1,0 +1,13 @@
+{
+  "name": "subscriptions/sub-abc123",
+  "targetResource": "//chat.googleapis.com/spaces/-",
+  "eventTypes": [
+    "google.workspace.chat.message.v1.created"
+  ],
+  "notificationEndpoint": {
+    "pubsubTopic": "projects/example-project/topics/events-1"
+  },
+  "state": "SUSPENDED",
+  "suspensionReason": "USER_SCOPE_REVOKED",
+  "expireTime": "2026-01-08T00:00:00Z"
+}

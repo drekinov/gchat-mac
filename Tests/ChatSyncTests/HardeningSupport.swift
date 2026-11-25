@@ -651,6 +651,8 @@ extension SessionTiming {
     static var fast: SessionTiming {
         var timing = SessionTiming()
         timing.sidebarInterval = .milliseconds(50)
+        timing.inactiveSidebarInterval = .milliseconds(50)
+        timing.liveSidebarInterval = .milliseconds(50)
         timing.focusInterval = 0.01...0.02
         timing.idleSleep = .milliseconds(10)
         timing.logoutDrain = .milliseconds(200)

@@ -344,14 +344,45 @@ public final class SQLiteAccountStore: AccountStore {
         }
     }
 
+    public func metas(prefix: String) throws(StoreError) -> [String: String] {
+        try withConnection { connection throws(StoreError) in
+            let rows: [(String, Data)]
+            if let upper = Self.upperBound(of: prefix) {
+                rows = try connection.prepare("SELECT key, payload FROM meta WHERE key >= ?1 AND key < ?2").rows([
+                    .text(prefix), .text(upper),
+                ]) { ($0.text(0), $0.blob(1)) }
+            } else {
+                rows = try connection.prepare("SELECT key, payload FROM meta WHERE key >= ?1").rows([.text(prefix)]) {
+                    ($0.text(0), $0.blob(1))
+                }
+            }
+            var values: [String: String] = [:]
+            for (key, blob) in rows where key.hasPrefix(prefix) {
+                values[key] = try self.codec.open(blob, as: String.self, table: "meta", rowKey: key)
+            }
+            return values
+        }
+    }
+
+    /// The smallest key above every key with `prefix`, when its last character is printable ASCII.
+    static func upperBound(of prefix: String) -> String? {
+        guard let last = prefix.utf8.last, last >= 0x20, last < 0x7E else { return nil }
+        return String(prefix.dropLast()) + String(UnicodeScalar(last + 1))
+    }
+
     // MARK: Writes
 
-    public func write(_ batch: StoreWrite, gate: SessionGate, generation: Generation) throws(StoreError) {
+    @discardableResult
+    public func write(
+        _ batch: StoreWrite, gate: SessionGate, generation: Generation
+    ) throws(StoreError) -> StoreWriteResult {
         do {
-            try gate.commit(generation) { () throws(StoreError) in
-                try self.withConnection { connection throws(StoreError) in
-                    try connection.transaction { () throws(StoreError) in
-                        for operation in batch.operations { try self.apply(operation, connection) }
+            return try gate.commit(generation) { () throws(StoreError) -> StoreWriteResult in
+                try self.withConnection { connection throws(StoreError) -> StoreWriteResult in
+                    try connection.transaction { () throws(StoreError) -> StoreWriteResult in
+                        var result = StoreWriteResult()
+                        for operation in batch.operations { try self.apply(operation, connection, &result) }
+                        return result
                     }
                 }
             }
@@ -362,7 +393,37 @@ public final class SQLiteAccountStore: AccountStore {
         }
     }
 
-    private func apply(_ operation: StoreWrite.Operation, _ c: Connection) throws(StoreError) {
+    private func exists(_ table: String, _ column: String, _ value: String, _ c: Connection) throws(StoreError) -> Bool
+    {
+        try c.prepare("SELECT 1 FROM \(table) WHERE \(column) = ?1").first([.text(value)]) { $0.int(0) } != nil
+    }
+
+    private func readMeta(_ key: String, _ c: Connection) throws(StoreError) -> String? {
+        guard let blob = try c.prepare("SELECT payload FROM meta WHERE key = ?1").first([.text(key)], { $0.blob(0) })
+        else { return nil }
+        return try codec.open(blob, as: String.self, table: "meta", rowKey: key)
+    }
+
+    private func writeMeta(_ key: String, _ value: String?, _ c: Connection) throws(StoreError) {
+        if let value {
+            let sealed = try codec.seal(value, table: "meta", rowKey: key)
+            try c.prepare("INSERT OR REPLACE INTO meta (key, payload) VALUES (?1, ?2)").run([.text(key), .blob(sealed)])
+        } else {
+            try c.prepare("DELETE FROM meta WHERE key = ?1").run([.text(key)])
+        }
+    }
+
+    private func apply(
+        _ operation: StoreWrite.Operation, _ c: Connection, _ result: inout StoreWriteResult
+    ) throws(StoreError) {
+        let handled = try Bookkeeping.apply(
+            operation,
+            get: { (key) throws(StoreError) in try self.readMeta(key, c) },
+            set: { (key, value) throws(StoreError) in try self.writeMeta(key, value, c) },
+            hasMessage: { (name) throws(StoreError) in try self.exists("messages", "name", name.rawValue, c) },
+            isNotified: { (name) throws(StoreError) in try self.exists("notified", "message", name.rawValue, c) },
+            result: &result)
+        if handled { return }
         switch operation {
         case .mergeSpace(let space): try mergeSpace(space, c)
         case .setSpaceHidden(let name, let hidden):
@@ -431,14 +492,7 @@ public final class SQLiteAccountStore: AccountStore {
                 try statement.run([.text(name.rawValue), .text(name.space.rawValue), .seconds(time), .nanos(time)])
             }
         case .setMeta(let key, let value):
-            if let value {
-                let sealed = try codec.seal(value, table: "meta", rowKey: key)
-                try c.prepare("INSERT OR REPLACE INTO meta (key, payload) VALUES (?1, ?2)").run([
-                    .text(key), .blob(sealed),
-                ])
-            } else {
-                try c.prepare("DELETE FROM meta WHERE key = ?1").run([.text(key)])
-            }
+            try writeMeta(key, value, c)
         case .pruneMessages(let space, let keep):
             try c.prepare(
                 """
@@ -447,6 +501,9 @@ public final class SQLiteAccountStore: AccountStore {
                     ORDER BY create_s DESC, create_n DESC, name DESC LIMIT ?2)
                 """
             ).run([.text(space.rawValue), .int(Int64(max(0, keep)))])
+        case .mergeOwed, .resolveOwed, .deferOwed, .owedOmitted, .clearOwed, .bumpRelist, .resolveRelist,
+            .addNotifyCandidates, .flagNotifyGap, .removeNotifyPending:
+            break
         }
     }
 
@@ -569,5 +626,6 @@ public final class SQLiteAccountStore: AccountStore {
         for table in ["messages", "members", "drafts", "read_state", "sync_checkpoints", "notified"] {
             try c.prepare("DELETE FROM \(table) WHERE space = ?1").run(key)
         }
+        try writeMeta(NotifyRecord.key(name), nil, c)
     }
 }

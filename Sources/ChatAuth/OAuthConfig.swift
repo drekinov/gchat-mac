@@ -90,8 +90,15 @@ public enum OAuthScopes {
     /// Requested too, but a login without them still works; the features they enable turn off.
     public static let optional: [String] = ["directory.readonly"].map { prefix + $0 }
 
+    /// Live notifications only; never part of an ordinary sign-in.
+    public static let pubsub = prefix + "pubsub"
+
     public static func hasDirectory(_ granted: String) -> Bool {
         granted.split(separator: " ").contains { $0 == "https://www.googleapis.com/auth/directory.readonly" }
+    }
+
+    public static func hasPubSub(_ granted: String) -> Bool {
+        granted.split(separator: " ").contains { $0 == pubsub }
     }
 
     /// Google may return `email` as its full URL form; both count.
@@ -99,9 +106,9 @@ public enum OAuthScopes {
         scope == "https://www.googleapis.com/auth/userinfo.email" ? "email" : scope
     }
 
-    public static func missing(from granted: String) -> [String] {
+    public static func missing(from granted: String, also extra: [String] = []) -> [String] {
         let have = Set(granted.split(separator: " ").map { normalize(String($0)) })
-        return required.filter { !have.contains($0) }
+        return (required + extra).filter { !have.contains($0) }
     }
 }
 

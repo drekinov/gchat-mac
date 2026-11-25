@@ -8,6 +8,9 @@ public struct FailureRule: Sendable {
         case getSpaceReadState, updateSpaceReadState, getThreadReadState, getNotificationSetting, listCustomEmojis
         case updateThreadReadState, searchMessages
         case createReaction, deleteReaction, listReactions, uploadAttachment, downloadMedia, setUpSpace, searchDirectory
+        case createEventSubscription, getEventSubscription, listEventSubscriptions, patchEventSubscription
+        case reactivateEventSubscription, deleteEventSubscription, getEventOperation
+        case getPullSubscription, pull, acknowledge
     }
 
     public enum Response: Sendable {

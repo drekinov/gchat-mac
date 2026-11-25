@@ -61,6 +61,27 @@ public struct StoreWrite: Sendable {
         case setMeta(key: String, value: String?)
         /// Keeps the newest `keep` messages of a space by `createTime`.
         case pruneMessages(SpaceName, keep: Int)
+        /// Raises the owed boundary, adds the IDs (up to `OwedRecord.maxMessages`), resets attempts and takes a new
+        /// revision. IDs that don't fit are reported in `StoreWriteResult.rejectedOwed`.
+        case mergeOwed(SpaceName, boundary: Timestamp, messages: [MessageName])
+        /// Drops IDs now stored or in `fetched` (deleted on the server). Deletes the row only if its revision is
+        /// still `revision`, `coveredUpTo` is strictly past the boundary, and no ID is left.
+        case resolveOwed(SpaceName, revision: UInt64, coveredUpTo: Timestamp?, fetched: [MessageName])
+        /// A failed attempt at `revision`: backs off, or drops a row without IDs after `OwedRecord.maxAttempts`.
+        case deferOwed(SpaceName, revision: UInt64, at: Timestamp)
+        /// A complete listing omitted the space; a row without IDs goes after `OwedRecord.maxOmissions`.
+        /// Like `clearOwed`, it skips a row whose revision is no longer the one the listing started with.
+        case owedOmitted(SpaceName, revision: UInt64)
+        case clearOwed(SpaceName, revision: UInt64)
+        case bumpRelist
+        /// Resolves relist requests up to `version`, the requested version seen when the listing started.
+        case resolveRelist(UInt64)
+        /// Must precede the batch's message writes: IDs already stored or notified are skipped.
+        case addNotifyCandidates(SpaceName, [MessageName])
+        case flagNotifyGap(SpaceName)
+        /// Removes posted or suppressed IDs, from the overflow for those folded into it since; subtracts `overflow`
+        /// and, if `gap`, clears the gap flag.
+        case removeNotifyPending(SpaceName, messages: [MessageName], overflow: Int, gap: Bool)
     }
 
     public private(set) var operations: [Operation] = []
@@ -88,17 +109,53 @@ public protocol AccountStore: AnyObject, Sendable {
     func outbox() throws(StoreError) -> [OutboxItem]
     func isNotified(_ message: MessageName) throws(StoreError) -> Bool
     func meta(_ key: String) throws(StoreError) -> String?
+    /// Every meta entry whose key starts with `prefix`.
+    func metas(prefix: String) throws(StoreError) -> [String: String]
 
-    func write(_ batch: StoreWrite, gate: SessionGate, generation: Generation) throws(StoreError)
+    @discardableResult
+    func write(_ batch: StoreWrite, gate: SessionGate, generation: Generation) throws(StoreError) -> StoreWriteResult
 }
 
 extension AccountStore {
+    @discardableResult
     public func write(
         gate: SessionGate, generation: Generation, _ build: (inout StoreWrite) -> Void
-    ) throws(StoreError) {
+    ) throws(StoreError) -> StoreWriteResult {
         var batch = StoreWrite()
         build(&batch)
-        guard !batch.isEmpty else { return }
-        try write(batch, gate: gate, generation: generation)
+        guard !batch.isEmpty else { return StoreWriteResult() }
+        return try write(batch, gate: gate, generation: generation)
+    }
+
+    public func owed(_ space: SpaceName) throws(StoreError) -> OwedRecord? {
+        Bookkeeping.decode(try meta(OwedRecord.key(space)), as: OwedRecord.self)
+    }
+
+    public func owedRecords() throws(StoreError) -> [SpaceName: OwedRecord] {
+        try records(OwedRecord.keyPrefix, as: OwedRecord.self)
+    }
+
+    public func notifyRecords() throws(StoreError) -> [SpaceName: NotifyRecord] {
+        try records(NotifyRecord.keyPrefix, as: NotifyRecord.self)
+    }
+
+    public func relist() throws(StoreError) -> RelistRecord {
+        Bookkeeping.decode(try meta(RelistRecord.key), as: RelistRecord.self) ?? RelistRecord()
+    }
+
+    /// Listing-derived owed rows given up on, for Diagnostics.
+    public func droppedOwedCount() throws(StoreError) -> Int {
+        Int(try meta(Bookkeeping.droppedKey) ?? "") ?? 0
+    }
+
+    private func records<T: Decodable>(_ prefix: String, as type: T.Type) throws(StoreError) -> [SpaceName: T] {
+        var records: [SpaceName: T] = [:]
+        for (key, value) in try metas(prefix: prefix) {
+            guard let space = SpaceName(String(key.dropFirst(prefix.count))),
+                let record = Bookkeeping.decode(value, as: T.self)
+            else { continue }
+            records[space] = record
+        }
+        return records
     }
 }

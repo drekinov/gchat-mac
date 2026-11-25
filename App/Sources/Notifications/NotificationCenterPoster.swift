@@ -26,11 +26,11 @@ final class NotificationCenterPoster: NotificationPoster {
         return !isFake || defaults.bool(forKey: Self.fakeKey)
     }
 
-    func post(_ request: ChatNotification) async {
-        guard allowed else { return }
+    func post(_ request: ChatNotification) async -> PostOutcome {
+        guard allowed else { return .suppressed }
         let center = UNUserNotificationCenter.current()
         let status = await center.notificationSettings().authorizationStatus
-        guard status == .authorized || status == .provisional else { return }
+        guard status == .authorized || status == .provisional else { return .suppressed }
         let content = UNMutableNotificationContent()
         content.title = RemoteText.title(request.title)
         if let subtitle = await subtitle(request.account) { content.subtitle = subtitle }
@@ -38,7 +38,22 @@ final class NotificationCenterPoster: NotificationPoster {
         content.threadIdentifier = request.threadIdentifier
         content.userInfo = ["account": request.account.description, "space": request.space.rawValue]
         content.sound = .default
-        try? await center.add(UNNotificationRequest(identifier: request.identifier, content: content, trigger: nil))
+        do {
+            try await center.add(UNNotificationRequest(identifier: request.identifier, content: content, trigger: nil))
+            return .accepted
+        } catch {
+            return Self.outcome(for: error)
+        }
+    }
+
+    /// Only the error domain class and code leave this method, never the request.
+    static func outcome(for error: any Error) -> PostOutcome {
+        let error = error as NSError
+        if error.domain == UNErrorDomain, error.code == UNError.Code.notificationsNotAllowed.rawValue {
+            return .suppressed
+        }
+        let domain = error.domain == UNErrorDomain ? "notifications" : "system"
+        return .retryable("\(domain).\(error.code)")
     }
 
     func remove(account: AccountID) async {

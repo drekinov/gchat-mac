@@ -1,6 +1,7 @@
 import AppKit
 import ChatModel
 import ChatSync
+import GoogleChat
 import ServiceManagement
 import SwiftUI
 import UserNotifications
@@ -91,7 +92,11 @@ struct AccountsSettings: View {
                     Label("No accounts yet", systemImage: "person.crop.circle").foregroundStyle(.secondary)
                 }
                 ForEach(model.accounts) { info in
-                    row(info)
+                    VStack(alignment: .leading, spacing: 6) {
+                        row(info)
+                        LiveNotificationsSettings(model: model, info: info)
+                            .padding(.leading, 40)
+                    }
                 }
             } footer: {
                 VStack(alignment: .leading, spacing: 12) {
@@ -264,6 +269,85 @@ extension AccountStatus {
     }
 
     private static let okColor = Theme.dynamic(light: 0x2E_7A4F, dark: 0x7C_C49A)
+}
+
+/// This Mac's Workspace Events channel for one account. Off stops pulling and renewing here; nothing is deleted.
+struct LiveNotificationsSettings: View {
+    let model: AppModel
+    let info: AccountInfo
+    @State private var expanded = false
+    @State private var draft = ""
+
+    private var settings: EventSettings { model.eventSettings[info.id] ?? EventSettings() }
+    private var status: EventChannelStatus { model.eventStatus[info.id] ?? .off }
+    private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var draftIsValid: Bool { trimmed.isEmpty || PubSubSubscriptionPath(trimmed) != nil }
+    private var draftChanged: Bool { trimmed != (settings.subscriptionPath ?? "") }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    TextField(
+                        "Subscription", text: $draft, prompt: Text("projects/PROJECT/subscriptions/NAME")
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                    .labelsHidden()
+                    .onSubmit(save)
+                    Button("Save", action: save).disabled(!draftIsValid || !draftChanged)
+                }
+                if !draftIsValid {
+                    Text("Expected projects/PROJECT/subscriptions/NAME.").font(.caption).foregroundStyle(.red)
+                }
+                HStack {
+                    Toggle("On for this Mac", isOn: enabledBinding)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    Spacer()
+                    if model.live != nil {
+                        Button("Grant Access…") { model.startReconnect(info, liveNotifications: true) }
+                            .disabled(model.isSigningIn || model.removingAccount != nil)
+                            .help("Sign in again to allow Pub/Sub, which live notifications need.")
+                    }
+                }
+                Text(
+                    "Run scripts/events-setup.sh once per account and Mac, paste the subscription path it prints, "
+                        + "then grant access. Off affects only this Mac and deletes nothing."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                if let error = model.eventSettingsError {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Text("Live notifications")
+                Text(status.label).foregroundStyle(.secondary)
+            }
+            .font(.callout)
+        }
+        .onAppear { draft = settings.subscriptionPath ?? "" }
+    }
+
+    private func save() {
+        guard draftIsValid, draftChanged else { return }
+        let path = trimmed.isEmpty ? nil : trimmed
+        let enabled = settings.enabled
+        Task { await model.setEventSettings(info.id, EventSettings(subscriptionPath: path, enabled: enabled)) }
+    }
+
+    private var enabledBinding: Binding<Bool> {
+        Binding(
+            get: { settings.enabled },
+            set: { enabled in
+                let path = settings.subscriptionPath
+                Task { await model.setEventSettings(info.id, EventSettings(subscriptionPath: path, enabled: enabled)) }
+            })
+    }
 }
 
 struct GeneralSettings: View {

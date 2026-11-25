@@ -1,0 +1,8 @@
+{
+  "name": "operations/op-1",
+  "done": true,
+  "error": {
+    "code": 7,
+    "message": "CANARY-7f3a The caller does not have permission"
+  }
+}

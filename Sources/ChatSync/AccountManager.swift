@@ -8,13 +8,20 @@ public struct AccountRecord: Hashable, Sendable, Codable, Identifiable {
     public var email: String
     public var displayName: String
     public var me: UserName
+    /// Absent in records written before live notifications existed.
+    public var events: EventSettings?
 
-    public init(id: AccountID = AccountID(), email: String, displayName: String, me: UserName) {
+    public init(
+        id: AccountID = AccountID(), email: String, displayName: String, me: UserName, events: EventSettings? = nil
+    ) {
         self.id = id
         self.email = email
         self.displayName = displayName
         self.me = me
+        self.events = events
     }
+
+    public var eventSettings: EventSettings { events ?? EventSettings() }
 }
 
 /// The account list lives in the keychain, so emails never sit in plaintext on disk. Edits are read-modify-write
@@ -36,6 +43,18 @@ public struct AccountRegistry: Sendable {
             records.removeAll { $0.id == record.id }
             records.append(record)
             try write(records)
+        }
+    }
+
+    /// Replaces a known account's record in place; returns false if it isn't registered.
+    @discardableResult
+    public func update(_ record: AccountRecord) throws(SecretStoreError) -> Bool {
+        try Self.lock.withLock { () throws(SecretStoreError) -> Bool in
+            var records = try read()
+            guard let index = records.firstIndex(where: { $0.id == record.id }) else { return false }
+            records[index] = record
+            try write(records)
+            return true
         }
     }
 
@@ -96,6 +115,8 @@ public actor AccountManager {
     public private(set) var sessions: [AccountID: AccountSession] = [:]
     /// Accounts with an add or logout in flight; lifecycle operations on one account never interleave.
     private var reserved: Set<AccountID> = []
+    /// The latest path state, applied to every session including ones created later.
+    public private(set) var connectivity: Connectivity = .reachable
     public nonisolated let accounts = LatestValue<[AccountRecord]>()
 
     public init(
@@ -125,6 +146,8 @@ public actor AccountManager {
             do {
                 let session = try await factory(record)
                 sessions[record.id] = session
+                await applyConnectivity(to: session)
+                await session.configureEvents(eventSettings(of: record))
                 await session.start()
                 restored.append(record.id)
             } catch {
@@ -152,6 +175,8 @@ public actor AccountManager {
         sessions[record.id] = session
         records.removeAll { $0.id == record.id }
         records.append(record)
+        await applyConnectivity(to: session)
+        await session.configureEvents(eventSettings(of: record))
         await session.start()
         accounts.send(records)
         return session
@@ -174,8 +199,21 @@ public actor AccountManager {
         }
         let session = try await factory(record)
         sessions[id] = session
+        await applyConnectivity(to: session)
+        await session.configureEvents(eventSettings(of: record))
         await session.start()
         return session
+    }
+
+    /// Saves this Mac's live-notification settings for the account and applies them to its session.
+    public func setEventSettings(_ id: AccountID, _ settings: EventSettings) async throws {
+        guard let index = records.firstIndex(where: { $0.id == id }) else { throw AccountManagerError.busy }
+        var record = records[index]
+        record.events = settings
+        guard try registry.update(record) else { throw AccountManagerError.busy }
+        records[index] = record
+        accounts.send(records)
+        await sessions[id]?.configureEvents(settings)
     }
 
     /// The session writes its tombstone first, and unregistering is the last logout step, so a crash anywhere
@@ -207,4 +245,27 @@ public actor AccountManager {
     }
 
     public func session(_ id: AccountID) -> AccountSession? { sessions[id] }
+
+    public func setConnectivity(_ connectivity: Connectivity) async {
+        self.connectivity = connectivity
+        for session in sessions.values { await session.setConnectivity(connectivity) }
+    }
+
+    public func systemDidWake() async {
+        for session in sessions.values { await session.systemDidWake() }
+    }
+
+    /// The saved settings as they are now; Settings can change them while a session is being built.
+    private func eventSettings(of record: AccountRecord) -> EventSettings {
+        records.first { $0.id == record.id }?.eventSettings ?? record.eventSettings
+    }
+
+    /// Repeats until the value it applied is still the latest, since a path change can land during the await.
+    private func applyConnectivity(to session: AccountSession) async {
+        var applied: Connectivity
+        repeat {
+            applied = connectivity
+            await session.setConnectivity(applied)
+        } while applied != connectivity
+    }
 }

@@ -6,6 +6,7 @@ import Synchronization
 public final class AuthTransport: StreamingTransport {
     public static let googleHosts: Set<String> = [
         "chat.googleapis.com", "oauth2.googleapis.com", "openidconnect.googleapis.com", "people.googleapis.com",
+        "pubsub.googleapis.com", "workspaceevents.googleapis.com",
     ]
 
     private let allowedHosts: Set<String>

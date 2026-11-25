@@ -1,0 +1,14 @@
+{
+  "memberships": [
+    {
+      "membership": {
+        "name": "spaces/AAAA/members/1234"
+      }
+    },
+    {
+      "membership": {
+        "name": "spaces/BBBB/members/1234"
+      }
+    }
+  ]
+}

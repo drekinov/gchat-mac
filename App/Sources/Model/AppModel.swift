@@ -19,6 +19,10 @@ final class AppModel {
     private(set) var phase: Phase = .idle
     private(set) var accounts: [AccountInfo] = []
     private(set) var snapshots: [AccountID: AccountSnapshot] = [:]
+    private(set) var eventStatus: [AccountID: EventChannelStatus] = [:]
+    /// This Mac's live-notification settings per account.
+    private(set) var eventSettings: [AccountID: EventSettings] = [:]
+    private(set) var eventSettingsError: String?
     var accountFilter: AccountID?
     private(set) var selection: SpaceKey?
     private(set) var loadedKey: SpaceKey?
@@ -65,6 +69,9 @@ final class AppModel {
     @ObservationIgnored private var exportSweeper: ExportSweeper?
     @ObservationIgnored private var exportSweeps: Task<Void, Never>?
     @ObservationIgnored private var wakeObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var connectivity: ConnectivityMonitor?
+    /// Keeps App Nap from stretching the poll timers while any account is signed in.
+    @ObservationIgnored private var pollingActivity: (any NSObjectProtocol)?
     private var photoURLs: [AccountID: [UserName: URL]] = [:]
     private(set) var isSigningIn = false
     private(set) var signInError: String?
@@ -74,6 +81,7 @@ final class AppModel {
     private(set) var savedClientProject: String?
     @ObservationIgnored private var signInTask: Task<Void, Never>?
     @ObservationIgnored private var subscriptions: [AccountID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var eventSubscriptions: [AccountID: Task<Void, Never>] = [:]
     @ObservationIgnored private var recent: [(key: SpaceKey, messages: [Message])] = []
     @ObservationIgnored private var lastMarked: [SpaceKey: Timestamp] = [:]
     @ObservationIgnored private var visibleThreads: [ThreadName] = []
@@ -144,9 +152,12 @@ final class AppModel {
             accounts: bench?.accounts ?? Self.fakeAccountCount(arguments: arguments),
             traffic: bench?.traffic ?? fakeTraffic, trafficRange: bench.map { _ in 10...20 },
             notifications: notificationPoster(isFake: true),
-            timing: bench == nil ? FakeWorld.timing() : SessionTiming())
+            timing: bench == nil ? FakeWorld.timing() : SessionTiming(), liveEvents: bench == nil && fakeTraffic)
         self.world = world
-        for entry in world.entries { attach(entry.info, entry.session) }
+        for entry in world.entries {
+            eventSettings[entry.info.id] = entry.events
+            attach(entry.info, entry.session)
+        }
         setAppActive(NSApplication.shared.isActive)
         phase = .running
     }
@@ -156,6 +167,7 @@ final class AppModel {
         let live = LiveAccounts(
             root: LiveAccounts.defaultRoot(), notifications: notificationPoster(isFake: false))
         self.live = live
+        connectivity = ConnectivityMonitor(manager: live.manager)
         AttachmentStaging.prune()
         startExportSweeps(root: LiveAccounts.defaultRoot())
         savedClientProject = live.storedClient.map(Self.projectLabel)
@@ -168,6 +180,7 @@ final class AppModel {
         for record in await live.manager.records {
             let info = liveInfo(record)
             accounts.append(info)
+            eventSettings[record.id] = record.eventSettings
             if let session = await live.manager.session(record.id) { attach(info, session) }
         }
         setAppActive(NSApplication.shared.isActive)
@@ -220,6 +233,7 @@ final class AppModel {
             let saved = newClient ? nil : live.storedClient
             guard let client = try saved ?? chooseClientFile(live) else { return }
             let (record, session) = try await live.signIn(client: client)
+            eventSettings[record.id] = record.eventSettings
             attach(liveInfo(record), session)
             setAppActive(NSApplication.shared.isActive)
             phase = .running
@@ -228,7 +242,9 @@ final class AppModel {
         }
     }
 
-    func startReconnect(_ info: AccountInfo, newClient: Bool = false) {
+    /// With `liveNotifications`, runs the fresh consent that adds Pub/Sub; a refused or partial grant keeps the
+    /// account signed in as it was.
+    func startReconnect(_ info: AccountInfo, newClient: Bool = false, liveNotifications: Bool = false) {
         guard let live, signInTask == nil, removingAccount == nil, !pendingRemoval.contains(info.id) else { return }
         isSigningIn = true
         signInError = nil
@@ -240,7 +256,8 @@ final class AppModel {
             do {
                 let saved = newClient ? nil : try live.vault.load(info.id)?.client
                 guard let client = try saved ?? chooseClientFile(live, saveAsDefault: false) else { return }
-                let session = try await live.reconnect(info, client: client)
+                let session = try await live.reconnect(
+                    info, client: client, liveNotifications: liveNotifications)
                 detach(info.id)
                 attach(info, session)
                 setAppActive(NSApplication.shared.isActive)
@@ -287,6 +304,7 @@ final class AppModel {
             }
             pendingRemoval.remove(id)
             accounts.removeAll { $0.id == id }
+            eventSettings[id] = nil
             var labels = Self.labels()
             labels[id.description] = nil
             UserDefaults.standard.set(labels, forKey: Self.labelsKey)
@@ -294,6 +312,22 @@ final class AppModel {
         } catch {
             signInError = "Couldn't start account removal. Try again."
         }
+    }
+
+    /// Saves this Mac's live-notification settings for the account; fake accounts keep them in memory.
+    func setEventSettings(_ id: AccountID, _ settings: EventSettings) async {
+        eventSettingsError = nil
+        if let live {
+            do {
+                try await live.manager.setEventSettings(id, settings)
+            } catch {
+                eventSettingsError = "Couldn't save the live notification settings."
+                return
+            }
+        } else {
+            await sessions[id]?.configureEvents(settings)
+        }
+        eventSettings[id] = settings
     }
 
     static let labelsKey = "accountLabels"
@@ -336,6 +370,8 @@ final class AppModel {
         switch error {
         case AuthError.cancelled, AuthError.timedOut: "Sign-in was cancelled or timed out."
         case AuthError.authorizationDenied(let code): "Google refused the sign-in (\(code))."
+        case AuthError.insufficientScopes(let missing) where missing == [OAuthScopes.pubsub]:
+            "Pub/Sub access wasn't granted, so this account keeps polling. Try again and allow it."
         case AuthError.insufficientScopes: "Some permissions were unticked. Sign in again and allow all of them."
         case AuthError.invalidClientConfig(let reason): "That file isn't a Desktop OAuth client (\(reason))."
         case AuthError.browserUnavailable: "Couldn't open the browser."
@@ -350,17 +386,30 @@ final class AppModel {
     private func attach(_ info: AccountInfo, _ session: AccountSession) {
         if self.info(info.id) == nil { accounts.append(info) }
         sessions[info.id] = session
+        updatePollingActivity()
         subscriptions[info.id] = Task {
             for await snapshot in session.snapshots.values {
                 guard !Task.isCancelled, sessions[info.id] === session else { return }
                 ingest(snapshot)
             }
         }
+        eventSubscriptions.removeValue(forKey: info.id)?.cancel()
+        guard let channel = session.eventChannel else { return }
+        eventStatus[info.id] = channel.status.current
+        eventSubscriptions[info.id] = Task {
+            for await status in channel.status.values {
+                guard !Task.isCancelled, sessions[info.id] === session else { return }
+                eventStatus[info.id] = status
+            }
+        }
     }
 
     private func detach(_ id: AccountID) {
         subscriptions.removeValue(forKey: id)?.cancel()
+        eventSubscriptions.removeValue(forKey: id)?.cancel()
+        eventStatus[id] = nil
         sessions[id] = nil
+        updatePollingActivity()
         snapshots[id] = nil
         photoURLs[id] = nil
         spaceFaces = spaceFaces.filter { $0.key.account != id }
@@ -557,7 +606,24 @@ final class AppModel {
 
     func shutdown() {
         for task in subscriptions.values { task.cancel() }
+        for task in eventSubscriptions.values { task.cancel() }
         world?.stop()
+        connectivity?.stop()
+        connectivity = nil
+        endPollingActivity()
+    }
+
+    private func updatePollingActivity() {
+        guard !sessions.isEmpty else { return endPollingActivity() }
+        guard pollingActivity == nil else { return }
+        pollingActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep], reason: "Checking for new messages")
+    }
+
+    private func endPollingActivity() {
+        guard let pollingActivity else { return }
+        ProcessInfo.processInfo.endActivity(pollingActivity)
+        self.pollingActivity = nil
     }
 
     // MARK: Inbox

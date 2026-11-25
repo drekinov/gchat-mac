@@ -1,0 +1,6 @@
+{
+  "subscription": {
+    "name": "subscriptions/sub-abc123",
+    "expireTime": "2026-01-08T00:00:00Z"
+  }
+}

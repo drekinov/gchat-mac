@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {
+      "message": {
+        "name": "spaces/AAAA/messages/m1.m1"
+      }
+    },
+    {
+      "message": {
+        "name": "spaces/AAAA/messages/m2.m2"
+      }
+    }
+  ]
+}

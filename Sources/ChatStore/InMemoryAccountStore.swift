@@ -116,13 +116,22 @@ public final class InMemoryAccountStore: AccountStore {
         state.withLock { $0.meta[key] }
     }
 
+    public func metas(prefix: String) throws(StoreError) -> [String: String] {
+        state.withLock { state in state.meta.filter { $0.key.hasPrefix(prefix) } }
+    }
+
     // MARK: Writes
 
-    public func write(_ batch: StoreWrite, gate: SessionGate, generation: Generation) throws(StoreError) {
+    @discardableResult
+    public func write(
+        _ batch: StoreWrite, gate: SessionGate, generation: Generation
+    ) throws(StoreError) -> StoreWriteResult {
         do {
-            try gate.commit(generation) { () throws(StoreError) in
+            return try gate.commit(generation) { () throws(StoreError) -> StoreWriteResult in
                 state.withLock { state in
-                    for operation in batch.operations { Self.apply(operation, &state) }
+                    var result = StoreWriteResult()
+                    for operation in batch.operations { Self.apply(operation, &state, &result) }
+                    return result
                 }
             }
         } catch {
@@ -130,7 +139,12 @@ public final class InMemoryAccountStore: AccountStore {
         }
     }
 
-    private static func apply(_ operation: StoreWrite.Operation, _ state: inout State) {
+    private static func apply(_ operation: StoreWrite.Operation, _ state: inout State, _ result: inout StoreWriteResult)
+    {
+        let handled = try? Bookkeeping.apply(
+            operation, get: { state.meta[$0] }, set: { state.meta[$0] = $1 },
+            hasMessage: { state.messages[$0] != nil }, isNotified: { state.notified[$0] != nil }, result: &result)
+        if handled == true { return }
         switch operation {
         case .mergeSpace(let space):
             if state.spaces[space.name] != nil {
@@ -151,6 +165,7 @@ public final class InMemoryAccountStore: AccountStore {
             state.threadReads = state.threadReads.filter { $0.key.space != name }
             state.checkpoints = state.checkpoints.filter { $0.key.space != name }
             state.notified = state.notified.filter { $0.key.space != name }
+            state.meta[NotifyRecord.key(name)] = nil
         case .upsertMessages(let messages):
             for message in messages {
                 guard let kept = Message.merge(message, over: state.messages[message.name]) else { continue }
@@ -197,6 +212,9 @@ public final class InMemoryAccountStore: AccountStore {
         case .pruneMessages(let space, let keep):
             let ordered = state.messages.values.filter { $0.space == space }.sorted(by: newerFirst)
             for message in ordered.dropFirst(max(0, keep)) { state.messages[message.name] = nil }
+        case .mergeOwed, .resolveOwed, .deferOwed, .owedOmitted, .clearOwed, .bumpRelist, .resolveRelist,
+            .addNotifyCandidates, .flagNotifyGap, .removeNotifyPending:
+            break
         }
     }
 }

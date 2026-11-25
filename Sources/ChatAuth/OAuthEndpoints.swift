@@ -40,13 +40,17 @@ public struct OAuthEndpoints: Sendable {
         self.revokeDeadline = revokeDeadline
     }
 
-    public func authorizationURL(pkce: PKCE, redirectURI: URL, loginHint: String?) -> URL {
+    /// Always a fresh consent for the whole set (`include_granted_scopes=false`): desktop clients get no
+    /// incremental authorization, so `extraScopes` are asked for alongside every regular scope.
+    public func authorizationURL(pkce: PKCE, redirectURI: URL, loginHint: String?, extraScopes: [String] = []) -> URL {
         var components = URLComponents(url: OAuthClientConfig.authorizationEndpoint, resolvingAgainstBaseURL: false)!
         var items = [
             URLQueryItem(name: "client_id", value: client.clientID),
             URLQueryItem(name: "redirect_uri", value: redirectURI.absoluteString),
             URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "scope", value: (OAuthScopes.required + OAuthScopes.optional).joined(separator: " ")),
+            URLQueryItem(
+                name: "scope", value: (OAuthScopes.required + OAuthScopes.optional + extraScopes).joined(separator: " ")
+            ),
             URLQueryItem(name: "state", value: pkce.state),
             URLQueryItem(name: "code_challenge", value: pkce.challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),

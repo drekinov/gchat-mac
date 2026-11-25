@@ -20,8 +20,16 @@ public struct ChatNotification: Sendable, Equatable, CustomStringConvertible, Cu
     public var debugDescription: String { description }
 }
 
+public enum PostOutcome: Sendable, Equatable {
+    case accepted
+    /// Not shown on purpose (disabled, not authorized); never retried.
+    case suppressed
+    /// Holds a content-free error class for logs.
+    case retryable(String)
+}
+
 public protocol NotificationPoster: Sendable {
-    func post(_ request: ChatNotification) async
+    func post(_ request: ChatNotification) async -> PostOutcome
     func remove(account: AccountID) async
     func remove(messages: [MessageName]) async
 }
@@ -31,11 +39,25 @@ struct NotifierContext: Sendable, Equatable {
     var appIsActive: Bool
 }
 
-/// Turns newly stored messages into notifications. Marks are committed through the gate before anything is posted.
+struct NotifyPass: Sendable, Equatable {
+    /// A post failed and stays pending.
+    var retry = false
+    /// The post cap stopped the pass before every pending record was handled.
+    var more = false
+    /// Some pending entry left its record.
+    var settled = false
+}
+
+/// Posts the durable pending records the sync commits write. An ID leaves its record only once its post was accepted
+/// or suppressed, so a failure or a restart retries it.
 final class Notifier: Sendable {
-    static let maxPerPass = 5
-    static let scanLimit = 100
+    /// Accepted or suppressed posts per pass; retryable failures don't count.
+    static let maxPerPass = 10
+    /// More live pending messages than this in one space post as a summary.
+    static let maxSinglesPerSpace = 5
+    static let deletionScanLimit = 100
     static let bodyLimit = 200
+    static let retryDelays: [Duration] = [.seconds(30), .seconds(120), .seconds(600)]
 
     let account: AccountID
     let store: any AccountStore
@@ -43,7 +65,6 @@ final class Notifier: Sendable {
     let me: UserName
     let poster: any NotificationPoster
     let clock: any SyncClock
-    let participation: ParticipationTracker
     private let removed = Mutex(Set<MessageName>())
 
     init(
@@ -56,84 +77,132 @@ final class Notifier: Sendable {
         self.me = me
         self.poster = poster
         self.clock = clock
-        participation = ParticipationTracker(store: store, me: me)
     }
 
-    static func markKey(_ space: SpaceName) -> String { "notifyMark|\(space.rawValue)" }
+    private struct Settled {
+        var messages: [MessageName] = []
+        var notified: [MessageName] = []
+        var overflow = 0
+        var gap = false
 
-    private struct Candidate {
-        var message: Message
-        var stored: StoredSpace
+        var isEmpty: Bool { messages.isEmpty && overflow == 0 && !gap }
     }
 
-    func process(spaces: Set<SpaceName>, generation: Generation, context: NotifierContext) async {
-        guard gate.isCurrent(generation), !spaces.isEmpty else { return }
-        guard let firstSync = try? store.meta("firstSyncCompleted").flatMap({ Timestamp(rfc3339: $0) }) else {
-            return
-        }
-        participation.invalidate(spaces)
-        let now = clock.now()
-
-        var candidates: [Candidate] = []
-        var marks: [SpaceName: Timestamp] = [:]
-        var deleted: [MessageName] = []
-        for name in spaces.sorted() {
-            guard let stored = try? store.space(name), !stored.isHidden else { continue }
-            let storedMark: String?
-            do { storedMark = try store.meta(Self.markKey(name)) } catch { continue }
-            let storedTime = storedMark.flatMap { Timestamp(rfc3339: $0) }
-            let mark = storedTime ?? firstSync
-            guard let recent = try? store.messages(in: name, before: nil, limit: Self.scanLimit) else { continue }
-            if let newest = recent.last?.createTime, newest > mark {
-                marks[name] = newest
-            } else if storedTime == nil {
-                marks[name] = mark
+    /// Posts pending records of every space, then asks to remove notifications of deleted messages in `spaces`.
+    @discardableResult
+    func process(spaces: Set<SpaceName>, generation: Generation, context: NotifierContext) async -> NotifyPass {
+        guard gate.isCurrent(generation) else { return NotifyPass() }
+        var pass = NotifyPass()
+        var posts = 0
+        let records = (try? store.notifyRecords()) ?? [:]
+        for (space, record) in records.sorted(by: { $0.key < $1.key }) {
+            guard gate.isCurrent(generation), !Task.isCancelled else { return pass }
+            guard posts < Self.maxPerPass else {
+                pass.more = true
+                break
             }
-            deleted += recent.filter(\.isDeleted).map(\.name)
-
-            let fresh = recent.filter { $0.createTime > mark }
-            var policy = PolicyContext(
-                me: me, focusedSpace: context.focusedSpace, appIsActive: context.appIsActive,
-                firstSyncCompleted: firstSync)
-            if NotificationPolicy.effectiveLevel(for: stored) == .mainConversations,
-                fresh.contains(where: \.isThreadReply)
-            {
-                policy.participatingThreads = (try? participation.threads(in: name)) ?? []
+            guard
+                let settled = await post(
+                    record, in: space, generation: generation, context: context, posts: &posts, pass: &pass)
+            else {
+                continue
             }
-            for message in fresh where NotificationPolicy.shouldNotify(message, in: stored, context: policy) {
-                guard let notified = try? store.isNotified(message.name), !notified else { continue }
-                candidates.append(Candidate(message: message, stored: stored))
-            }
-        }
-        candidates.sort { ($0.message.createTime, $0.message.name) < ($1.message.createTime, $1.message.name) }
-
-        if !candidates.isEmpty || !marks.isEmpty {
-            let names = candidates.map(\.message.name)
+            guard !settled.isEmpty else { continue }
+            let now = clock.now()
             do {
                 try store.write(gate: gate, generation: generation) { batch in
-                    if !names.isEmpty { batch.append(.markNotified(names, at: now)) }
-                    for (space, time) in marks.sorted(by: { $0.key < $1.key }) {
-                        batch.append(.setMeta(key: Self.markKey(space), value: time.rfc3339))
-                    }
+                    if !settled.notified.isEmpty { batch.append(.markNotified(settled.notified, at: now)) }
+                    batch.append(
+                        .removeNotifyPending(
+                            space, messages: settled.messages, overflow: settled.overflow, gap: settled.gap))
                 }
             } catch {
-                return
+                return pass
             }
+            pass.settled = true
         }
 
-        for request in requests(for: candidates) {
-            guard gate.isCurrent(generation), !Task.isCancelled else { return }
-            await poster.post(request)
-        }
-
-        let gone = removable(deleted)
+        let gone = removable(deleted(in: spaces))
         if !gone.isEmpty, gate.isCurrent(generation), !Task.isCancelled {
             await poster.remove(messages: gone)
         }
+        return pass
+    }
+
+    /// Returns what to remove from the record, or `nil` when the space can't be read this pass.
+    private func post(
+        _ record: NotifyRecord, in space: SpaceName, generation: Generation, context: NotifierContext,
+        posts: inout Int, pass: inout NotifyPass
+    ) async -> Settled? {
+        let all = record.messages(in: space)
+        var settled = Settled()
+        let lookup: StoredSpace?
+        do { lookup = try store.space(space) } catch { return nil }
+        guard let stored = lookup, !stored.isHidden, !(context.appIsActive && context.focusedSpace == space),
+            stored.notificationSetting?.isMuted != true, NotificationPolicy.effectiveLevel(for: stored) != .off
+        else {
+            return Settled(messages: all, overflow: record.overflow, gap: record.gap)
+        }
+        var live: [Message] = []
+        var pruned: [MessageName] = []
+        for name in all {
+            let found: Message?
+            do { found = try store.message(name) } catch { return nil }
+            if let message = found {
+                if message.isDeleted { settled.messages.append(name) } else { live.append(message) }
+            } else {
+                pruned.append(name)
+            }
+        }
+        live.sort { ($0.createTime, $0.name) < ($1.createTime, $1.name) }
+        var folded = pruned
+        if live.count > Self.maxSinglesPerSpace {
+            folded += live.map(\.name)
+            live = []
+        }
+        let count = record.overflow + folded.count
+        if count > 0 || record.gap {
+            guard gate.isCurrent(generation), !Task.isCancelled else { return settled }
+            switch await poster.post(summary(stored, count: count)) {
+            case .accepted, .suppressed:
+                posts += 1
+                settled.messages += folded
+                settled.overflow = record.overflow
+                settled.gap = record.gap
+            case .retryable:
+                pass.retry = true
+            }
+        }
+        for message in live {
+            guard gate.isCurrent(generation), !Task.isCancelled else { break }
+            guard posts < Self.maxPerPass else {
+                pass.more = true
+                break
+            }
+            switch await poster.post(single(message, in: stored)) {
+            case .accepted:
+                posts += 1
+                settled.messages.append(message.name)
+                settled.notified.append(message.name)
+            case .suppressed:
+                posts += 1
+                settled.messages.append(message.name)
+            case .retryable:
+                pass.retry = true
+            }
+        }
+        return settled
     }
 
     func removeAll() async {
         await poster.remove(account: account)
+    }
+
+    private func deleted(in spaces: Set<SpaceName>) -> [MessageName] {
+        spaces.sorted().flatMap { space in
+            ((try? store.messages(in: space, before: nil, limit: Self.deletionScanLimit)) ?? []).filter(\.isDeleted)
+                .map(\.name)
+        }
     }
 
     private func removable(_ deleted: [MessageName]) -> [MessageName] {
@@ -143,23 +212,11 @@ final class Notifier: Sendable {
         return notified
     }
 
-    private func requests(for candidates: [Candidate]) -> [ChatNotification] {
-        guard candidates.count > Self.maxPerPass else { return candidates.map(single) }
-        let grouped = Dictionary(grouping: candidates, by: \.stored.space.name)
-        let summaries = grouped.values.map { group -> (newest: Timestamp, request: ChatNotification) in
-            let newest = group.map(\.message.createTime).max() ?? group[0].message.createTime
-            return (newest, summary(group, newest: newest))
-        }
-        return summaries.sorted { ($0.newest, $0.request.space) > ($1.newest, $1.request.space) }
-            .prefix(Self.maxPerPass).map(\.request)
-    }
-
-    private func single(_ candidate: Candidate) -> ChatNotification {
-        let message = candidate.message
-        let title = SyncEngine.title(of: candidate.stored)
+    private func single(_ message: Message, in stored: StoredSpace) -> ChatNotification {
+        let title = SyncEngine.title(of: stored)
         let text = Self.preview(of: message)
         let sender = message.sender.displayName ?? "Someone"
-        let body = candidate.stored.space.type == .directMessage ? text : "\(sender): \(text)"
+        let body = stored.space.type == .directMessage ? text : "\(sender): \(text)"
         let thread = message.isThreadReply ? message.thread : nil
         return ChatNotification(
             account: account, space: message.space, thread: message.thread, message: message.name, title: title,
@@ -167,15 +224,16 @@ final class Notifier: Sendable {
             identifier: message.name.rawValue)
     }
 
-    private func summary(_ group: [Candidate], newest: Timestamp) -> ChatNotification {
-        let stored = group[0].stored
+    /// `count` zero means only a reseed gap is known.
+    private func summary(_ stored: StoredSpace, count: Int) -> ChatNotification {
         let title = SyncEngine.title(of: stored)
         let space = stored.space.name
+        let body =
+            count > 0 ? "\(count) new \(count == 1 ? "message" : "messages") in \(title)" : "New messages in \(title)"
         return ChatNotification(
             account: account, space: space, thread: nil, message: nil, title: title,
-            body: String(
-                "\(group.count) new \(group.count == 1 ? "message" : "messages") in \(title)".prefix(Self.bodyLimit)),
-            threadIdentifier: space.rawValue, identifier: "summary|\(space.rawValue)|\(newest.rfc3339)")
+            body: String(body.prefix(Self.bodyLimit)), threadIdentifier: space.rawValue,
+            identifier: "summary|\(space.rawValue)|\(clock.now().rfc3339)")
     }
 
     private static func preview(of message: Message) -> String {

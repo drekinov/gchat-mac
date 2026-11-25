@@ -1,0 +1,35 @@
+{
+  "receivedMessages": [
+    {
+      "ackId": "ack-1",
+      "message": {
+        "data": "ewogICJtZXNzYWdlIjogewogICAgIm5hbWUiOiAic3BhY2VzL0FBQUEvbWVzc2FnZXMvbTEubTEiCiAgfQp9",
+        "attributes": {
+          "ce-specversion": "1.0",
+          "ce-type": "google.workspace.chat.message.v1.created",
+          "ce-source": "//workspaceevents.googleapis.com/subscriptions/sub-abc123",
+          "ce-subject": "//chat.googleapis.com/spaces/AAAA",
+          "ce-id": "id-1",
+          "ce-time": "2026-01-01T00:00:05.5Z"
+        },
+        "messageId": "1001",
+        "publishTime": "2026-01-01T00:00:06Z"
+      }
+    },
+    {
+      "ackId": "ack-2",
+      "message": {
+        "data": "ewogICJtZXNzYWdlcyI6IFsKICAgIHsKICAgICAgIm1lc3NhZ2UiOiB7CiAgICAgICAgIm5hbWUiOiAic3BhY2VzL0FBQUEvbWVzc2FnZXMvbTEubTEiCiAgICAgIH0KICAgIH0sCiAgICB7CiAgICAgICJtZXNzYWdlIjogewogICAgICAgICJuYW1lIjogInNwYWNlcy9BQUFBL21lc3NhZ2VzL20yLm0yIgogICAgICB9CiAgICB9CiAgXQp9",
+        "attributes": {
+          "ce-type": "google.workspace.chat.message.v1.batchCreated",
+          "ce-source": "//workspaceevents.googleapis.com/subscriptions/sub-abc123",
+          "ce-subject": "//chat.googleapis.com/spaces/AAAA",
+          "ce-id": "id-2",
+          "ce-time": "2026-01-01T00:00:07Z"
+        },
+        "messageId": "1002",
+        "publishTime": "2026-01-01T00:00:08Z"
+      }
+    }
+  ]
+}

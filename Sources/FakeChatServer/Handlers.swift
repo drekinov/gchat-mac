@@ -100,6 +100,16 @@ extension State {
         case .downloadMedia(let resource): try downloadMedia(resource, incoming, account)
         case .setUpSpace: try setUpSpace(incoming, account)
         case .searchDirectory: try searchDirectory(incoming, account)
+        case .createEventSubscription: try createEventSubscription(incoming, account)
+        case .listEventSubscriptions: try listEventSubscriptions(incoming, account)
+        case .getEventSubscription(let name): try getEventSubscription(name, account)
+        case .patchEventSubscription(let name): try patchEventSubscription(name, incoming, account)
+        case .reactivateEventSubscription(let name): try reactivateEventSubscription(name, account)
+        case .deleteEventSubscription(let name): try deleteEventSubscription(name, account)
+        case .getEventOperation(let name): try getEventOperation(name)
+        case .getPullSubscription(let path): try getPullSubscription(path)
+        case .pull(let path): try pull(path, incoming)
+        case .acknowledge(let path): try acknowledge(path, incoming)
         }
     }
 

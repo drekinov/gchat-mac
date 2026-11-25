@@ -24,6 +24,16 @@ enum Endpoint {
     case downloadMedia(MediaResourceName)
     case setUpSpace
     case searchDirectory
+    case createEventSubscription
+    case listEventSubscriptions
+    case getEventSubscription(String)
+    case patchEventSubscription(String)
+    case reactivateEventSubscription(String)
+    case deleteEventSubscription(String)
+    case getEventOperation(String)
+    case getPullSubscription(String)
+    case pull(String)
+    case acknowledge(String)
 
     var route: FailureRule.Route {
         switch self {
@@ -50,12 +60,26 @@ enum Endpoint {
         case .downloadMedia: .downloadMedia
         case .setUpSpace: .setUpSpace
         case .searchDirectory: .searchDirectory
+        case .createEventSubscription: .createEventSubscription
+        case .listEventSubscriptions: .listEventSubscriptions
+        case .getEventSubscription: .getEventSubscription
+        case .patchEventSubscription: .patchEventSubscription
+        case .reactivateEventSubscription: .reactivateEventSubscription
+        case .deleteEventSubscription: .deleteEventSubscription
+        case .getEventOperation: .getEventOperation
+        case .getPullSubscription: .getPullSubscription
+        case .pull: .pull
+        case .acknowledge: .acknowledge
         }
     }
 
     var space: SpaceName? {
         switch self {
-        case .listSpaces, .listCustomEmojis, .downloadMedia, .setUpSpace, .searchDirectory, .searchMessages: nil
+        case .listSpaces, .listCustomEmojis, .downloadMedia, .setUpSpace, .searchDirectory, .searchMessages,
+            .createEventSubscription, .listEventSubscriptions, .getEventSubscription, .patchEventSubscription,
+            .reactivateEventSubscription, .deleteEventSubscription, .getEventOperation, .getPullSubscription, .pull,
+            .acknowledge:
+            nil
         case .getSpace(let space), .listMessages(let space), .createMessage(let space), .listSpaceEvents(let space),
             .listMembers(let space), .getSpaceReadState(let space, _), .updateSpaceReadState(let space, _),
             .getThreadReadState(let space, _, _), .updateThreadReadState(let space, _, _),
@@ -69,6 +93,8 @@ enum Endpoint {
     }
 
     static let directoryHost = "people.googleapis.com"
+    static let workspaceEventsHost = "workspaceevents.googleapis.com"
+    static let pubSubHost = "pubsub.googleapis.com"
 
     static func parse(method: String, path: String, host: String = "chat.googleapis.com") -> Endpoint? {
         var parts = path.split(separator: "/").map(String.init)
@@ -80,6 +106,8 @@ enum Endpoint {
 
         func space(_ id: String) -> SpaceName? { SpaceName("spaces/\(id)") }
 
+        if host == workspaceEventsHost { return isUpload ? nil : parseWorkspaceEvents(method: method, rest: rest) }
+        if host == pubSubHost { return isUpload ? nil : parsePubSub(method: method, rest: rest) }
         if host == directoryHost {
             return !isUpload && isGet && rest == ["people:searchDirectoryPeople"] ? .searchDirectory : nil
         }
@@ -148,6 +176,39 @@ enum Endpoint {
                 : .updateThreadReadState(thread.space, thread, user: rest[1])
         default:
             return nil
+        }
+    }
+
+    private static func parseWorkspaceEvents(method: String, rest: [String]) -> Endpoint? {
+        switch (rest.count, method) {
+        case (1, "POST") where rest[0] == "subscriptions": return .createEventSubscription
+        case (1, "GET") where rest[0] == "subscriptions": return .listEventSubscriptions
+        case (2, _) where rest[0] == "subscriptions":
+            if method == "POST", rest[1].hasSuffix(":reactivate") {
+                let id = String(rest[1].dropLast(":reactivate".count))
+                return id.isEmpty ? nil : .reactivateEventSubscription("subscriptions/\(id)")
+            }
+            let name = "subscriptions/\(rest[1])"
+            switch method {
+            case "GET": return .getEventSubscription(name)
+            case "PATCH": return .patchEventSubscription(name)
+            case "DELETE": return .deleteEventSubscription(name)
+            default: return nil
+            }
+        case (2, "GET") where rest[0] == "operations": return .getEventOperation("operations/\(rest[1])")
+        default: return nil
+        }
+    }
+
+    private static func parsePubSub(method: String, rest: [String]) -> Endpoint? {
+        guard rest.count == 4, rest[0] == "projects", rest[2] == "subscriptions" else { return nil }
+        let base = "projects/\(rest[1])/subscriptions/"
+        switch method {
+        case "GET": return .getPullSubscription(base + rest[3])
+        case "POST" where rest[3].hasSuffix(":pull"): return .pull(base + rest[3].dropLast(":pull".count))
+        case "POST" where rest[3].hasSuffix(":acknowledge"):
+            return .acknowledge(base + rest[3].dropLast(":acknowledge".count))
+        default: return nil
         }
     }
 }
