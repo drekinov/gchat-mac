@@ -61,17 +61,20 @@ final class Counter: Sendable {
 }
 
 final class HookedBodyProtocol: URLProtocol, @unchecked Sendable {
-    /// Runs once after the first 64 KiB of the body have been read.
-    static let afterFirstRead = Mutex<(@Sendable () -> Void)?>(nil)
+    typealias Hook = @Sendable () -> Void
+
+    /// Keyed by request path. Runs once after the first 64 KiB of the body have been read.
+    static let afterFirstRead = Mutex<[String: Hook]>([:])
     static let finished = Mutex<[String: Int]>([:])
-    /// Runs after the body has been fully read and before the response is delivered.
-    static let beforeResponse = Mutex<(@Sendable () -> Void)?>(nil)
+    /// Keyed by request path. Runs after the body has been fully read and before the response is delivered.
+    static let beforeResponse = Mutex<[String: Hook]>([:])
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         guard let stream = request.httpBodyStream else { return }
+        let path = request.url?.path ?? ""
         stream.open()
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         var total = 0
@@ -86,11 +89,11 @@ final class HookedBodyProtocol: URLProtocol, @unchecked Sendable {
             total += count
             if first {
                 first = false
-                Self.afterFirstRead.withLock { $0 }?()
+                Self.afterFirstRead.withLock { $0[path] }?()
             }
         }
-        Self.beforeResponse.withLock { $0 }?()
-        Self.finished.withLock { $0[request.url?.path ?? ""] = total }
+        Self.beforeResponse.withLock { $0[path] }?()
+        Self.finished.withLock { $0[path] = total }
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [:])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data("{}".utf8))
@@ -301,9 +304,9 @@ final class HookedBodyProtocol: URLProtocol, @unchecked Sendable {
         let file = directory.appending(path: "m.bin")
         try Data(count: 300_000).write(to: file)
         HookedBodyProtocol.afterFirstRead.withLock {
-            $0 = { try? Data(count: 10).write(to: file) }
+            $0["/up/mid-truncate"] = { try? Data(count: 10).write(to: file) }
         }
-        defer { HookedBodyProtocol.afterFirstRead.withLock { $0 = nil } }
+        defer { HookedBodyProtocol.afterFirstRead.withLock { $0["/up/mid-truncate"] = nil } }
         let hooked = AuthTransport(allowedHosts: ["chat.googleapis.com"], protocolClasses: [HookedBodyProtocol.self])
         await #expect(throws: TransportError.requestBodyUnavailable) {
             try await hooked.send(
@@ -318,12 +321,12 @@ final class HookedBodyProtocol: URLProtocol, @unchecked Sendable {
         let file = directory.appending(path: "mm.bin")
         try Data(count: 300_000).write(to: file)
         HookedBodyProtocol.afterFirstRead.withLock {
-            $0 = {
+            $0["/up/mid-touch"] = {
                 try? FileManager.default.setAttributes(
                     [.modificationDate: Date().addingTimeInterval(120)], ofItemAtPath: file.path)
             }
         }
-        defer { HookedBodyProtocol.afterFirstRead.withLock { $0 = nil } }
+        defer { HookedBodyProtocol.afterFirstRead.withLock { $0["/up/mid-touch"] = nil } }
         let hooked = AuthTransport(allowedHosts: ["chat.googleapis.com"], protocolClasses: [HookedBodyProtocol.self])
         await #expect(throws: TransportError.requestBodyUnavailable) {
             try await hooked.send(

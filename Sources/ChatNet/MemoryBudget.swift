@@ -36,12 +36,16 @@ public actor MemoryBudget {
         try await core.reserve(bytes, timeout: timeout)
     }
 
-    /// `beforeEnqueue` runs just before the request joins the queue; tests use it to widen that window.
-    func reserve(_ bytes: Int, timeout: Duration, beforeEnqueue: @escaping @Sendable () -> Void) async throws
+    /// The wait times out when `expiry` returns, in place of sleeping for `timeout`. Its task starts only after
+    /// the request has joined the queue.
+    func reserve(_ bytes: Int, timeout: Duration, expiry: @escaping @Sendable () async throws -> Void) async throws
         -> Reservation
     {
-        try await core.reserve(bytes, timeout: timeout, beforeEnqueue: beforeEnqueue)
+        try await core.reserve(bytes, timeout: timeout, expiry: expiry)
     }
+
+    /// Requests currently queued.
+    nonisolated var waiterCount: Int { core.waiterCount }
 
     /// Returns nil unless the bytes are free and nobody is queued ahead.
     public func tryReserve(_ bytes: Int) -> Reservation? {
@@ -119,6 +123,8 @@ private final class BudgetCore: Sendable {
 
     var available: Int { state.withLock { capacity - $0.used } }
 
+    var waiterCount: Int { state.withLock { $0.waiters.count } }
+
     private func validate(_ bytes: Int) throws {
         guard bytes >= 0 else { throw MemoryBudgetError.invalidSize }
         guard bytes <= capacity else { throw MemoryBudgetError.exceedsCapacity(requested: bytes, capacity: capacity) }
@@ -134,7 +140,7 @@ private final class BudgetCore: Sendable {
     }
 
     func reserve(
-        _ bytes: Int, timeout: Duration? = nil, beforeEnqueue: (@Sendable () -> Void)? = nil
+        _ bytes: Int, timeout: Duration? = nil, expiry: (@Sendable () async throws -> Void)? = nil
     ) async throws -> Reservation {
         try validate(bytes)
         let id = state.withLock { state -> UInt64 in
@@ -145,7 +151,6 @@ private final class BudgetCore: Sendable {
         defer { timer.cancel() }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Reservation, any Error>) in
-                beforeEnqueue?()
                 let immediate: Result<Reservation, any Error>? = state.withLock { state in
                     if Task.isCancelled { return .failure(CancellationError()) }
                     if state.waiters.isEmpty, state.used + bytes <= capacity {
@@ -160,7 +165,9 @@ private final class BudgetCore: Sendable {
                 } else if let timeout {
                     timer.arm(
                         Task {
-                            do { try await Task.sleep(for: timeout) } catch { return }
+                            do {
+                                if let expiry { try await expiry() } else { try await Task.sleep(for: timeout) }
+                            } catch { return }
                             remove(id, with: MemoryBudgetError.timedOut)
                         })
                 }

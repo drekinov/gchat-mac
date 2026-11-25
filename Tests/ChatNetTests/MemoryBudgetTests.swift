@@ -4,6 +4,16 @@ import Testing
 
 @testable import ChatNet
 
+/// Polls `condition` until it holds or `timeout` passes; the timeout only guards against hangs.
+func waitUntil(timeout: Duration = .seconds(10), _ condition: @Sendable () -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while !condition() {
+        guard ContinuousClock.now < deadline else { return false }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    return true
+}
+
 @Suite struct MemoryBudgetTests {
     @Test func reservesAndReleases() async throws {
         let budget = MemoryBudget(capacity: 100)
@@ -80,7 +90,7 @@ import Testing
                     try await Task.sleep(for: .milliseconds(5))
                     reservation.release()
                 })
-            try await Task.sleep(for: .milliseconds(20))
+            try #require(await waitUntil { budget.waiterCount == index + 1 })
         }
         full.release()
         for task in tasks { try await task.value }
@@ -92,10 +102,10 @@ import Testing
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(60)
         let big = Task { try await budget.reserve(80) }
-        try await Task.sleep(for: .milliseconds(30))
+        try #require(await waitUntil { budget.waiterCount == 1 })
         #expect(await budget.tryReserve(10) == nil)
         let small = Task { try await budget.reserve(10) }
-        try await Task.sleep(for: .milliseconds(30))
+        try #require(await waitUntil { budget.waiterCount == 2 })
         held.release()
         let bigReservation = try await big.value
         #expect(bigReservation.bytes == 80)
@@ -108,11 +118,12 @@ import Testing
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(90)
         let blocked = Task { try await budget.reserve(50) }
-        try await Task.sleep(for: .milliseconds(30))
+        try #require(await waitUntil { budget.waiterCount == 1 })
         let behind = Task { try await budget.reserve(5) }
-        try await Task.sleep(for: .milliseconds(30))
+        try #require(await waitUntil { budget.waiterCount == 2 })
         blocked.cancel()
         await #expect(throws: CancellationError.self) { _ = try await blocked.value }
+        try #require(await waitUntil { budget.waiterCount == 0 })
         let granted = try await behind.value
         #expect(granted.bytes == 5)
         granted.release()
@@ -161,16 +172,13 @@ import Testing
     @Test func cancelledStormLeavesTheBudgetWhole() async throws {
         let budget = MemoryBudget(capacity: 50)
         let held = try await budget.reserve(50)
-        let tasks = (0..<200).map { _ in Task { try await budget.reserve(10) } }
-        try await Task.sleep(for: .milliseconds(50))
+        let tasks = (0..<200).map { _ in Task { try await budget.reserve(10).release() } }
+        try #require(await waitUntil { budget.waiterCount == 200 })
         for task in tasks.prefix(150) { task.cancel() }
         held.release()
         var granted = 0
-        for task in tasks {
-            if let reservation = try? await task.value {
-                granted += 1
-                reservation.release()
-            }
+        for task in tasks where (try? await task.value) != nil {
+            granted += 1
         }
         #expect(granted >= 50)
         #expect(await budget.available == 50)
