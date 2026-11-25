@@ -490,9 +490,9 @@ extension MediaFlowTests {
         let root = rig.root
         let logout = Recorder<Task<Void, Never>>()
         loader.beforeExportWrite = {
+            gate.retire()
             logout.append(
                 Task {
-                    gate.retire()
                     await loader.close(waitingUpTo: .seconds(5))
                     events.append("closed")
                     Self.removeExportedPDFs(under: root)
