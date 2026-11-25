@@ -388,6 +388,39 @@
                     await window(
                         "25-image-preview-zoomed.png",
                         ImagePreviewSheet(target: target, startZoom: 2) {}.environment(\.isSnapshotMode, true), size)
+                    let widths: [CGFloat] = [1040, 900, 899, 700, 640, 560, 480]
+                    print("snapshot: preview strip=\(widths.map(ImagePreviewStrip.length(forWidth:)))")
+                    await window(
+                        "25-image-preview-medium.png",
+                        ImagePreviewSheet(target: target) {}.environment(\.isSnapshotMode, true),
+                        NSSize(width: 640, height: 520))
+                    // All three actions, as the main window shows them, with the sender line, at the narrowest.
+                    await window(
+                        "25-image-preview-narrow.png",
+                        ImagePreviewSheet(target: target, onShowInChat: { _ in }) {}
+                            .environment(\.isSnapshotMode, true),
+                        NSSize(width: 480, height: 400))
+                    // An action error shows above the controls, then fades so it doesn't keep covering the image.
+                    // The same error again, as when an action fails twice, starts its own fade rather than ending early.
+                    var repeated = PreviewActionError("Couldn't copy this image")
+                    let first = repeated.shown
+                    repeated.show("Couldn't copy this image")
+                    print("snapshot: preview repeated error restarts fade=\(repeated.shown != first)")
+                    let failed = ImagePreviewSheet(target: target, startError: "Couldn't copy this image") {}
+                        .environment(\.isSnapshotMode, true)
+                    await window("25-image-preview-error.png", failed, NSSize(width: 640, height: 520))
+                    await window(
+                        "25-image-preview-error-later.png", failed, NSSize(width: 640, height: 520),
+                        onLayout: { await Self.pump(.seconds(6)) })
+                    // One image with a long name, at the narrowest: no strip, and the name truncates.
+                    var long = attachment
+                    long.contentName = "onboarding-flow-screenshot-for-the-release-review-final-v3.png"
+                    await window(
+                        "25-image-preview-single.png",
+                        ImagePreviewSheet(target: PreviewTarget(attachment: long, media: loader)) {}
+                            .environment(\.isSnapshotMode, true),
+                        NSSize(width: 480, height: 400))
+                    await previewSheetChecks(target)
                 }
             }
 
@@ -411,6 +444,121 @@
                     print("snapshot: redirect failed: \(mediaFailureText(error))")
                 }
             }
+        }
+
+        /// The preview presented as a real sheet: resizable down to its minimum, and opening next time at the size
+        /// it was left at. Uses a defaults suite of its own, so the app's remembered size is left alone.
+        private func previewSheetChecks(_ target: PreviewTarget) async {
+            let text = { (size: CGSize) in "\(Int(size.width.rounded()))x\(Int(size.height.rounded()))" }
+            let huge = PreviewSheetSize.clamped(
+                CGSize(width: 5000, height: 4000), screen: CGSize(width: 1440, height: 900))
+            print("snapshot: preview clamp=\(text(huge))")
+            print(
+                "snapshot: preview clamp small=\(text(PreviewSheetSize.clamped(CGSize(width: 100, height: 100), screen: nil)))"
+            )
+            guard let suite = UserDefaults(suiteName: "io.github.drekinov.gchat-mac.snapshot.preview") else { return }
+            suite.removeObject(forKey: PreviewSheetSize.defaultsKey)
+            defer { suite.removeObject(forKey: PreviewSheetSize.defaultsKey) }
+            let flag = SheetFlag()
+            let window = NSWindow(
+                contentRect: NSRect(x: 20, y: 20, width: 1200, height: 900), styleMask: [.titled],
+                backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: PreviewSheetHost(flag: flag, target: target, defaults: suite))
+            window.alphaValue = 0.01
+            window.ignoresMouseEvents = true
+            window.orderFrontRegardless()
+            defer { window.close() }
+            let contentSize = { (sheet: NSWindow) in sheet.contentRect(forFrameRect: sheet.frame).size }
+
+            flag.shown = true
+            await Self.pump(.milliseconds(1500))
+            guard let sheet = window.attachedSheet else { return print("snapshot: preview sheet FAILED not presented") }
+            print(
+                "snapshot: preview sheet resizable=\(sheet.styleMask.contains(.resizable)) min=\(text(sheet.contentMinSize)) size=\(text(contentSize(sheet)))"
+            )
+            // A click between the top capsules lands on the image, so panning and double-clicking work there.
+            if let root = sheet.contentView, let frame = root.superview {
+                let point = root.convert(
+                    NSPoint(x: 600, y: root.isFlipped ? 30 : root.bounds.height - 30), to: frame)
+                let hit = root.hitTest(point)
+                let onImage = sequence(first: hit, next: { $0?.superview }).contains { $0 is ZoomScrollView }
+                print("snapshot: preview gap hits image=\(onImage)")
+            }
+            // A person dragging an edge: AppKit resizes the sheet, then reports that the live resize ended.
+            let endResize = { (sheet: NSWindow, size: NSSize) in
+                sheet.setContentSize(size)
+                NotificationCenter.default.post(name: NSWindow.didEndLiveResizeNotification, object: sheet)
+            }
+            let stored = { text(suite.string(forKey: PreviewSheetSize.defaultsKey).map(NSSizeFromString) ?? .zero) }
+
+            endResize(sheet, NSSize(width: 700, height: 500))
+            await Self.pump(.milliseconds(500))
+            // Dragged away and then back to the size it opened at: that last size is the one remembered.
+            endResize(sheet, NSSize(width: 900, height: 640))
+            await Self.pump(.milliseconds(500))
+            print("snapshot: preview dragged back stored=\(stored())")
+            endResize(sheet, NSSize(width: 700, height: 500))
+            await Self.pump(.milliseconds(500))
+            flag.shown = false
+            await Self.pump(.milliseconds(1000))
+            print("snapshot: preview remembered=\(text(PreviewSheetSize.load(from: suite, screen: nil)))")
+
+            flag.shown = true
+            await Self.pump(.milliseconds(1500))
+            if let again = window.attachedSheet {
+                print("snapshot: preview reopened=\(text(contentSize(again)))")
+                // A size saved while the sheet is open, then a redraw of the window under it mid-resize: the sheet
+                // stays where the person put it rather than jumping to the saved size.
+                endResize(again, NSSize(width: 1000, height: 700))
+                await Self.pump(.milliseconds(600))
+                again.setContentSize(NSSize(width: 800, height: 560))
+                flag.generation += 1
+                await Self.pump(.milliseconds(300))
+                print("snapshot: preview kept=\(text(contentSize(again)))")
+                // Closed straight after a resize and opened again: the new sheet opens at that size. It waits for
+                // the old sheet to go first, so what it measures is a new presentation rather than the resized one.
+                endResize(again, NSSize(width: 760, height: 540))
+                let closed = ContinuousClock.now
+                flag.shown = false
+                while window.attachedSheet === again, ContinuousClock.now - closed < .seconds(3) {
+                    await Self.pump(.milliseconds(20))
+                }
+                let gone = ContinuousClock.now - closed
+                if window.attachedSheet === again {
+                    // Every check after this one would measure the old sheet rather than a new presentation.
+                    return print("snapshot: preview quick reopen FAILED old sheet still attached after 3 s")
+                } else {
+                    flag.shown = true
+                    await Self.pump(.milliseconds(1500))
+                    if let quick = window.attachedSheet {
+                        print(
+                            "snapshot: preview quick reopen fresh=\(quick !== again) size=\(text(contentSize(quick))) closed in \(Int(gone / .milliseconds(1))) ms"
+                        )
+                    } else {
+                        print("snapshot: preview quick reopen FAILED not presented")
+                    }
+                }
+            } else {
+                print("snapshot: preview reopened FAILED not presented")
+            }
+            flag.shown = false
+            await Self.pump(.milliseconds(800))
+
+            // Opened and closed without a resize: a remembered size too big for this screen opens smaller, and
+            // stays remembered for a larger screen instead of being replaced by the size it opened at.
+            suite.set(NSStringFromSize(NSSize(width: 9000, height: 9000)), forKey: PreviewSheetSize.defaultsKey)
+            flag.shown = true
+            await Self.pump(.milliseconds(1500))
+            if let big = window.attachedSheet {
+                let size = contentSize(big)
+                print("snapshot: preview untouched opened smaller=\(size.width < 9000 && size.height < 9000)")
+            } else {
+                print("snapshot: preview untouched FAILED not presented")
+            }
+            flag.shown = false
+            await Self.pump(.milliseconds(800))
+            print("snapshot: preview untouched stored=\(stored())")
         }
 
         /// Drives the mention editor the way the composer does and prints the wire text.
@@ -611,6 +759,30 @@
                 try? await Task.sleep(for: .milliseconds(200))
             }
             return true
+        }
+    }
+
+    /// Whether the preview check's sheet is up.
+    @MainActor @Observable
+    private final class SheetFlag {
+        var shown = false
+        /// Bumped to redraw the host, as any change in the main window would.
+        var generation = 0
+    }
+
+    /// A blank window that presents the preview as a real sheet, the way the main window does.
+    private struct PreviewSheetHost: View {
+        @Bindable var flag: SheetFlag
+        let target: PreviewTarget
+        let defaults: UserDefaults
+
+        var body: some View {
+            let _ = flag.generation
+            Color.clear
+                .frame(width: 1200, height: 900)
+                .sheet(isPresented: $flag.shown) {
+                    ImagePreviewSheet(target: target, defaults: defaults) { flag.shown = false }
+                }
         }
     }
 #endif
