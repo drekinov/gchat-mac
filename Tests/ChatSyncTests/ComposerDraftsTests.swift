@@ -172,7 +172,7 @@ struct ComposerDraftsTests {
         let flushing = Task { await drafts.flush() }
         await Task.yield()
 
-        let sending = Task { await drafts.send(key, enqueue()) }
+        let sending = Task { await drafts.send(key, enqueue())?.value ?? false }
         await Task.yield()
         #expect(drafts.draft(key).text.isEmpty)
         await storage.release()
@@ -196,7 +196,7 @@ struct ComposerDraftsTests {
                 for await _ in proceed { break }
                 await storage.delete(key)
                 return true
-            }
+            }?.value ?? false
         }
         for await _ in entered { break }
 
@@ -220,7 +220,7 @@ struct ComposerDraftsTests {
                 enteredContinuation.yield()
                 for await _ in proceed { break }
                 return false
-            }
+            }?.value ?? false
         }
         for await _ in entered { break }
         drafts.setAttachments([draftFile("b.pdf")], for: key)
@@ -269,7 +269,7 @@ struct ComposerDraftsTests {
         await drafts.hydrate(key)
         await storage.hold()
         drafts.reload()
-        let sending = Task { await drafts.send(key, enqueue()) }
+        let sending = Task { await drafts.send(key, enqueue())?.value ?? false }
         await Task.yield()
         await storage.release()
 
@@ -284,7 +284,7 @@ struct ComposerDraftsTests {
 
         drafts.setText("late", for: key)
         #expect(!drafts.setAttachments([draftFile("a.pdf")], for: key))
-        #expect(await !drafts.send(key, enqueue()))
+        #expect(drafts.send(key, enqueue()) == nil)
         #expect(drafts.draft(key).isEmpty)
 
         drafts.isQuitting = false
@@ -310,7 +310,8 @@ struct ComposerDraftsTests {
 
     @Test func adoptedAttachmentsAreSavedBack() async {
         await storage.put(stored("", files: [draftFile("gone.pdf"), draftFile("kept.pdf")]))
-        let drafts = ComposerDrafts(adopt: { $0.filter { $0.filename != "gone.pdf" } }) { [storage] in storage }
+        let drafts = ComposerDrafts(
+            adopt: { $0.filter { $0.filename != "gone.pdf" } }, storage: { [storage] in storage })
 
         await drafts.hydrate(key)
         await drafts.settle()

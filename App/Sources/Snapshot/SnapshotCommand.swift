@@ -53,6 +53,25 @@
                 await mainWindow("02-direct-message.png", model, wide)
             }
 
+            if let other = model.inbox.first(where: { $0.id != threaded.id && model.kind(of: $0) == .space }) {
+                let id = ComposerID(key: other.id, thread: nil)
+                let drafts = model.drafts(for: other.account)
+                let loaded = await model.hydrateDraft(id)
+                model.setDraftText("Half-written reply", for: id)
+                let saved = await drafts.flush()
+                drafts.reload()
+                await drafts.settle()
+                print("snapshot: draft loaded=\(loaded) saved=\(saved) marked=\(model.hasDraft(other.id))")
+                model.select(threaded.id)
+                await mainWindow("34-sidebar-draft.png", model, wide)
+                model.setDraftText("", for: id)
+                _ = await drafts.flush()
+            }
+            await window(
+                "35-quit-hint.png",
+                QuitHint().padding(20).background(Color(nsColor: .windowBackgroundColor)),
+                NSSize(width: 300, height: 80))
+
             model.select(threaded.id)
             await model.waitUntilSettled(timeout: .seconds(3))
             if let thread = model.openMessages.last(where: \.isThreadReply)?.thread,
@@ -301,6 +320,7 @@
             print(
                 "snapshot: security-scoped bookmark creation works: \((try? SecurityScopedFileAccess.bookmark(for: png)) != nil)"
             )
+            _ = await model.hydrateDraft(id)
             model.addFiles([png, pdf, huge], to: id)
             print(
                 "snapshot: queued \(model.attachments(for: id).map(\.filename)) problem: \(model.attachmentError(for: id) ?? "none")"

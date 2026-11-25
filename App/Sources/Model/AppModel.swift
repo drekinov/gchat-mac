@@ -102,7 +102,10 @@ final class AppModel {
     var showsMessageSearch = false
     private(set) var scrollCommand = ScrollCommand(sequence: 0, toTop: false)
     var preview: PreviewTarget?
-    private(set) var composerAttachments: [ComposerID: [PendingAttachment]] = [:]
+    let quitGuard = QuitGuard()
+    /// Per account, kept across reconnects so unsaved drafts reach the new session.
+    @ObservationIgnored private var composerDrafts: [AccountID: ComposerDrafts] = [:]
+    @ObservationIgnored private var draftRevisions: [AccountID: UInt64] = [:]
     private(set) var attachmentErrors: [ComposerID: String] = [:]
     /// Text and web links dropped on a conversation, waiting for that composer to type them in.
     private(set) var droppedText: [ComposerID: [String]] = [:]
@@ -168,7 +171,6 @@ final class AppModel {
             root: LiveAccounts.defaultRoot(), notifications: notificationPoster(isFake: false))
         self.live = live
         connectivity = ConnectivityMonitor(manager: live.manager)
-        AttachmentStaging.prune()
         startExportSweeps(root: LiveAccounts.defaultRoot())
         savedClientProject = live.storedClient.map(Self.projectLabel)
         do {
@@ -294,7 +296,8 @@ final class AppModel {
             if activeComposer?.key.account == id { activeComposer = nil }
             if pendingComposerFocus?.account == id { pendingComposerFocus = nil }
             recent.removeAll { $0.key.account == id }
-            composerAttachments = composerAttachments.filter { $0.key.key.account != id }
+            composerDrafts[id] = nil
+            draftRevisions[id] = nil
             attachmentErrors = attachmentErrors.filter { $0.key.key.account != id }
             droppedText = droppedText.filter { $0.key.key.account != id }
             guard report.failedSteps.isEmpty else {
@@ -387,6 +390,10 @@ final class AppModel {
         if self.info(info.id) == nil { accounts.append(info) }
         sessions[info.id] = session
         updatePollingActivity()
+        let drafts = drafts(for: info.id)
+        draftRevisions[info.id] = nil
+        drafts.reload()
+        drafts.retryUnsaved()
         subscriptions[info.id] = Task {
             for await snapshot in session.snapshots.values {
                 guard !Task.isCancelled, sessions[info.id] === session else { return }
@@ -680,6 +687,10 @@ final class AppModel {
         warmFaces(id)
         refreshChangedFaces(snapshot, previous: previous)
 
+        if draftRevisions[id] != snapshot.draftRevision {
+            if draftRevisions[id] != nil { composerDrafts[id]?.reload() }
+            draftRevisions[id] = snapshot.draftRevision
+        }
         let skipped = previous.map { snapshot.revision > $0.revision + 1 } ?? false
         if let open = unreadPopover, open.account == id {
             let wasDiscovering = previous?.discoveringSpaces.contains(open.space) ?? false
@@ -1036,15 +1047,46 @@ final class AppModel {
 
     // MARK: Composer
 
-    func loadDraft(_ key: SpaceKey, thread: ThreadName?) async -> String {
-        guard let session = sessions[key.account] else { return "" }
-        return await StoreReader.draft(session: session, space: key.space, thread: thread)
+    func drafts(for account: AccountID) -> ComposerDrafts {
+        if let drafts = composerDrafts[account] { return drafts }
+        let drafts = ComposerDrafts(
+            adopt: { AttachmentStaging.adoptStored($0, for: account) },
+            storage: { [weak self] in self?.sessions[account].map(SessionDraftStorage.init) })
+        composerDrafts[account] = drafts
+        return drafts
     }
 
-    func saveDraft(_ text: String, key: SpaceKey, thread: ThreadName?) async {
-        guard let session = sessions[key.account] else { return }
-        let draft = Draft(space: key.space, thread: thread, text: text, updated: Timestamp(Date()))
-        try? await session.saveDraft(draft)
+    func composerDraft(_ id: ComposerID) -> ComposerDraft { drafts(for: id.key.account).draft(id.draftKey) }
+
+    func isComposerEditable(_ id: ComposerID) -> Bool { drafts(for: id.key.account).isEditable(id.draftKey) }
+
+    func hydrateDraft(_ id: ComposerID) async -> Bool { await drafts(for: id.key.account).hydrate(id.draftKey) }
+
+    func setDraftText(_ text: String, for id: ComposerID) {
+        drafts(for: id.key.account).setText(text, for: id.draftKey)
+    }
+
+    func hasDraft(_ key: SpaceKey) -> Bool { composerDrafts[key.account]?.hasDraft(in: key.space) ?? false }
+
+    /// Clears the composer at once and sends its draft in turn after earlier saves; the task's result is `false` if
+    /// nothing was sent and the draft came back.
+    func sendDraft(_ wire: String, from id: ComposerID) -> Task<Bool, Never>? {
+        drafts(for: id.key.account).send(id.draftKey) { [weak self] attachments in
+            await self?.send(wire, key: id.key, thread: id.thread, attachments: attachments) ?? false
+        }
+    }
+
+    /// Stops draft edits and saves every account's drafts; `false` if any couldn't be saved.
+    func prepareToQuit() async -> Bool {
+        let all = Array(composerDrafts.values)
+        for drafts in all { drafts.isQuitting = true }
+        var saved = true
+        for drafts in all where await !drafts.flush() { saved = false }
+        return saved
+    }
+
+    func cancelQuit() {
+        for drafts in composerDrafts.values { drafts.isQuitting = false }
     }
 
     /// Sends through the session of `key` only; the composer's account never changes after it was created.
@@ -1206,35 +1248,23 @@ final class AppModel {
 
     static let maxAttachmentsPerMessage = 10
 
-    func attachments(for id: ComposerID) -> [PendingAttachment] { composerAttachments[id] ?? [] }
+    func attachments(for id: ComposerID) -> [PendingAttachment] { composerDraft(id).attachments }
 
     func attachmentError(for id: ComposerID) -> String? { attachmentErrors[id] }
 
     func clearAttachmentError(_ id: ComposerID) { attachmentErrors[id] = nil }
 
+    /// A removed chip's staged copy stays until the prune: a failed send can still refer to the same file.
     func removeAttachment(_ attachment: UUID, from id: ComposerID) {
-        let removed = composerAttachments[id]?.first { $0.id == attachment }
-        composerAttachments[id]?.removeAll { $0.id == attachment }
-        if composerAttachments[id]?.isEmpty == true { composerAttachments[id] = nil }
-        // A staged copy belongs to its chip alone (sending takes the chips, a failed send gives them back), so it
-        // goes with the chip rather than waiting for the seven-day prune. User-selected originals aren't staged.
-        if let removed {
-            let staged = URL(fileURLWithPath: String(decoding: removed.bookmark, as: UTF8.self))
-            if AttachmentStaging.contains(staged, for: id.key.account) {
-                AttachmentStaging.removeStaged(staged, for: id.key.account)
-            }
-        }
+        let drafts = drafts(for: id.key.account)
+        let remaining = composerDraft(id).attachments.filter { $0.id != attachment }
+        drafts.setAttachments(remaining, for: id.draftKey)
     }
 
     func takeAttachments(_ id: ComposerID) -> [PendingAttachment] {
-        let taken = composerAttachments[id] ?? []
-        composerAttachments[id] = nil
+        let taken = composerDraft(id).attachments
+        drafts(for: id.key.account).setAttachments([], for: id.draftKey)
         return taken
-    }
-
-    func restoreAttachments(_ attachments: [PendingAttachment], to id: ComposerID) {
-        guard sessions[id.key.account]?.gate.current != nil, removingAccount != id.key.account else { return }
-        composerAttachments[id] = attachments + (composerAttachments[id] ?? [])
     }
 
     /// Attaches the files among `drops` and passes web links and text on for the composer to type in. `false`
@@ -1275,6 +1305,7 @@ final class AppModel {
 
     private func canAttach(to id: ComposerID) -> Bool {
         sessions[id.key.account]?.gate.current != nil && removingAccount != id.key.account
+            && !drafts(for: id.key.account).isQuitting
     }
 
     /// Bookmarks the files and queues them as chips; over-size files and failures become one inline message.
@@ -1299,8 +1330,20 @@ final class AppModel {
             for case .dropped(let copy) in candidates { AttachmentStaging.discard(copy) }
             return
         }
+        // Files join the stored draft, never replace it, so its load comes first.
+        guard composerDraft(id).hydrated else {
+            Task {
+                if await hydrateDraft(id) {
+                    attach(candidates, to: id, problems: earlier)
+                } else {
+                    for case .dropped(let copy) in candidates { AttachmentStaging.discard(copy) }
+                    attachmentErrors[id] = "This conversation's draft couldn't be loaded."
+                }
+            }
+            return
+        }
         var problems = earlier
-        var current = composerAttachments[id] ?? []
+        var current = composerDraft(id).attachments
         for (index, candidate) in candidates.enumerated() {
             guard current.count < Self.maxAttachmentsPerMessage else {
                 problems.append(Self.attachmentLimitProblem)
@@ -1320,7 +1363,9 @@ final class AppModel {
                 if case .dropped = candidate { AttachmentStaging.removeStaged(url, for: id.key.account) }
             }
         }
-        composerAttachments[id] = current.isEmpty ? nil : current
+        if !drafts(for: id.key.account).setAttachments(current, for: id.draftKey) {
+            problems.append("The files couldn't be added right now.")
+        }
         var seen = Set<String>()
         let unique = problems.filter { seen.insert($0).inserted }
         attachmentErrors[id] = unique.isEmpty ? nil : unique.joined(separator: " ")

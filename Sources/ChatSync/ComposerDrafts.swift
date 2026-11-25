@@ -141,14 +141,14 @@ public final class ComposerDrafts {
         return true
     }
 
-    /// Clears the composer and runs `perform` with its attachments in turn after earlier saves. The stored draft
-    /// stays until `perform` commits the send (which deletes it); on failure the text and files come back, ahead of
-    /// anything added since. `false` if nothing was sent.
+    /// Clears the composer at once and runs `perform` with its attachments in turn after earlier saves. The stored
+    /// draft stays until `perform` commits the send (which deletes it); on failure the text and files come back,
+    /// ahead of anything added since. The task's result is `false` if nothing was sent; `nil` if nothing was taken.
     public func send(
         _ key: DraftKey, _ perform: @escaping @MainActor ([PendingAttachment]) async -> Bool
-    ) async -> Bool {
+    ) -> Task<Bool, Never>? {
         let entry = draft(key)
-        guard entry.hydrated, !isQuitting, !entry.claimed else { return false }
+        guard entry.hydrated, !isQuitting, !entry.claimed else { return nil }
         let text = entry.text
         let attachments = entry.attachments
         entry.debounce?.cancel()
@@ -158,7 +158,7 @@ public final class ComposerDrafts {
         entry.claimed = true
         let submitted = entry.revision
         refreshDrafted()
-        return await run { [self] in
+        return schedule { [self] in
             let sent = await perform(attachments)
             entry.claimed = false
             if sent {
@@ -229,14 +229,18 @@ public final class ComposerDrafts {
         }
     }
 
-    private func run<T: Sendable>(_ operation: @escaping @MainActor () async -> T) async -> T {
+    private func schedule<T: Sendable>(_ operation: @escaping @MainActor () async -> T) -> Task<T, Never> {
         let previous = tail
         let task = Task { @MainActor in
             await previous?.value
             return await operation()
         }
         tail = Task { _ = await task.value }
-        return await task.value
+        return task
+    }
+
+    private func run<T: Sendable>(_ operation: @escaping @MainActor () async -> T) async -> T {
+        await schedule(operation).value
     }
 
     /// Only from the queue. A claimed composer's row belongs to its send.

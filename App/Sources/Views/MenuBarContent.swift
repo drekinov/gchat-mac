@@ -42,7 +42,6 @@ struct MenuBarContent: View {
         Button("Open Thimble") { showWindow() }
         Divider()
         Button("Quit Thimble") { NSApplication.shared.terminate(nil) }
-            .keyboardShortcut("q")
     }
 
     private func label(_ entry: InboxEntry) -> String {

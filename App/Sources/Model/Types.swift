@@ -36,6 +36,10 @@ struct ComposerID: Hashable {
     let thread: ThreadName?
 }
 
+extension ComposerID {
+    var draftKey: DraftKey { DraftKey(space: key.space, thread: thread) }
+}
+
 /// Asks the open message list to scroll; used by the benchmark.
 struct ScrollCommand: Equatable {
     var sequence: Int

@@ -14,7 +14,7 @@ struct DailyUseTests {
         let attachments = rig.scratch.url.appending(path: "uploads")
         let eraser = LocalAccountEraser(
             root: rig.scratch.url, secrets: rig.secrets, registry: rig.registry, credentialID: TestEraser.credentialID,
-            stagedFilesRoot: attachments, notificationRemover: { _ in })
+            stagedFilesRoots: [attachments], notificationRemover: { _ in })
         let runner = LogoutRunner(eraser: eraser, tombstones: rig.tombstones)
         let manager = AccountManager(
             registry: rig.registry, recovery: LogoutRecovery(runner: runner), tombstones: rig.tombstones
