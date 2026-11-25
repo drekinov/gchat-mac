@@ -13,6 +13,9 @@ actor TestDraftStorage: DraftStorage {
     private var held = false
     private var waiting: [CheckedContinuation<Void, Never>] = []
 
+    /// Operations waiting at the hold.
+    var parked: Int { waiting.count }
+
     func hold() { held = true }
 
     func release() {
@@ -87,11 +90,12 @@ struct ComposerDraftsTests {
         }
     }
 
-    @Test func aComposerTakesNoEditsUntilItsDraftLoads() async {
+    @Test func aComposerTakesNoEditsUntilItsDraftLoads() async throws {
         await storage.put(stored("kept", files: [draftFile("a.pdf")]))
         await storage.hold()
         let loading = Task { await drafts.hydrate(key) }
-        await Task.yield()
+        let parked = await pollAsync { [storage] in await storage.parked == 1 }
+        try #require(parked)
 
         drafts.setText("typed early", for: key)
         #expect(!drafts.setAttachments([draftFile("b.pdf")], for: key))
@@ -163,17 +167,17 @@ struct ComposerDraftsTests {
         #expect(await drafts.flush())
     }
 
-    @Test func aSaveQueuedBeforeSendDoesNotBringBackTheSentText() async {
+    @Test func aSaveQueuedBeforeSendDoesNotBringBackTheSentText() async throws {
         await drafts.hydrate(key)
         drafts.setText("outgoing", for: key)
         #expect(await drafts.flush())
         drafts.setText("outgoing!", for: key)
         await storage.hold()
         let flushing = Task { await drafts.flush() }
-        await Task.yield()
+        let parked = await pollAsync { [storage] in await storage.parked == 1 }
+        try #require(parked)
 
-        let sending = Task { await drafts.send(key, enqueue())?.value ?? false }
-        await Task.yield()
+        let sending = try #require(drafts.send(key, enqueue()))
         #expect(drafts.draft(key).text.isEmpty)
         await storage.release()
 
@@ -305,13 +309,14 @@ struct ComposerDraftsTests {
         #expect(!drafts.hasDraft(in: Self.room))
     }
 
-    @Test func aSlowReloadCannotResurrectADraftSentAfterIt() async {
+    @Test func aSlowReloadCannotResurrectADraftSentAfterIt() async throws {
         await storage.put(stored("about to send"))
         await drafts.hydrate(key)
         await storage.hold()
         drafts.reload()
-        let sending = Task { await drafts.send(key, enqueue())?.value ?? false }
-        await Task.yield()
+        let parked = await pollAsync { [storage] in await storage.parked == 1 }
+        try #require(parked)
+        let sending = try #require(drafts.send(key, enqueue()))
         await storage.release()
 
         #expect(await sending.value)

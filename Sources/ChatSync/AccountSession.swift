@@ -110,6 +110,8 @@ public actor AccountSession {
     static let threadReadDiscoveryBudget = 5
     var memberFetches: [SpaceName: Task<Result<Bool, SyncError>, Never>] = [:]
     var nextSidebar: Timestamp?
+    /// Finished polling-loop passes, so a caller can wait until the loop has seen the current state.
+    var loopPasses: UInt64 = 0
     var nextFocus: Timestamp?
     /// Only `.transport(.offline)`; a reconnect clears it.
     var offlineUntil: Timestamp?
@@ -619,6 +621,7 @@ public actor AccountSession {
                         ? clock.now().adding(.seconds(Double.random(in: timing.focusInterval))) : nil
                 }
             }
+            loopPasses &+= 1
             await sleepUntilNextDeadline()
         }
     }
