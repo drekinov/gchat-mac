@@ -289,6 +289,33 @@ import Testing
     }
 
     @Test(arguments: Backend.allCases)
+    func draftsKeepTheirFilesAndOnlyFillAnEmptySlot(_ backend: Backend) throws {
+        let f = try Fixture(backend)
+        let a = spaceName("A")
+        let file = PendingAttachment(
+            bookmark: Data("b".utf8), filename: "f.pdf", contentType: "application/pdf", byteCount: 3)
+        let filesOnly = Draft(space: a, thread: nil, text: "", attachments: [file], updated: stamp(1))
+        try f.commit(.putDraft(filesOnly))
+        #expect(try f.store.drafts() == [filesOnly])
+
+        let recovered = Draft(space: a, thread: nil, text: "recovered", updated: stamp(2))
+        try f.commit(.putDraftIfAbsent(recovered))
+        #expect(try f.store.drafts() == [filesOnly])
+
+        try f.commit(.putDraft(Draft(space: a, thread: nil, text: "", updated: stamp(3))))
+        try f.commit(.putDraftIfAbsent(recovered))
+        #expect(try f.store.drafts() == [recovered])
+    }
+
+    @Test func aDraftSavedWithoutFilesStillDecodes() throws {
+        let legacy = Data(
+            #"{"space":"spaces/A","text":"old","updated":"2026-01-01T00:00:00Z"}"#.utf8)
+        let draft = try JSONDecoder().decode(Draft.self, from: legacy)
+        #expect(draft.text == "old")
+        #expect(draft.attachments.isEmpty)
+    }
+
+    @Test(arguments: Backend.allCases)
     func outboxRoundTripsEveryState(_ backend: Backend) throws {
         let f = try Fixture(backend)
         let a = spaceName("A")

@@ -2,12 +2,14 @@ import AppKit
 import SwiftUI
 
 struct GChatApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var model: AppModel
     private let responder: NotificationResponder
 
     init() {
         let model = AppModel()
         _model = State(initialValue: model)
+        AppDelegate.model = model
         responder = NotificationResponder.install(model: model)
         AppAppearance.applyStored()
         NotificationCenter.default.addObserver(

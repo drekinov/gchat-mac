@@ -122,6 +122,8 @@ public actor AccountSession {
     var reconcileCursor = 0
     var revision: UInt64 = 0
     var changedSinceSnapshot: Set<SpaceName> = []
+    /// Bumped when the session writes a draft itself (a failed send's text going back to its composer).
+    var draftRevision: UInt64 = 0
     var unavailable: Set<String> = []
     var retryScheduled: Set<SpaceName> = []
     /// Set when an error suggests a membership loss; the next loop pass relists spaces instead of waiting a tick.
@@ -177,6 +179,10 @@ public actor AccountSession {
     public nonisolated func draft(space: SpaceName, thread: ThreadName?) throws(StoreError) -> Draft? {
         let key = thread?.rawValue ?? space.rawValue
         return try store.drafts().first { $0.key == key }
+    }
+
+    public nonisolated func drafts() throws(StoreError) -> [Draft] {
+        try store.drafts().filter { !$0.isEmpty }
     }
 
     public nonisolated func storedSpace(_ space: SpaceName) throws(StoreError) -> StoredSpace? {
@@ -371,10 +377,20 @@ public actor AccountSession {
 
     /// "Post as new message" for a reply whose thread is gone.
     @discardableResult
-    public func repostAsNewMessage(_ failed: OutboxItem) throws(SyncError) -> OutboxItem {
+    public func repostAsNewMessage(_ failed: OutboxItem) throws(SyncError) -> OutboxItem? {
         guard let generation = gate.current else { throw .retired }
-        let item = try sends.enqueue(text: failed.payload.text, space: failed.space, thread: nil, generation)
-        try sends.discard(failed.id, generation)
+        // A second activation finds the failed item already replaced.
+        let current: [OutboxItem]
+        do { current = try store.outbox() } catch { throw .store(error) }
+        guard
+            current.contains(where: {
+                guard $0.id == failed.id, case .failed = $0.state else { return false }
+                return true
+            })
+        else { return nil }
+        let item = try sends.enqueue(
+            text: failed.payload.text, space: failed.space, thread: nil, attachments: failed.payload.attachments,
+            clearsDraft: false, replacing: failed.id, generation)
         work.spawn { [weak self] in await self?.drainOutbox(failed.space, generation) }
         return item
     }
@@ -501,7 +517,7 @@ public actor AccountSession {
         guard let generation = gate.current else { throw .retired }
         do {
             try store.write(gate: gate, generation: generation) { batch in
-                batch.append(draft.text.isEmpty ? .deleteDraft(key: draft.key) : .putDraft(draft))
+                batch.append(draft.isEmpty ? .deleteDraft(key: draft.key) : .putDraft(draft))
             }
         } catch .gateClosed {
             throw .retired
@@ -527,6 +543,8 @@ public actor AccountSession {
             return handle(error, generation, epoch: epoch)
         }
         guard let outcomes else { return }
+        // Published with this commit, so composers pick up a failed send's text straight away.
+        if outcomes.values.contains(where: { if case .failed = $0 { true } else { false } }) { draftRevision += 1 }
         didCommit(space, generation)
         var retryAt: Timestamp?
         var held = false
@@ -996,7 +1014,8 @@ public actor AccountSession {
         snapshots.send(
             AccountSnapshot(
                 account: account, generation: generation, status: status, spaces: spaces, revision: revision,
-                changedSpaces: changedSinceSnapshot, discoveringSpaces: discoveringSpace.map { [$0] } ?? []))
+                changedSpaces: changedSinceSnapshot, discoveringSpaces: discoveringSpace.map { [$0] } ?? [],
+                draftRevision: draftRevision))
         changedSinceSnapshot = []
     }
 

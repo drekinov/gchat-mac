@@ -65,9 +65,14 @@ final class LiveSessionMaker: Sendable {
         guard let key, state == .ready else { throw LiveAccountError.storeShredded }
         try directory.create()
         let store = try SQLiteAccountStore.open(directory: directory, key: key)
-        if let outbox = try? store.outbox() {
-            let bookmarks = Set(outbox.flatMap { $0.payload.attachments.map(\.bookmark) })
-            AttachmentStaging.prune(in: AttachmentStaging.directory(record.id), keeping: bookmarks)
+        // Copies still referenced by a queued send or a draft stay; without both lists nothing is pruned.
+        if let outbox = try? store.outbox(), let drafts = try? store.drafts() {
+            let bookmarks = Set(
+                outbox.flatMap { $0.payload.attachments.map(\.bookmark) }
+                    + drafts.flatMap { $0.attachments.map(\.bookmark) })
+            for directory in [AttachmentStaging.directory(record.id), AttachmentStaging.legacyDirectory(record.id)] {
+                AttachmentStaging.prune(in: directory, keeping: bookmarks)
+            }
         }
         let loader = try MediaLoader(
             media: client, cache: MediaCache(directory: directory, key: key),
@@ -99,7 +104,7 @@ final class LiveAccounts: Sendable {
         let tombstones = LogoutTombstones(root: root)
         let eraser = LocalAccountEraser(
             root: root, secrets: secrets, registry: registry, credentialID: CredentialVault.secretID(for:),
-            stagedFilesRoot: AttachmentStaging.accountsRoot,
+            stagedFilesRoots: [AttachmentStaging.accountsRoot, AttachmentStaging.legacyAccountsRoot],
             notificationRemover: { await notifications.remove(account: $0) })
         let runner = LogoutRunner(eraser: eraser, tombstones: tombstones)
         let maker = LiveSessionMaker(

@@ -10,8 +10,6 @@ struct ComposerView: View {
 
     @State private var text: String
     @State private var restored = false
-    @State private var editRevision = 0
-    @State private var saveTask: Task<Void, Never>?
     @State private var selection: TextSelection?
     @State private var pickerOpen = false
     @State private var mentionEditor = MentionEditor()
@@ -39,16 +37,25 @@ struct ComposerView: View {
     }
 
     private var composerID: ComposerID { ComposerID(key: key, thread: thread) }
+    private var draft: ComposerDraft { model.composerDraft(composerID) }
+    /// Off until the stored draft has loaded, and while the app quits; editing a sent message isn't a draft.
+    private var editable: Bool { previewMode || edit != nil || restored && model.isComposerEditable(composerID) }
 
     var body: some View {
         let items = mentionItems
-        let pending = model.attachments(for: composerID)
+        let pending = draft.attachments
         VStack(alignment: .leading, spacing: 6) {
             if let error = model.sendError {
                 Text(error).font(.caption).foregroundStyle(Theme.error)
             }
             if let problem = model.attachmentError(for: composerID) {
                 Text(problem).font(.caption).foregroundStyle(Theme.error)
+            }
+            if draft.loadFailed, !restored {
+                HStack(spacing: 6) {
+                    Text("The draft couldn't be loaded.").font(.caption).foregroundStyle(Theme.error)
+                    Button("Try Again") { Task { await loadDraft() } }.buttonStyle(.link).font(.caption)
+                }
             }
             if let edit { EditBar(edit: edit, onCancel: { finishEdit() }) }
             // Google Chat's per-conversation history setting; the org's retention rules apply only while it's on.
@@ -65,7 +72,7 @@ struct ComposerView: View {
                         .frame(height: Self.rowHeight)
                 }
                 .buttonStyle(.plain)
-                .disabled(edit != nil)
+                .disabled(edit != nil || !editable)
                 .help("Attach files")
                 .accessibilityLabel("Attach files")
                 VStack(alignment: .leading, spacing: 6) {
@@ -163,16 +170,14 @@ struct ComposerView: View {
             if edit == nil { model.restartEdit(composerID) }
             startRequestedEdit()
             model.prepareMentions(for: key)
+            await loadDraft()
             candidates = await model.mentionCandidates(for: key)
             guard !Task.isCancelled else { return }
             refreshTrigger()
-            guard !restored else { return }
-            let revision = editRevision
-            let draft = await model.loadDraft(key, thread: thread)
-            guard !Task.isCancelled else { return }
-            restored = true
-            if editRevision == revision, text.isEmpty, edit == nil { text = draft }
-            insertDroppedText()
+        }
+        // The draft changes under the composer when a failed send gives its text back.
+        .onChange(of: draft.text) {
+            if restored, edit == nil, draft.text != text { showDraft() }
         }
         .onChange(of: model.editRequests[composerID]?.id) {
             if model.editRequests[composerID] == nil {
@@ -202,6 +207,7 @@ struct ComposerView: View {
 
     private func editor(_ items: [Contact]) -> some View {
         TextEditor(text: editorBinding, selection: $selection)
+            .disabled(!editable)
             .background(TextOnlyDrops())
             .font(.body)
             .scrollContentBackground(.hidden)
@@ -278,8 +284,7 @@ struct ComposerView: View {
     private func commit(_ newValue: String) {
         mentionEditor.applyEdit(old: text, new: newValue)
         text = newValue
-        editRevision += 1
-        scheduleSave()
+        saveDraft()
         refreshTrigger()
     }
 
@@ -339,8 +344,7 @@ struct ComposerView: View {
         guard let trigger else { return }
         let result = mentionEditor.insert(contact, into: text, trigger: trigger)
         text = result.text
-        editRevision += 1
-        scheduleSave()
+        saveDraft()
         self.trigger = nil
         selection = TextSelection(insertionPoint: String.Index(utf16Offset: result.caret, in: text))
     }
@@ -379,8 +383,9 @@ struct ComposerView: View {
 
     private var canSend: Bool {
         if let edit { return !edit.saving && edit.basedOn != nil }
+        guard restored else { return false }
         return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !model.attachments(for: composerID).isEmpty
+            || !draft.attachments.isEmpty
     }
 
     private func chooseFiles() {
@@ -409,15 +414,24 @@ struct ComposerView: View {
         return CGFloat(lines) * Self.lineHeight + Self.editorSlack
     }
 
-    private func scheduleSave() {
-        saveTask?.cancel()
-        guard edit == nil else { return }
-        let snapshot = text
-        saveTask = Task {
-            try? await Task.sleep(for: .milliseconds(600))
-            guard !Task.isCancelled else { return }
-            await model.saveDraft(snapshot, key: key, thread: thread)
-        }
+    /// Hands the text to the draft store, which saves it after a pause; a sent message being edited isn't a draft.
+    private func saveDraft() {
+        guard edit == nil, !previewMode else { return }
+        model.setDraftText(text, for: composerID)
+    }
+
+    private func loadDraft() async {
+        guard !restored, !previewMode, await model.hydrateDraft(composerID), !Task.isCancelled else { return }
+        restored = true
+        if edit == nil { showDraft() }
+        insertDroppedText()
+    }
+
+    /// Shows the stored draft in place of the field's text, which has no mentions of its own then.
+    private func showDraft() {
+        text = draft.text
+        mentionEditor = MentionEditor()
+        refreshTrigger()
     }
 
     private func submit() {
@@ -425,20 +439,17 @@ struct ComposerView: View {
         guard edit == nil else { return saveEdit() }
         let outgoing = text
         let sentMentions = mentionEditor
-        let sentAttachments = model.takeAttachments(composerID)
-        model.clearAttachmentError(composerID)
         let wire = mentionEditor.wireText(outgoing, names: mentionNames)
-        saveTask?.cancel()
+        guard let sending = model.sendDraft(wire, from: composerID) else { return }
+        model.clearAttachmentError(composerID)
         text = ""
         mentionEditor = MentionEditor()
         trigger = nil
         Task {
-            if await !model.send(wire, key: key, thread: thread, attachments: sentAttachments) {
-                model.restoreAttachments(sentAttachments, to: composerID)
-                if text.isEmpty {
-                    text = outgoing
-                    mentionEditor = sentMentions
-                }
+            // The draft store gives the text back on failure; its mentions only the composer knows.
+            if await !sending.value, edit == nil, draft.text == outgoing {
+                text = outgoing
+                mentionEditor = sentMentions
             }
         }
     }
@@ -460,7 +471,7 @@ extension ComposerView {
 
     /// Up arrow in an empty composer edits my last message here.
     fileprivate func editLast() -> KeyPress.Result {
-        guard edit == nil, restored, text.isEmpty, model.attachments(for: composerID).isEmpty,
+        guard edit == nil, restored, text.isEmpty, draft.attachments.isEmpty,
             let message = model.lastEditable(for: composerID)
         else { return .ignored }
         model.beginEdit(message, key: key)
@@ -469,11 +480,8 @@ extension ComposerView {
 
     fileprivate func startRequestedEdit() {
         guard let request = model.takeEditRequest(composerID) else { return }
-        saveTask?.cancel()
         if edit == nil, restored, !model.hasStashedDraft(composerID) {
             model.stashDraft(StashedDraft(text: text, mentions: mentionEditor), for: composerID)
-            let snapshot = text
-            Task { await model.saveDraft(snapshot, key: key, thread: thread) }
         }
         edit = ActiveEdit(attempt: request.id, message: request.message)
         text = ""
@@ -534,20 +542,10 @@ extension ComposerView {
         edit = nil
         trigger = nil
         model.endEdit(composerID, attempt: attempt)
-        mentionEditor = MentionEditor()
-        if let stash = model.takeStashedDraft(composerID) {
-            text = stash.text
-            mentionEditor = stash.mentions
-        } else {
-            text = ""
-            restored = false
-            Task {
-                let draft = await model.loadDraft(key, thread: thread)
-                guard edit == nil, text.isEmpty else { return }
-                text = draft
-                restored = true
-            }
-        }
+        // The draft never changed during the edit; the stash only adds its mentions back.
+        let stash = model.takeStashedDraft(composerID)
+        text = draft.text
+        mentionEditor = stash?.text == text ? stash?.mentions ?? MentionEditor() : MentionEditor()
         selection = TextSelection(insertionPoint: text.endIndex)
         focused = true
     }

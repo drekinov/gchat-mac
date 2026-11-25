@@ -7,6 +7,10 @@ struct AppCommands: Commands {
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(replacing: .appTermination) {
+            Button("Quit Thimble") { model.quitGuard.request() }
+                .keyboardShortcut("q")
+        }
         CommandGroup(after: .windowArrangement) {
             Button("Thimble") { showMainWindow() }
                 .keyboardShortcut("1")

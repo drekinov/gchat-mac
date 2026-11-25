@@ -12,19 +12,19 @@ public struct LocalAccountEraser: AccountEraser {
     let registry: AccountRegistry
     let credentialID: @Sendable (AccountID) -> SecretID
     let notificationRemover: @Sendable (AccountID) async -> Void
-    let stagedFilesRoot: URL?
+    let stagedFilesRoots: [URL]
 
     public init(
         root: URL, secrets: any SecretStore, registry: AccountRegistry,
         credentialID: @escaping @Sendable (AccountID) -> SecretID,
-        stagedFilesRoot: URL? = nil, notificationRemover: @escaping @Sendable (AccountID) async -> Void
+        stagedFilesRoots: [URL] = [], notificationRemover: @escaping @Sendable (AccountID) async -> Void
     ) {
         self.root = root
         self.secrets = secrets
         self.registry = registry
         self.credentialID = credentialID
         self.notificationRemover = notificationRemover
-        self.stagedFilesRoot = stagedFilesRoot
+        self.stagedFilesRoots = stagedFilesRoots
     }
 
     func directory(_ account: AccountID) -> AccountDirectory { AccountDirectory(root: root, account: account) }
@@ -40,7 +40,7 @@ public struct LocalAccountEraser: AccountEraser {
     public func deleteCredentials(_ account: AccountID) throws { try secrets.delete(credentialID(account)) }
 
     public func deleteAccountFiles(_ account: AccountID) throws {
-        if let stagedFilesRoot {
+        for stagedFilesRoot in stagedFilesRoots {
             do {
                 try FileManager.default.removeItem(at: stagedFilesRoot.appending(path: account.description))
             } catch CocoaError.fileNoSuchFile {}

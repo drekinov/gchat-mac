@@ -45,10 +45,13 @@ public struct AccountSnapshot: Sendable {
     public var changedSpaces: Set<SpaceName>
     /// Spaces whose unread replies may still grow, because some of their threads' read times are due a check.
     public var discoveringSpaces: Set<SpaceName>
+    /// Bumped when the session itself writes a draft, so composers and the sidebar re-read theirs.
+    public var draftRevision: UInt64
 
     public init(
         account: AccountID, generation: Generation, status: AccountStatus, spaces: [SpaceSummary] = [],
-        revision: UInt64 = 0, changedSpaces: Set<SpaceName> = [], discoveringSpaces: Set<SpaceName> = []
+        revision: UInt64 = 0, changedSpaces: Set<SpaceName> = [], discoveringSpaces: Set<SpaceName> = [],
+        draftRevision: UInt64 = 0
     ) {
         self.account = account
         self.generation = generation
@@ -57,6 +60,7 @@ public struct AccountSnapshot: Sendable {
         self.revision = revision
         self.changedSpaces = changedSpaces
         self.discoveringSpaces = discoveringSpaces
+        self.draftRevision = draftRevision
     }
 }
 

@@ -19,6 +19,10 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 860, minHeight: 520)
+        .overlay(alignment: .top) {
+            if model.quitGuard.hintVisible { QuitHint().padding(.top, 14) }
+        }
+        .animation(.easeOut(duration: 0.2), value: model.quitGuard.hintVisible)
         .task {
             await model.boot()
             if let bench = BenchConfig(arguments: CommandLine.arguments) {
@@ -177,5 +181,20 @@ struct WindowDragArea: View {
         case "None": break
         default: window.performZoom(nil)
         }
+    }
+}
+
+/// Shown after the first ⌘Q.
+struct QuitHint: View {
+    var body: some View {
+        Text("Press ⌘Q again to quit")
+            .font(.callout.weight(.medium))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.2)))
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .allowsHitTesting(false)
     }
 }

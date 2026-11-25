@@ -93,12 +93,21 @@ enum AttachmentStaging {
         FileManager.default.temporaryDirectory.appending(path: "attachments", directoryHint: .isDirectory)
     }
 
+    /// Drafts keep their files across launches, so copies live outside the temporary folder the system cleans.
     static var accountsRoot: URL {
+        URL.applicationSupportDirectory.appending(path: "Attachments", directoryHint: .isDirectory)
+    }
+
+    static var legacyAccountsRoot: URL {
         FileManager.default.temporaryDirectory.appending(path: "account-attachments", directoryHint: .isDirectory)
     }
 
     static func directory(_ account: AccountID) -> URL {
         accountsRoot.appending(path: account.description, directoryHint: .isDirectory)
+    }
+
+    static func legacyDirectory(_ account: AccountID) -> URL {
+        legacyAccountsRoot.appending(path: account.description, directoryHint: .isDirectory)
     }
 
     /// A fresh per-file folder, so equal file names never collide.
@@ -190,9 +199,28 @@ enum AttachmentStaging {
     }
 
     static func contains(_ url: URL, for account: AccountID) -> Bool {
+        isInside(url, [directory(account), legacyDirectory(account), root])
+    }
+
+    private static func isInside(_ url: URL, _ folders: [URL]) -> Bool {
         let path = url.standardizedFileURL.resolvingSymlinksInPath().path
-        // Old outbox rows can still reference the original per-file folders.
-        return [directory(account), root].contains { path.hasPrefix($0.resolvingSymlinksInPath().path + "/") }
+        return folders.contains { path.hasPrefix($0.resolvingSymlinksInPath().path + "/") }
+    }
+
+    /// Readies a loaded draft's files: a staged copy that's gone is dropped, and one still in the temporary folder
+    /// is copied to the account's durable folder. Bookmarks of the user's own files are kept as they are.
+    static func adoptStored(_ attachments: [PendingAttachment], for account: AccountID) -> [PendingAttachment] {
+        attachments.compactMap { attachment in
+            let url = URL(fileURLWithPath: String(decoding: attachment.bookmark, as: UTF8.self))
+            guard contains(url, for: account) else { return attachment }
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            guard isInside(url, [legacyDirectory(account), root]), let copy = stage(url, for: account) else {
+                return attachment
+            }
+            var moved = attachment
+            moved.bookmark = PathFileAccess.bookmark(for: copy)
+            return moved
+        }
     }
 
     /// Queued attachments survive relaunches, so only old copies go.

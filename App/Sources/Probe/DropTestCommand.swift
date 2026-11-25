@@ -219,20 +219,22 @@
 
             let account = id.key.account
             var wasStaged = false
-            var gone = false
+            var kept = false
             if let staged = AttachmentStaging.stage(image, for: account) {
                 model.addFiles([staged], to: id)
                 if let stagedChip = model.attachments(for: id).first {
                     wasStaged = String(decoding: stagedChip.bookmark, as: UTF8.self) == staged.path
                     model.removeAttachment(stagedChip.id, from: id)
                 }
-                gone = !FileManager.default.fileExists(atPath: staged.path)
+                // A failed send may still refer to it; the prune removes it once nothing does.
+                kept = FileManager.default.fileExists(atPath: staged.path)
+                AttachmentStaging.removeStaged(staged, for: account)
             }
-            let ok = notCopied && originalKept && wasStaged && gone
+            let ok = notCopied && originalKept && wasStaged && kept
             if !ok { failures += 1 }
             print(
                 "DROPTEST \(ok ? "PASS" : "FAIL") stagedCopy: finderNotCopied=\(notCopied) "
-                    + "originalKept=\(originalKept) staged=\(wasStaged) deletedOnRemove=\(gone)")
+                    + "originalKept=\(originalKept) staged=\(wasStaged) keptOnRemove=\(kept)")
         }
 
         /// Link files are read only when small, and only a web link comes out of one.

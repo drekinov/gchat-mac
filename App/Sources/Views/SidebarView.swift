@@ -79,7 +79,8 @@ struct SidebarView: View {
             } label: {
                 InboxRow(
                     entry: entry, account: model.info(entry.account), kind: model.kind(of: entry),
-                    showsBadge: showsBadges, isSelected: selected, density: density,
+                    showsBadge: showsBadges, isSelected: selected, hasDraft: model.hasDraft(entry.id),
+                    density: density,
                     faces: model.spaceFaces[entry.id], media: model.mediaLoader(for: entry.account),
                     photoURL: { model.photoURL($0, account: entry.account) }
                 )
@@ -270,6 +271,9 @@ struct InboxRow: View {
     let kind: SpaceKind
     let showsBadge: Bool
     let isSelected: Bool
+    /// A composer in it holds unsent text or files. The open conversation's own composer is in view, so its mark
+    /// is hidden.
+    var hasDraft = false
     var density = SidebarDensity.comfortable
     /// Two members drawn overlapping in place of a space's letter, or a direct message's other person, once the
     /// member list is cached.
@@ -289,6 +293,12 @@ struct InboxRow: View {
             avatar(title, size: compact ? 24 : 40)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    if hasDraft && !isSelected {
+                        Image(systemName: "square.and.pencil")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Theme.accentText)
+                            .help("Draft")
+                    }
                     Text(title)
                         .font(.body.weight(.semibold))
                         .lineLimit(1)
@@ -347,6 +357,7 @@ struct InboxRow: View {
     private func accessibilityText(_ title: String) -> String {
         var parts = [title]
         if showsBadge, let account { parts.append("\(RemoteText.title(account.name)) account") }
+        if hasDraft && !isSelected { parts.append("draft") }
         if entry.hasUnread { parts.append("\(entry.unread) unread") }
         if entry.isMuted { parts.append("muted") }
         return parts.joined(separator: ", ")

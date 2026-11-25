@@ -54,10 +54,11 @@ public final class SendQueue: Sendable {
         self.clock = clock
     }
 
-    /// Persists the send and clears the composer's draft in the same commit.
+    /// Persists the send, in the same commit clearing the composer's draft (`clearsDraft`) and deleting the item it
+    /// replaces (`replacing`).
     public func enqueue(
         text: String, space: SpaceName, thread: ThreadName?, attachments: [PendingAttachment] = [],
-        _ generation: Generation
+        clearsDraft: Bool = true, replacing: UUID? = nil, _ generation: Generation
     ) throws(SyncError) -> OutboxItem {
         let item = OutboxItem(
             space: space, payload: OutboxPayload(text: text, thread: thread, attachments: attachments),
@@ -66,7 +67,8 @@ public final class SendQueue: Sendable {
         do {
             try store.write(gate: gate, generation: generation) { batch in
                 batch.append(.putOutbox(item))
-                batch.append(.deleteDraft(key: draftKey))
+                if clearsDraft { batch.append(.deleteDraft(key: draftKey)) }
+                if let replacing { batch.append(.deleteOutbox(replacing)) }
             }
         } catch .gateClosed {
             throw .retired
@@ -300,22 +302,17 @@ public final class SendQueue: Sendable {
         return outcome
     }
 
-    /// Terminal failure: the text goes back into the composer unless the user already started a new draft.
+    /// Terminal failure: the text and files go back into the composer unless the user already started a new draft.
     func fail(_ original: OutboxItem, reason: String, _ generation: Generation) throws(SyncError) -> SendOutcome {
         var item = original
         item.state = .failed(reason: reason)
         let failed = item
         let draft = Draft(
-            space: item.space, thread: item.payload.thread, text: item.payload.text, updated: clock.now())
-        let hasDraft: Bool
-        do {
-            hasDraft = try store.drafts().contains { $0.key == draft.key && !$0.text.isEmpty }
-        } catch {
-            throw .store(error)
-        }
+            space: item.space, thread: item.payload.thread, text: item.payload.text,
+            attachments: item.payload.attachments, updated: clock.now())
         try commit(generation) { batch in
             batch.append(.putOutbox(failed))
-            if !hasDraft { batch.append(.putDraft(draft)) }
+            if !draft.isEmpty { batch.append(.putDraftIfAbsent(draft)) }
         }
         return .failed(reason: reason)
     }

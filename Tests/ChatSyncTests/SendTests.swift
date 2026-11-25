@@ -64,6 +64,10 @@ struct SendRig: Sendable {
     func outbox() throws -> [OutboxItem] { try store.outbox() }
 }
 
+func draftFile(_ name: String) -> PendingAttachment {
+    PendingAttachment(bookmark: Data(name.utf8), filename: name, contentType: "application/pdf", byteCount: 10)
+}
+
 func isSent(_ outcome: SendOutcome?) -> Bool {
     if case .sent = outcome { true } else { false }
 }
@@ -291,6 +295,55 @@ struct SendTests {
         #expect(outcomes[item.id] == .failed(reason: "invalid"))
         #expect(try rig.store.drafts() == [newer])
         #expect(try rig.outbox().first?.payload.text == "first try", "the failed payload stays recoverable")
+    }
+
+    @Test func anAttachmentOnlyDraftCountsAsStarted() async throws {
+        let rig = SendRig()
+        rig.server.fail(
+            FailureRule(route: .createMessage, response: .http(status: 400, googleStatus: "INVALID_ARGUMENT")))
+        let item = try rig.enqueue("first try")
+        let newer = Draft(
+            space: rig.team, thread: nil, text: "", attachments: [draftFile("new.pdf")], updated: rig.clock.now())
+        try rig.store.write(gate: rig.gate, generation: rig.generation) { $0.append(.putDraft(newer)) }
+
+        let outcomes = try await rig.drain()
+
+        #expect(outcomes[item.id] == .failed(reason: "invalid"))
+        #expect(try rig.store.drafts() == [newer])
+    }
+
+    @Test func aFailedSendReturnsItsFilesAndReplacesAnEmptyLegacyDraft() async throws {
+        let rig = SendRig()
+        let empty = Draft(space: rig.team, thread: nil, text: "", updated: rig.clock.now())
+        try rig.store.write(gate: rig.gate, generation: rig.generation) { $0.append(.putDraft(empty)) }
+        let file = draftFile("report.pdf")
+        let item = OutboxItem(
+            space: rig.team, payload: OutboxPayload(text: "", thread: nil, attachments: [file]),
+            created: rig.clock.now())
+
+        _ = try rig.sends.fail(item, reason: "invalid", rig.generation)
+
+        let draft = try #require(try rig.store.drafts().first)
+        #expect(draft.attachments == [file])
+        #expect(draft.text.isEmpty)
+    }
+
+    @Test func repostingKeepsTheRoomDraftAndTheFiles() async throws {
+        let rig = SendRig()
+        let roomDraft = Draft(space: rig.team, thread: nil, text: "unsent", updated: rig.clock.now())
+        try rig.store.write(gate: rig.gate, generation: rig.generation) { $0.append(.putDraft(roomDraft)) }
+        let file = draftFile("photo.png")
+        let failed = try rig.sends.enqueue(
+            text: "", space: rig.team, thread: ThreadName(unchecked: "\(rig.team.rawValue)/threads/gone"),
+            attachments: [file], rig.generation)
+
+        let item = try rig.sends.enqueue(
+            text: failed.payload.text, space: rig.team, thread: nil, attachments: failed.payload.attachments,
+            clearsDraft: false, replacing: failed.id, rig.generation)
+
+        #expect(try rig.store.drafts() == [roomDraft])
+        #expect(try rig.outbox().map(\.id) == [item.id])
+        #expect(item.payload.attachments == [file])
     }
 
     @Test(arguments: [429, 503])

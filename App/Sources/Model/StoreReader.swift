@@ -105,8 +105,17 @@ enum StoreReader {
         }
     }
 
-    @concurrent
-    static func draft(session: AccountSession, space: SpaceName, thread: ThreadName?) async -> String {
-        (try? session.draft(space: space, thread: thread))?.text ?? ""
+}
+
+/// An account's drafts in its session's store; reads run off the main actor.
+struct SessionDraftStorage: DraftStorage {
+    let session: AccountSession
+
+    @concurrent func draft(_ key: DraftKey) async throws -> Draft? {
+        try session.draft(space: key.space, thread: key.thread)
     }
+
+    @concurrent func drafts() async throws -> [Draft] { try session.drafts() }
+
+    func save(_ draft: Draft) async throws { try await session.saveDraft(draft) }
 }
