@@ -14,7 +14,7 @@ struct InlineThread: View {
     /// The list's visible area in window coordinates; a reply counts as read once it's inside it.
     let listFrame: CGRect
     /// Rows a drag is over; the thread's reply field shows its drop outline while there's at least one.
-    @Binding var dropRows: Int
+    @Binding var dropRows: Set<AnyHashable>
 
     var body: some View {
         let rows = MessageRowModel.build(
@@ -32,7 +32,7 @@ struct InlineThread: View {
         }
         ForEach(rows) { row in
             let name = row.message.name
-            takesDrops(MessageRow(row: row, context: context, compact: true))
+            takesDrops(MessageRow(row: row, context: context, compact: true), id: row.id)
                 .onGeometryChange(for: Bool.self, of: { [listFrame] in Self.isOnScreen($0, in: listFrame) }) {
                     onScreen in
                     seen(name, onScreen: onScreen)
@@ -49,11 +49,12 @@ struct InlineThread: View {
                     item: item, context: context,
                     onRepost: { Task { await model.repostAsNewMessage(item, key: key) } },
                     onDiscard: { Task { await model.discard(item, key: key) } }
-                )
+                ),
+                id: item.id
             )
             .modifier(ThreadRail(context: context, top: 1))
         }
-        ComposerView(model: model, key: key, thread: thread, conversationDropTargeted: dropRows > 0)
+        ComposerView(model: model, key: key, thread: thread, conversationDropTargeted: !dropRows.isEmpty)
             .modifier(ThreadRail(context: context, top: 5, bottom: 8))
             .id(ComposerID(key: key, thread: thread))
     }
@@ -71,12 +72,9 @@ struct InlineThread: View {
     }
 
     /// Drops on the thread's rows attach to its reply field.
-    private func takesDrops<V: View>(_ row: V) -> some View {
-        row.dropDestination(for: DroppedFile.self) { drops, _ in
-            dropRows = 0
-            return model.addDroppedFiles(drops, to: ComposerID(key: key, thread: thread))
-        } isTargeted: { over in
-            dropRows = max(0, dropRows + (over ? 1 : -1))
+    private func takesDrops<V: View>(_ row: V, id: AnyHashable) -> some View {
+        row.acceptsDrops(id: id, over: $dropRows) {
+            model.addDroppedFiles($0, to: ComposerID(key: key, thread: thread))
         }
     }
 }
