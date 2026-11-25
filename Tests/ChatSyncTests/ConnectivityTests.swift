@@ -195,10 +195,11 @@ struct ConnectivityTests {
     @Test func aStaleOfflineResultFromBeforeAReconnectIsIgnored() async throws {
         let rig = ConnectivityRig()
         #expect(await rig.startAndSync())
+        try #require(await rig.nextSidebar() != nil)
         rig.server.fail(.networkError(.notConnectedToInternet, route: .listSpaces))
         rig.barrier.arm()
         rig.server.advance(.seconds(1))
-        #expect(await rig.barrier.waitForArrival())
+        try #require(await rig.barrier.waitForArrival())
 
         await rig.session.setConnectivity(.unreachable)
         await rig.session.setConnectivity(.reachable)
@@ -206,10 +207,14 @@ struct ConnectivityTests {
         rig.barrier.release()
 
         #expect(await poll { rig.calls.count("listSpaces") > lists }, "the stale result blocked the catch-up")
-        try await rig.settle()
-        #expect(await rig.session.offlineUntil == nil)
-        #expect(await rig.session.offlineFailures == 0)
-        #expect(await rig.session.status == .ok)
+        let session = rig.session
+        let recovered = await pollAsync {
+            let offline = await session.offlineUntil
+            let failures = await session.offlineFailures
+            let status = await session.status
+            return offline == nil && failures == 0 && status == .ok
+        }
+        #expect(recovered, "the stale offline result was applied after the reconnect")
         await rig.shutdown()
     }
 
