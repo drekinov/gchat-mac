@@ -54,6 +54,8 @@ public struct StoreWrite: Sendable {
         case setNotificationSetting(SpaceName, SpaceNotificationSetting?)
         case setMembers(SpaceName, [Membership], title: String?, fetched: Timestamp)
         case putDraft(Draft)
+        /// Writes `draft` only if its composer has no draft, or only an empty one.
+        case putDraftIfAbsent(Draft)
         case deleteDraft(key: String)
         case putOutbox(OutboxItem)
         case deleteOutbox(UUID)

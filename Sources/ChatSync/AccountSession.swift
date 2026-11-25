@@ -122,6 +122,8 @@ public actor AccountSession {
     var reconcileCursor = 0
     var revision: UInt64 = 0
     var changedSinceSnapshot: Set<SpaceName> = []
+    /// Bumped when the session writes a draft itself (a failed send's text going back to its composer).
+    var draftRevision: UInt64 = 0
     var unavailable: Set<String> = []
     var retryScheduled: Set<SpaceName> = []
     /// Set when an error suggests a membership loss; the next loop pass relists spaces instead of waiting a tick.
@@ -177,6 +179,10 @@ public actor AccountSession {
     public nonisolated func draft(space: SpaceName, thread: ThreadName?) throws(StoreError) -> Draft? {
         let key = thread?.rawValue ?? space.rawValue
         return try store.drafts().first { $0.key == key }
+    }
+
+    public nonisolated func drafts() throws(StoreError) -> [Draft] {
+        try store.drafts().filter { !$0.isEmpty }
     }
 
     public nonisolated func storedSpace(_ space: SpaceName) throws(StoreError) -> StoredSpace? {
@@ -373,8 +379,9 @@ public actor AccountSession {
     @discardableResult
     public func repostAsNewMessage(_ failed: OutboxItem) throws(SyncError) -> OutboxItem {
         guard let generation = gate.current else { throw .retired }
-        let item = try sends.enqueue(text: failed.payload.text, space: failed.space, thread: nil, generation)
-        try sends.discard(failed.id, generation)
+        let item = try sends.enqueue(
+            text: failed.payload.text, space: failed.space, thread: nil, attachments: failed.payload.attachments,
+            clearsDraft: false, replacing: failed.id, generation)
         work.spawn { [weak self] in await self?.drainOutbox(failed.space, generation) }
         return item
     }
@@ -501,7 +508,7 @@ public actor AccountSession {
         guard let generation = gate.current else { throw .retired }
         do {
             try store.write(gate: gate, generation: generation) { batch in
-                batch.append(draft.text.isEmpty ? .deleteDraft(key: draft.key) : .putDraft(draft))
+                batch.append(draft.isEmpty ? .deleteDraft(key: draft.key) : .putDraft(draft))
             }
         } catch .gateClosed {
             throw .retired
@@ -541,7 +548,9 @@ public actor AccountSession {
                 held = true
             case .notAdmitted:
                 held = true
-            case .sent, .failed, .retired:
+            case .failed:
+                draftRevision += 1
+            case .sent, .retired:
                 break
             }
         }
@@ -996,7 +1005,8 @@ public actor AccountSession {
         snapshots.send(
             AccountSnapshot(
                 account: account, generation: generation, status: status, spaces: spaces, revision: revision,
-                changedSpaces: changedSinceSnapshot, discoveringSpaces: discoveringSpace.map { [$0] } ?? []))
+                changedSpaces: changedSinceSnapshot, discoveringSpaces: discoveringSpace.map { [$0] } ?? [],
+                draftRevision: draftRevision))
         changedSinceSnapshot = []
     }
 

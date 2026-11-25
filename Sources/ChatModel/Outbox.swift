@@ -5,17 +5,34 @@ public struct Draft: Hashable, Sendable, Codable {
     /// `nil` for the space's composer; a thread for a reply composer.
     public var thread: ThreadName?
     public var text: String
+    public var attachments: [PendingAttachment]
     public var updated: Timestamp
 
-    public init(space: SpaceName, thread: ThreadName?, text: String, updated: Timestamp) {
+    public init(
+        space: SpaceName, thread: ThreadName?, text: String, attachments: [PendingAttachment] = [],
+        updated: Timestamp
+    ) {
         self.space = space
         self.thread = thread
         self.text = text
+        self.attachments = attachments
         self.updated = updated
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        space = try container.decode(SpaceName.self, forKey: .space)
+        thread = try container.decodeIfPresent(ThreadName.self, forKey: .thread)
+        text = try container.decode(String.self, forKey: .text)
+        attachments = try container.decodeIfPresent([PendingAttachment].self, forKey: .attachments) ?? []
+        updated = try container.decode(Timestamp.self, forKey: .updated)
     }
 
     /// Stable row key: one draft per composer.
     public var key: String { thread?.rawValue ?? space.rawValue }
+
+    /// An empty draft is never stored.
+    public var isEmpty: Bool { text.isEmpty && attachments.isEmpty }
 }
 
 /// A file the user attached. `bookmark` is a security-scoped bookmark (sealed with the outbox row); the upload token

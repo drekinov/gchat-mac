@@ -466,13 +466,15 @@ public final class SQLiteAccountStore: AccountStore {
         case .setMembers(let space, let members, let title, let fetched):
             try setMembers(space, members, title: title, fetched: fetched, c)
         case .putDraft(let draft):
-            let sealed = try codec.seal(draft, table: "drafts", rowKey: draft.key)
-            try c.prepare(
-                "INSERT OR REPLACE INTO drafts (key, space, updated_s, updated_n, payload) VALUES (?1, ?2, ?3, ?4, ?5)"
-            ).run([
-                .text(draft.key), .text(draft.space.rawValue), .seconds(draft.updated), .nanos(draft.updated),
-                .blob(sealed),
-            ])
+            try storeDraft(draft, c)
+        case .putDraftIfAbsent(let draft):
+            let statement = try c.prepare("SELECT payload FROM drafts WHERE key = ?1")
+            if let blob = try statement.first([.text(draft.key)], { $0.blob(0) }),
+                try !codec.open(blob, as: Draft.self, table: "drafts", rowKey: draft.key).isEmpty
+            {
+                return
+            }
+            try storeDraft(draft, c)
         case .deleteDraft(let key):
             try c.prepare("DELETE FROM drafts WHERE key = ?1").run([.text(key)])
         case .putOutbox(let item):
@@ -505,6 +507,16 @@ public final class SQLiteAccountStore: AccountStore {
             .addNotifyCandidates, .flagNotifyGap, .removeNotifyPending:
             break
         }
+    }
+
+    private func storeDraft(_ draft: Draft, _ c: Connection) throws(StoreError) {
+        let sealed = try codec.seal(draft, table: "drafts", rowKey: draft.key)
+        try c.prepare(
+            "INSERT OR REPLACE INTO drafts (key, space, updated_s, updated_n, payload) VALUES (?1, ?2, ?3, ?4, ?5)"
+        ).run([
+            .text(draft.key), .text(draft.space.rawValue), .seconds(draft.updated), .nanos(draft.updated),
+            .blob(sealed),
+        ])
     }
 
     private func loadSpacePayload(_ name: SpaceName, _ c: Connection) throws(StoreError) -> SpacePayload? {

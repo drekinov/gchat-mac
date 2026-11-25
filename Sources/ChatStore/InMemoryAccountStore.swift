@@ -199,6 +199,8 @@ public final class InMemoryAccountStore: AccountStore {
             state.spaces[space]?.memberTitleFetched = fetched
         case .putDraft(let draft):
             state.drafts[draft.key] = draft
+        case .putDraftIfAbsent(let draft):
+            if state.drafts[draft.key]?.isEmpty ?? true { state.drafts[draft.key] = draft }
         case .deleteDraft(let key):
             state.drafts[key] = nil
         case .putOutbox(let item):
