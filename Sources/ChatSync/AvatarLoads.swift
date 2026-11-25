@@ -74,6 +74,8 @@ public actor AvatarLoads {
         }
     }
 
+    func waiterCount(_ url: URL) -> Int { workers[url]?.waiters.count ?? 0 }
+
     private func isWanted(_ url: URL, _ generation: UInt64) -> Bool {
         !Task.isCancelled && workers[url]?.generation == generation
     }

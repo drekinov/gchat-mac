@@ -66,16 +66,15 @@ struct AvatarLoadsTests {
 
     @Test func aCancelledCallerLeavesPromptlyAndTheOthersStillGetThePhoto() async {
         let loads = AvatarLoads(sleep: noWait)
-        let script = Script([], hold: .milliseconds(200))
+        let script = Script([], hold: .seconds(1))
         let fetch = script.fetch
         let leaving = Task { await loads.load(url, fetch: fetch) }
         let staying = Task { await loads.load(url, fetch: fetch) }
-        try? await Task.sleep(for: .milliseconds(30))
-        let clock = ContinuousClock()
-        let start = clock.now
+        #expect(await pollAsync { await loads.waiterCount(url) == 2 })
+        #expect(await poll { script.running.load(ordering: .acquiring) == 1 })
         leaving.cancel()
         #expect(await leaving.value == nil)
-        #expect(clock.now - start < .milliseconds(150))
+        #expect(script.running.load(ordering: .acquiring) == 1, "the cancelled caller waited for the download")
         #expect(await staying.value != nil)
         #expect(script.calls.load(ordering: .acquiring) == 1)
     }
