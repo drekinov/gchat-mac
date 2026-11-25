@@ -70,11 +70,10 @@ struct AuthTransportTests {
         AuthTransportTests.credentialedURL,
     ])
     func rejectsBeforeAnyRequest(url: String) async {
-        let before = StubProtocol.seen.withLock { $0.count }
         await #expect(throws: TransportError.self) {
             try await transport.send(HTTPRequest(url: URL(string: url)!))
         }
-        #expect(StubProtocol.seen.withLock { $0.count } == before)
+        #expect(!StubProtocol.seen.withLock { $0.contains { $0.url?.absoluteString == url } })
     }
 
     @Test func redirectIsAnErrorWithLocationAndNotFollowed() async throws {

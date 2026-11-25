@@ -73,11 +73,10 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
             "127.0.0.1", "2130706433", "127.1", "0x7f.0.0.1", "::1", "::ffff:127.0.0.1", "localhost", "foo.localhost",
             "printer.local", "intranet",
         ])
-        let before = FetchStubProtocol.seen.withLock { $0.count }
         await #expect(throws: TransportError.self) {
             try await fetcher(hosts: allowEverything).fetch(url(target))
         }
-        #expect(FetchStubProtocol.seen.withLock { $0.count } == before)
+        #expect(!FetchStubProtocol.seen.withLock { $0.contains { $0.url?.absoluteString == target } })
     }
 
     @Test func schemeFailureIsDistinct() async {

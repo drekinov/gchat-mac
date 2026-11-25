@@ -63,18 +63,19 @@ import Testing
     }
 
     @Test func alreadyCancelledCallerNeverStartsARequest() async {
-        let before = DownloadStubProtocol.seen.withLock { $0.count }
+        DownloadStubProtocol.routes.withLock { $0["/cx/never"] = .init(status: 200, body: Data("ok".utf8)) }
+        let never = URL(string: "https://chat.googleapis.com/cx/never")!
         let task = Task { () -> TransportError? in
             withUnsafeCurrentTask { $0?.cancel() }
             do throws(TransportError) {
-                _ = try await transport.send(HTTPRequest(url: url))
+                _ = try await transport.send(HTTPRequest(url: never))
                 return nil
             } catch {
                 return error
             }
         }
         #expect(await finish(task) == .some(.cancelled))
-        #expect(DownloadStubProtocol.seen.withLock { $0.count } == before)
+        #expect(!DownloadStubProtocol.seen.withLock { $0.contains { $0.url?.path == "/cx/never" } })
     }
 
     // MARK: Deterministic outcome delivery
