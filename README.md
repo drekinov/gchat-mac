@@ -5,6 +5,20 @@
 Thimble is a native Mac app for Google Chat™. Keep several Google Workspace accounts in one inbox, reply in threads,
 share attachments, and search message history. Each conversation shows which account you’re sending from.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/threads-dark.png">
+  <img src="docs/screenshots/threads-light.png" alt="Thimble showing a space with an expanded thread, and spaces and direct messages from three accounts in the sidebar" width="1280">
+</picture>
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/reactions.png" alt="Reactions, skin tones and custom emoji in a space"></td>
+    <td><img src="docs/screenshots/search.png" alt="Message search across all accounts, grouped by account"></td>
+  </tr>
+</table>
+
+<sub>Screenshots use the built-in sample data (<code>make fake</code>); every person and organization in them is made up.</sub>
+
 ## Getting started
 
 - **Try it with sample conversations.** Build the app on macOS 27 or later and launch sample mode. You can explore the inbox before connecting a Google account. [Build and try the app](docs/user-guide.md#build-and-try-the-app)
