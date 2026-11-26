@@ -94,6 +94,9 @@ public final class MediaLoader: Sendable {
     /// Test seam: how many `close` calls are waiting for running exports to finish.
     var exportCloseWaiters: Int { exportsInFlight.waiterCount }
 
+    /// Test seam: why the latest `close` stopped waiting for exports.
+    var exportCloseOutcome: ExportGuard.CloseOutcome? { exportsInFlight.closeOutcome }
+
     /// Test seam: runs after the export is registered and its reader opened, before any file is created.
     var beforeExportWrite: (@Sendable () -> Void)? {
         get { beforeHook.withLock { $0 } }
@@ -398,10 +401,17 @@ public final class MediaLoader: Sendable {
 }
 
 final class ExportGuard: Sendable {
+    enum CloseOutcome: Sendable, Equatable {
+        /// No export was running, or the last one ended.
+        case exportsEnded
+        case timedOut
+    }
+
     private struct State {
         var active = 0
         var closed = false
         var waiters: [@Sendable () -> Void] = []
+        var closeOutcome: CloseOutcome?
     }
 
     private let state = Mutex(State())
@@ -426,11 +436,17 @@ final class ExportGuard: Sendable {
     }
 
     var waiterCount: Int { state.withLock { $0.waiters.count } }
+    var closeOutcome: CloseOutcome? { state.withLock { $0.closeOutcome } }
 
     func closeAndWait(timeout: Duration) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let once = Once()
-            let resume: @Sendable () -> Void = { if once.claim() { continuation.resume() } }
+            let finish: @Sendable (CloseOutcome) -> Void = { [self] outcome in
+                guard once.claim() else { return }
+                state.withLock { $0.closeOutcome = outcome }
+                continuation.resume()
+            }
+            let resume: @Sendable () -> Void = { finish(.exportsEnded) }
             let idle = state.withLock { state -> Bool in
                 state.closed = true
                 guard state.active > 0 else { return true }
@@ -440,7 +456,7 @@ final class ExportGuard: Sendable {
             if idle { return resume() }
             Task {
                 try? await Task.sleep(for: timeout)
-                resume()
+                finish(.timedOut)
             }
         }
     }

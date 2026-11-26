@@ -478,48 +478,59 @@ extension MediaFlowTests {
         }
     }
 
-    /// Pause export before file creation while logout retires the session and wipes files.
+    /// Holds an export after its file exists while logout retires the session, closes the loader and wipes files.
     @Test func logoutWaitsForARunningExportBeforeWiping() async throws {
         let rig = Rig()
         defer { try? FileManager.default.removeItem(at: rig.root) }
         let media = rig.h.server.addMedia(Data("secret".utf8), contentType: "application/pdf", filename: "s.pdf")
         let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let attachment = try #require(message.attachments.first)
         let loader = try rig.loader()
         let gate = rig.h.gate
         let events = Recorder<String>()
         let root = rig.root
-        let logout = Recorder<Task<Void, Never>>()
-        loader.beforeExportWrite = {
-            gate.retire()
-            logout.append(
-                Task {
-                    await loader.close(waitingUpTo: .seconds(5))
-                    events.append("closed")
-                    Self.removeExportedPDFs(under: root)
-                    events.append("wiped")
-                })
-            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-            while loader.exportCloseWaiters == 0, ContinuousClock.now < deadline {
-                Thread.sleep(forTimeInterval: 0.001)
-            }
-            if loader.exportCloseWaiters == 1 { events.append("closeWaiting") }
+        let hold = DispatchSemaphore(value: 0)
+        defer { hold.signal() }
+        loader.beforeExportReturns = {
             events.append("exportWriting")
+            // Only a hang guard: the test releases the export once it has seen close waiting.
+            _ = hold.wait(timeout: .now() + 10)
         }
 
-        await #expect(throws: MediaLoadError.retired) {
-            _ = try await loader.export(try #require(message.attachments.first))
+        let export = Task { () -> MediaLoadError? in
+            do throws(MediaLoadError) {
+                _ = try await loader.export(attachment)
+                return nil
+            } catch {
+                return error
+            }
         }
-        for task in logout.all { await task.value }
-        let order = events.all
-        try #require(order.contains("closeWaiting"), "close didn't wait for the running export")
-        let writing = try #require(order.firstIndex(of: "exportWriting"))
-        let closed = try #require(order.firstIndex(of: "closed"))
-        #expect(writing < closed)
-        #expect(order.last == "wiped")
-        let left =
-            FileManager.default.enumerator(atPath: rig.root.path)?.compactMap { $0 as? String }
-            .filter { $0.contains("exports/") && $0.hasSuffix(".pdf") } ?? []
-        #expect(left.isEmpty)
+        #expect(await poll { events.all == ["exportWriting"] })
+        #expect(Self.exportedPDFs(under: root).count == 1, "the export's file exists")
+
+        gate.retire()
+        let logout = Task {
+            await loader.close(waitingUpTo: .seconds(10))
+            events.append("closed")
+            Self.removeExportedPDFs(under: root)
+            events.append("wiped")
+        }
+        #expect(await poll { loader.exportCloseWaiters == 1 }, "close waits for the running export")
+        #expect(events.all == ["exportWriting"])
+        #expect(Self.exportedPDFs(under: root).count == 1)
+        #expect(loader.exportCloseOutcome == nil)
+
+        hold.signal()
+        #expect(await export.value == MediaLoadError.retired)
+        await logout.value
+        #expect(loader.exportCloseOutcome == .exportsEnded)
+        #expect(events.all == ["exportWriting", "closed", "wiped"])
+        #expect(Self.exportedPDFs(under: root).isEmpty)
+    }
+
+    static func exportedPDFs(under root: URL) -> [String] {
+        (FileManager.default.enumerator(atPath: root.path)?.compactMap { $0 as? String } ?? [])
+            .filter { $0.contains("exports/") && $0.hasSuffix(".pdf") }
     }
 
     static func removeExportedPDFs(under root: URL) {
