@@ -4,6 +4,7 @@ import ChatNet
 import Foundation
 import GoogleChat
 import Network
+import Synchronization
 import Testing
 
 @testable import ChatAuth
@@ -30,17 +31,19 @@ extension OAuthNetworkTests {
                 clock: harness.clock.reader)
         }
 
-        // A2: waiters of an older refresh never overwrite what a newer refresh stored.
+        // A2: overlapping callers share one refresh, and the next refresh stores the token it rotated to.
         @Test func overlappingRefreshesApplyInOrder() async throws {
-            fake.configure {
-                $0.rotateRefreshTokens = true
-                $0.latency = .milliseconds(60)
-            }
+            fake.configure { $0.rotateRefreshTokens = true }
+            fake.holdTokens()
+            defer { fake.releaseTokens() }
             let provider = try provider()
-            async let a = fetchToken(provider)
-            async let b = fetchToken(provider)
-            let first = try await a.get()
-            #expect(try await b.get() == first)
+            let a = Task { await fetchToken(provider) }
+            let b = Task { await fetchToken(provider) }
+            try #require(await eventuallyAsync { await provider.refreshWaiters == 2 })
+            try #require(await eventually { fake.parkedTokenResponses == 1 })
+            fake.releaseTokens()
+            let first = try await a.value.get()
+            #expect(try await b.value.get() == first)
             #expect(fake.tokenRequests().count == 1)
 
             await provider.invalidate(first)
@@ -75,16 +78,125 @@ extension OAuthNetworkTests {
             #expect(await fetchToken(provider) == .failure(.noCredentials))
             #expect(await provider.needsReconsent)
         }
+    }
+}
 
-        // A6: a stalled revoke gives up at the absolute deadline.
-        @Test func revokeHonoursAnAbsoluteDeadline() async {
-            fake.configure { $0.latency = .seconds(30) }
-            let endpoints = OAuthEndpoints(
-                transport: harness.transport, client: fake.client, revokeDeadline: .milliseconds(200))
-            let started = ContinuousClock.now
-            await endpoints.revoke("rt-seed")
-            #expect(ContinuousClock.now - started < .seconds(2))
+/// Opens once. `wait` resumes when it does, or returns false once `limit`, a guard against hangs, runs out.
+final class Gate: Sendable {
+    private let state = Mutex<(open: Bool, waiters: [UUID: CheckedContinuation<Bool, Never>])>((false, [:]))
+
+    var isOpen: Bool { state.withLock { $0.open } }
+
+    func open() {
+        let waiters = state.withLock { state in
+            state.open = true
+            defer { state.waiters = [:] }
+            return state.waiters
         }
+        for waiter in waiters.values { waiter.resume(returning: true) }
+    }
+
+    func wait(within limit: Duration? = .seconds(10)) async -> Bool {
+        let id = UUID()
+        let expiry = limit.map { limit in
+            Task {
+                try? await Task.sleep(for: limit)
+                self.state.withLock { $0.waiters.removeValue(forKey: id) }?.resume(returning: false)
+            }
+        }
+        defer { expiry?.cancel() }
+        return await withCheckedContinuation { continuation in
+            let ready = state.withLock { state in
+                if !state.open { state.waiters[id] = continuation }
+                return state.open
+            }
+            if ready { continuation.resume(returning: true) }
+        }
+    }
+}
+
+/// A6: revoke ends at its deadline or with the response, whichever comes first, and cancels the other.
+@Suite struct RevokeDeadlineTests {
+    /// Answers only once `release` opens, ignoring cancellation apart from reporting it, with no timeout of its own.
+    struct GatedTransport: HTTPTransport {
+        let arrived = Gate()
+        let release = Gate()
+        let cancelled = Gate()
+        let completed = Gate()
+
+        func send(_ request: HTTPRequest) async throws(TransportError) -> HTTPResponse {
+            arrived.open()
+            await withTaskCancellationHandler {
+                _ = await release.wait(within: nil)
+            } onCancel: {
+                cancelled.open()
+            }
+            completed.open()
+            return HTTPResponse(status: 200)
+        }
+    }
+
+    final class Race: Sendable {
+        let transport = GatedTransport()
+        let sleeping = Gate()
+        let deadline = Gate()
+        let sleepCancelled = Gate()
+        let returned = Gate()
+        private let reported = Mutex<[OAuthEndpoints.RevokeOutcome]>([])
+
+        var outcomes: [OAuthEndpoints.RevokeOutcome] { reported.withLock { $0 } }
+
+        func start() -> Task<Void, Never> {
+            var endpoints = OAuthEndpoints(
+                transport: transport, client: OAuthClientConfig(clientID: "id", clientSecret: "secret"))
+            endpoints.sleep = { [self] _ in
+                sleeping.open()
+                await withTaskCancellationHandler {
+                    _ = await deadline.wait(within: nil)
+                } onCancel: {
+                    sleepCancelled.open()
+                }
+            }
+            endpoints.onRevokeOutcome = { [self] outcome in reported.withLock { $0.append(outcome) } }
+            return Task { [self, endpoints] in
+                await endpoints.revoke("rt-seed")
+                returned.open()
+            }
+        }
+
+        func releaseAll() {
+            transport.release.open()
+            deadline.open()
+        }
+    }
+
+    @Test func revokeReturnsAtTheDeadlineWhileTheResponseIsHeld() async throws {
+        let race = Race()
+        defer { race.releaseAll() }
+        _ = race.start()
+        try #require(await race.transport.arrived.wait())
+        try #require(await race.sleeping.wait())
+
+        race.deadline.open()
+        try #require(await race.returned.wait())
+        #expect(race.outcomes == [.deadline])
+        #expect(await race.transport.cancelled.wait())
+        #expect(!race.transport.completed.isOpen)
+    }
+
+    @Test func revokeReturnsWithTheResponseAndStopsWaitingForTheDeadline() async throws {
+        let race = Race()
+        defer { race.releaseAll() }
+        _ = race.start()
+        try #require(await race.transport.arrived.wait())
+        try #require(await race.sleeping.wait())
+
+        race.transport.release.open()
+        try #require(await race.returned.wait())
+        #expect(race.outcomes == [.response])
+        #expect(race.transport.completed.isOpen)
+        #expect(await race.sleepCancelled.wait())
+        #expect(!race.deadline.isOpen)
     }
 }
 

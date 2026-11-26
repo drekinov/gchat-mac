@@ -28,6 +28,14 @@ public struct OAuthEndpoints: Sendable {
     let client: OAuthClientConfig
     let clock: @Sendable () -> Timestamp
     let revokeDeadline: Duration
+    /// Waits out the revoke deadline; a test seam.
+    var sleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    /// Reports which side ended a revoke; a test seam.
+    var onRevokeOutcome: @Sendable (RevokeOutcome) -> Void = { _ in }
+
+    enum RevokeOutcome: Sendable, Equatable {
+        case response, deadline
+    }
 
     public init(
         transport: any HTTPTransport, client: OAuthClientConfig,
@@ -96,19 +104,30 @@ public struct OAuthEndpoints: Sendable {
             timeout: Self.revokeDeadline, maxResponseBytes: 64 * 1024)
         let transport = transport
         let deadline = revokeDeadline
+        let sleep = sleep
+        let report = onRevokeOutcome
+        // Unstructured, so a transport that ignores cancellation can't hold revoke past the deadline.
         let send = Task { _ = try? await transport.send(request) }
+        let timer = Task { try? await sleep(deadline) }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let once = RevokeOnce()
             Task {
                 await send.value
-                if once.claim() { continuation.resume() }
+                if once.claim() {
+                    report(.response)
+                    continuation.resume()
+                }
             }
             Task {
-                try? await Task.sleep(for: deadline)
-                if once.claim() { continuation.resume() }
+                await timer.value
+                if once.claim() {
+                    report(.deadline)
+                    continuation.resume()
+                }
             }
         }
         send.cancel()
+        timer.cancel()
     }
 
     public func userinfo(accessToken: String) async throws(AuthError) -> UserIdentity {

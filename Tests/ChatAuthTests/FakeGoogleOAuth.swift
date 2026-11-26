@@ -127,8 +127,8 @@ final class FakeGoogleOAuth: Sendable {
         var tokenScripts: [(grant: Grant?, reply: Reply)] = []
         var userinfoScripts: [Reply] = []
         var counter = 0
-        var holdingTokens = false
-        var parked: [@Sendable () -> Void] = []
+        var holding: Set<String> = []
+        var parked: [String: [@Sendable () -> Void]] = [:]
     }
 
     let clientID: String
@@ -153,27 +153,30 @@ final class FakeGoogleOAuth: Sendable {
         }
     }
 
-    /// Parks `/token` responses until `releaseTokens()`, so a test can act while a refresh is in flight.
-    func holdTokens() {
-        state.withLock { $0.holdingTokens = true }
+    /// Parks responses to `path` until `release(path)`, so a test can act while a request is in flight.
+    func hold(_ path: String) {
+        state.withLock { _ = $0.holding.insert(path) }
     }
 
-    /// Delivers every parked `/token` response and stops holding new ones.
-    func releaseTokens() {
+    /// Delivers every parked response to `path` and stops holding new ones.
+    func release(_ path: String) {
         let parked = state.withLock { state in
-            state.holdingTokens = false
-            defer { state.parked = [] }
-            return state.parked
+            state.holding.remove(path)
+            return state.parked.removeValue(forKey: path) ?? []
         }
         for deliver in parked { deliver() }
     }
 
-    var parkedTokenResponses: Int { state.withLock { $0.parked.count } }
+    func parkedResponses(_ path: String) -> Int { state.withLock { $0.parked[path]?.count ?? 0 } }
+
+    func holdTokens() { hold("/token") }
+    func releaseTokens() { release("/token") }
+    var parkedTokenResponses: Int { parkedResponses("/token") }
 
     func park(path: String, _ deliver: @escaping @Sendable () -> Void) -> Bool {
         state.withLock { state in
-            guard state.holdingTokens, path == "/token" else { return false }
-            state.parked.append(deliver)
+            guard state.holding.contains(path) else { return false }
+            state.parked[path, default: []].append(deliver)
             return true
         }
     }
