@@ -5,13 +5,14 @@ import Testing
 @testable import ChatNet
 
 final class HangingProtocol: URLProtocol, @unchecked Sendable {
-    static let started = Mutex<Set<String>>([])
+    /// The request timeout each started path carried.
+    static let started = Mutex<[String: TimeInterval]>([:])
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let path = request.url?.path ?? ""
-        Self.started.withLock { _ = $0.insert(path) }
+        Self.started.withLock { $0[path] = request.timeoutInterval }
     }
     override func stopLoading() {}
 }
@@ -165,6 +166,7 @@ extension SafeFetcher.Resolution {
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
             #expect(request.value(forHTTPHeaderField: "Cookie") == nil)
             #expect(request.httpMethod == "GET")
+            #expect(request.timeoutInterval == 20)
         }
     }
 
@@ -447,7 +449,8 @@ extension SafeFetcher.Resolution {
             protocolClass: HangingProtocol.self, resolver: nil, slots: MemoryBudget(capacity: 1), fetch: deadline)
         let fetch = outcome(of: slow, url("https://media.example.com/sf/hang-deadline"))
         defer { fetch.cancel() }
-        try #require(await eventually { HangingProtocol.started.withLock { $0.contains("/sf/hang-deadline") } })
+        try #require(await eventually { HangingProtocol.started.withLock { $0["/sf/hang-deadline"] != nil } })
+        #expect(HangingProtocol.started.withLock { $0["/sf/hang-deadline"] } == 3600)
         deadline.open()
         #expect(await fetch.settled() == .some(.timedOut))
     }
@@ -456,7 +459,7 @@ extension SafeFetcher.Resolution {
         let slow = gated(protocolClass: HangingProtocol.self, resolver: nil, slots: MemoryBudget(capacity: 1))
         let fetch = outcome(of: slow, url("https://media.example.com/sf/hang-cancel"))
         defer { fetch.cancel() }
-        try #require(await eventually { HangingProtocol.started.withLock { $0.contains("/sf/hang-cancel") } })
+        try #require(await eventually { HangingProtocol.started.withLock { $0["/sf/hang-cancel"] != nil } })
         fetch.cancel()
         #expect(await fetch.settled() == .some(.cancelled))
     }
