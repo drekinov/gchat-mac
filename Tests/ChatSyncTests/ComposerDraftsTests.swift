@@ -68,12 +68,21 @@ struct ComposerDraftsTests {
     static let other = SpaceName(unchecked: "spaces/OTHER")
     let key = DraftKey(space: room, thread: nil)
     let thread = DraftKey(space: room, thread: ThreadName(unchecked: "spaces/ROOM/threads/T1"))
+    static let saveDelay: Duration = .seconds(7)
     let storage = TestDraftStorage()
+    /// The pauses after typing; one ends only when a test fires it.
+    let pauses = Pauses()
     let drafts: ComposerDrafts
 
     init() {
-        let storage = storage
-        drafts = ComposerDrafts(saveDelay: .milliseconds(20)) { storage }
+        drafts = Self.make(storage: { [storage] in storage }, pauses: pauses)
+    }
+
+    static func make(
+        adopt: @escaping @MainActor ([PendingAttachment]) -> [PendingAttachment] = { $0 },
+        storage: @escaping @MainActor () -> (any DraftStorage)?, pauses: Pauses
+    ) -> ComposerDrafts {
+        ComposerDrafts(saveDelay: saveDelay, adopt: adopt, storage: storage, sleep: pauses.sleep)
     }
 
     func stored(_ text: String, files: [PendingAttachment] = [], at key: DraftKey? = nil) -> Draft {
@@ -93,16 +102,16 @@ struct ComposerDraftsTests {
     @Test func aComposerTakesNoEditsUntilItsDraftLoads() async throws {
         await storage.put(stored("kept", files: [draftFile("a.pdf")]))
         await storage.hold()
-        let loading = Task { await drafts.hydrate(key) }
-        let parked = await pollAsync { [storage] in await storage.parked == 1 }
-        try #require(parked)
+        let loading = Running { [drafts, key] in await drafts.hydrate(key) }
+        let parked = await eventually { await storage.parked == 1 }
+        #expect(parked)
 
         drafts.setText("typed early", for: key)
         #expect(!drafts.setAttachments([draftFile("b.pdf")], for: key))
         #expect(!drafts.isEditable(key))
 
         await storage.release()
-        #expect(await loading.value)
+        #expect(await loading.settled() == true)
         #expect(drafts.draft(key).text == "kept")
         #expect(drafts.draft(key).attachments.map(\.filename) == ["a.pdf"])
         #expect(await storage.row(key)?.text == "kept")
@@ -145,13 +154,34 @@ struct ComposerDraftsTests {
         #expect(!drafts.hasDraft(in: Self.room))
     }
 
+    @Test func typingIsSavedOnceItPausesAndRetypingRestartsThePause() async throws {
+        await drafts.hydrate(key)
+        drafts.setText("he", for: key)
+        let paused = await eventually { pauses.asked.count == 1 }
+        try #require(paused)
+        drafts.setText("hello", for: key)
+        let restarted = await eventually { pauses.asked.count == 2 }
+        try #require(restarted)
+        #expect(pauses.asked == [Self.saveDelay, Self.saveDelay])
+        #expect(pauses.endings == [.cancelled, nil])
+        await drafts.settle()
+        #expect(await storage.saves == 0, "an interrupted pause saved")
+
+        pauses.fire(1)
+        let saved = await eventually { await storage.row(key)?.text == "hello" }
+        try #require(saved)
+        await drafts.settle()
+        #expect(await storage.saves == 1)
+        #expect(drafts.isSettled)
+    }
+
     @Test func flushSavesTypingWithoutWaitingForThePause() async {
-        let drafts = ComposerDrafts(saveDelay: .seconds(60)) { [storage] in storage }
         await drafts.hydrate(key)
         drafts.setText("last words", for: key)
 
         #expect(await drafts.flush())
         #expect(await storage.row(key)?.text == "last words")
+        #expect(await storage.saves == 1)
     }
 
     @Test func aFailedSaveStaysUnsavedUntilRetried() async {
@@ -173,94 +203,96 @@ struct ComposerDraftsTests {
         #expect(await drafts.flush())
         drafts.setText("outgoing!", for: key)
         await storage.hold()
-        let flushing = Task { await drafts.flush() }
-        let parked = await pollAsync { [storage] in await storage.parked == 1 }
-        try #require(parked)
+        let flushing = Running { [drafts] in await drafts.flush() }
+        let parked = await eventually { await storage.parked == 1 }
+        #expect(parked)
 
-        let sending = try #require(drafts.send(key, enqueue()))
+        let sending = drafts.send(key, enqueue())
+        #expect(sending != nil)
         #expect(drafts.draft(key).text.isEmpty)
         await storage.release()
 
-        #expect(await sending.value)
-        _ = await flushing.value
+        let sent = Running { await sending?.value ?? false }
+        #expect(await sent.settled() == true)
+        #expect(await flushing.settled() != nil)
         #expect(await drafts.flush())
         #expect(await storage.row(key) == nil)
         #expect(!drafts.hasDraft(in: Self.room))
     }
 
-    @Test func theStoredDraftStaysUntilTheSendCommits() async {
+    @Test func theStoredDraftStaysUntilTheSendCommits() async throws {
         await drafts.hydrate(key)
         drafts.setText("outgoing", for: key)
         #expect(await drafts.flush())
-        let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
-        let (proceed, proceedContinuation) = AsyncStream<Void>.makeStream()
-        let sending = Task {
-            await drafts.send(key) { [storage, key] _ in
-                enteredContinuation.yield()
-                for await _ in proceed { break }
+        let commit = Hold()
+        defer { commit.open() }
+        let sending = Running { [drafts, storage, key] in
+            await drafts.send(key) { _ in
+                await commit.pass()
                 await storage.delete(key)
                 return true
             }?.value ?? false
         }
-        for await _ in entered { break }
+        let committing = await eventually { commit.arrived == 1 }
+        try #require(committing)
 
         drafts.setText("typed while sending", for: key)
         #expect(await storage.row(key)?.text == "outgoing")
 
-        proceedContinuation.yield()
-        #expect(await sending.value)
+        commit.open()
+        #expect(await sending.settled() == true)
         #expect(await drafts.flush())
         #expect(await storage.row(key)?.text == "typed while sending")
     }
 
-    @Test func aFailedSendPutsTheDraftBackAheadOfNewFiles() async {
+    @Test func aFailedSendPutsTheDraftBackAheadOfNewFiles() async throws {
         await drafts.hydrate(key)
         drafts.setText("outgoing", for: key)
         drafts.setAttachments([draftFile("a.pdf")], for: key)
-        let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
-        let (proceed, proceedContinuation) = AsyncStream<Void>.makeStream()
-        let sending = Task {
+        let commit = Hold()
+        defer { commit.open() }
+        let sending = Running { [drafts, key] in
             await drafts.send(key) { _ in
-                enteredContinuation.yield()
-                for await _ in proceed { break }
+                await commit.pass()
                 return false
             }?.value ?? false
         }
-        for await _ in entered { break }
+        let committing = await eventually { commit.arrived == 1 }
+        try #require(committing)
         drafts.setAttachments([draftFile("b.pdf")], for: key)
-        proceedContinuation.yield()
+        commit.open()
 
-        #expect(await !sending.value)
+        #expect(await sending.settled() == false)
         #expect(drafts.draft(key).text == "outgoing")
         #expect(drafts.draft(key).attachments.map(\.filename) == ["a.pdf", "b.pdf"])
         #expect(await drafts.flush())
         #expect(await storage.row(key)?.attachments.map(\.filename) == ["a.pdf", "b.pdf"])
     }
 
-    @Test func aFailedSendKeepsTextTypedWhileItWasPending() async {
+    @Test func aFailedSendKeepsTextTypedWhileItWasPending() async throws {
         await drafts.hydrate(key)
         drafts.setText("first", for: key)
-        let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
-        let (proceed, proceedContinuation) = AsyncStream<Void>.makeStream()
-        let sending = Task {
+        let commit = Hold()
+        defer { commit.open() }
+        let sending = Running { [drafts, key] in
             await drafts.send(key) { _ in
-                enteredContinuation.yield()
-                for await _ in proceed { break }
+                await commit.pass()
                 return false
             }?.value ?? false
         }
-        for await _ in entered { break }
+        let committing = await eventually { commit.arrived == 1 }
+        try #require(committing)
         drafts.setText("second", for: key)
-        proceedContinuation.yield()
+        commit.open()
 
-        #expect(await !sending.value)
+        #expect(await sending.settled() == false)
         #expect(drafts.draft(key).text == "first\nsecond")
     }
 
     @Test func reloadReadiesTheFilesOfDraftsNotOpenedYet() async {
         await storage.put(stored("waiting", files: [draftFile("gone.pdf"), draftFile("kept.pdf")], at: thread))
-        let drafts = ComposerDrafts(
-            adopt: { $0.filter { $0.filename != "gone.pdf" } }, storage: { [storage] in storage })
+        let drafts = Self.make(
+            adopt: { $0.filter { $0.filename != "gone.pdf" } }, storage: { [storage] in storage }, pauses: pauses)
 
         drafts.reload()
         await drafts.settle()
@@ -314,12 +346,14 @@ struct ComposerDraftsTests {
         await drafts.hydrate(key)
         await storage.hold()
         drafts.reload()
-        let parked = await pollAsync { [storage] in await storage.parked == 1 }
-        try #require(parked)
-        let sending = try #require(drafts.send(key, enqueue()))
+        let parked = await eventually { await storage.parked == 1 }
+        #expect(parked)
+        let sending = drafts.send(key, enqueue())
+        #expect(sending != nil)
         await storage.release()
 
-        #expect(await sending.value)
+        let sent = Running { await sending?.value ?? false }
+        #expect(await sent.settled() == true)
         await drafts.settle()
         #expect(!drafts.hasDraft(in: Self.room))
     }
@@ -341,7 +375,7 @@ struct ComposerDraftsTests {
     @Test func aNewSessionTakesOverUnsavedDrafts() async {
         let replacement = TestDraftStorage()
         var current: TestDraftStorage? = storage
-        let drafts = ComposerDrafts(saveDelay: .seconds(60)) { current }
+        let drafts = Self.make(storage: { current }, pauses: pauses)
         await drafts.hydrate(key)
         drafts.setText("across reconnect", for: key)
 
@@ -356,8 +390,8 @@ struct ComposerDraftsTests {
 
     @Test func adoptedAttachmentsAreSavedBack() async {
         await storage.put(stored("", files: [draftFile("gone.pdf"), draftFile("kept.pdf")]))
-        let drafts = ComposerDrafts(
-            adopt: { $0.filter { $0.filename != "gone.pdf" } }, storage: { [storage] in storage })
+        let drafts = Self.make(
+            adopt: { $0.filter { $0.filename != "gone.pdf" } }, storage: { [storage] in storage }, pauses: pauses)
 
         await drafts.hydrate(key)
         await drafts.settle()

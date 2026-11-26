@@ -21,7 +21,7 @@ public actor AvatarLoads {
         var task: Task<Void, Never>?
     }
 
-    private let slots: MemoryBudget
+    let slots: MemoryBudget
     private let retryDelays: [Duration]
     private let sleep: @Sendable (Duration) async throws -> Void
     private var workers: [URL: Worker] = [:]
