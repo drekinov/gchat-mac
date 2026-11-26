@@ -283,12 +283,12 @@ struct OwedTests {
 struct OwedSessionTests {
     static func makeSession(
         _ server: FakeChatServer, _ alice: FakeAccount, store: any AccountStore, timing: SessionTiming,
-        scratch: ScratchDirectory
+        scratch: ScratchDirectory, clock: (any SyncClock)? = nil
     ) -> AccountSession {
         AccountSession(
             account: AccountID(), me: alice.user.name,
             api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: alice.token)),
-            store: store, clock: RealSleepClock(server: server),
+            store: store, clock: clock ?? RealSleepClock(server: server),
             logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
             timing: timing)
     }
@@ -337,24 +337,48 @@ struct OwedSessionTests {
         let scratch = ScratchDirectory()
         var timing = SessionTiming.fast
         timing.sidebarInterval = .seconds(3600)
+        timing.inactiveSidebarInterval = .seconds(3600)
+        timing.idleSleep = .seconds(3600)
         let store = InMemoryAccountStore()
-        let session = Self.makeSession(server, alice, store: store, timing: timing, scratch: scratch)
+        let clock = ServerTimeClock(server: server)
+        defer { clock.stop() }
+        let session = Self.makeSession(server, alice, store: store, timing: timing, scratch: scratch, clock: clock)
         let recorder = SnapshotRecorder(session.snapshots.values)
         await session.start()
         #expect(await recorder.wait { $0.status == .ok && $0.spaces.contains { $0.name == space } } != nil)
+        let listPath = "/v1/\(space.rawValue)/messages"
+        let lists: @Sendable () -> Int = { server.requests.filter { $0.method == "GET" && $0.path == listPath }.count }
+        let listed = lists()
 
+        // Server time stands still from here until the test moves it.
         let message = server.post("pushed", in: space, from: .account(bob))
         let recorded = try await session.recordEvents([
             .messagesCreated(space: space, messages: [message.name], time: message.createTime)
         ])
         #expect(recorded.rejected.isEmpty)
+        let requested = server.now
         await session.requestOwedSync()
         await session.requestOwedSync()
-        try await Task.sleep(for: .milliseconds(100))
-        #expect(try store.message(message.name) == nil, "the sync waits for the boundary to settle")
-        server.advance(.seconds(6))
-        #expect(await poll { (try? session.messages(in: space))?.contains { $0.name == message.name } == true })
+        let boundary = try #require(try store.owed(space)).boundary
+        let settle = min(
+            boundary.adding(SyncEngine.skew + AccountSession.owedDebounceSlack),
+            requested.adding(AccountSession.owedDebounceCap))
+        #expect(settle > requested)
+        #expect(await clock.waitForSleeper(until: settle), "the owed sync parks until the boundary settles")
+        #expect(await session.owedDeadline == settle)
+
+        server.advance(settle.interval(since: server.now) - .milliseconds(1))
+        clock.tick()
+        #expect(clock.hasSleeper(until: settle), "nothing wakes the owed sync before its deadline")
+        #expect(lists() == listed, "no fetch before the settle time")
+        #expect(try store.message(message.name) == nil)
+
+        server.advance(.milliseconds(1))
+        #expect(clock.tick() > 0)
+        #expect(await poll { lists() == listed + 1 })
         #expect(await poll { (try? store.owed(space)) == nil })
+        #expect(try store.message(message.name) != nil)
+        #expect(lists() == listed + 1)
 
         recorder.cancel()
         _ = await session.logout(refreshToken: nil)

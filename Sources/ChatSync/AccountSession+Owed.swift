@@ -41,6 +41,7 @@ extension AccountSession {
             let cap = (owedFirstRequest ?? clock.now()).adding(Self.owedDebounceCap)
             var target = owedSettleTime(cap: cap)
             while !Task.isCancelled, clock.now() < target {
+                owedDeadline = target
                 await clock.sleep(until: target)
                 target = owedSettleTime(cap: cap)
             }

@@ -93,6 +93,8 @@ public actor AccountSession {
     var owedSyncWanted = false
     var owedSyncArmed = false
     var owedFirstRequest: Timestamp?
+    /// Test seam: the settle time the owed sync last slept until.
+    var owedDeadline: Timestamp?
     var status: AccountStatus = .starting
     var paused = false
     var focused: SpaceName?
