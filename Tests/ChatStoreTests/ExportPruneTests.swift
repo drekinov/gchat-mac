@@ -1,73 +1,8 @@
 import ChatModel
 import Foundation
-import Synchronization
 import Testing
 
 @testable import ChatStore
-
-/// A value several threads write, read once they're done.
-final class Locked<Value: Sendable>: Sendable {
-    private let value: Mutex<Value>
-    init(_ value: Value) { self.value = Mutex(value) }
-    func update(_ body: (inout Value) -> Void) { value.withLock { body(&$0) } }
-    var current: Value { value.withLock { $0 } }
-}
-
-/// Sets the modification time of `url` itself (a symlink's own, never its target's) `seconds` in the past.
-private func backdate(_ url: URL, by seconds: TimeInterval) throws {
-    let then = Int(Date().addingTimeInterval(-seconds).timeIntervalSince1970)
-    var times = [timespec(tv_sec: then, tv_nsec: 0), timespec(tv_sec: then, tv_nsec: 0)]
-    guard utimensat(AT_FDCWD, url.path, &times, AT_SYMLINK_NOFOLLOW) == 0 else {
-        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-    }
-}
-
-/// A copy last touched two days ago: its file first, then its folder, since writing the file bumps the folder.
-private func makeOld(_ url: URL) throws {
-    try backdate(url, by: 2 * 86_400)
-    try backdate(url.deletingLastPathComponent(), by: 2 * 86_400)
-}
-
-private func exists(_ url: URL) -> Bool {
-    var info = stat()
-    return lstat(url.path, &info) == 0
-}
-
-private func cutoff() -> Date { Date().addingTimeInterval(-ExportDirectory.maxAge) }
-
-/// What seams on other threads report, in order. A test waits for the event it needs; the bound only guards
-/// against a hang.
-final class Events<Event: Sendable>: @unchecked Sendable {
-    private let condition = NSCondition()
-    private var log: [Event] = []
-
-    func record(_ event: Event) {
-        condition.lock()
-        log.append(event)
-        condition.broadcast()
-        condition.unlock()
-    }
-
-    var all: [Event] {
-        condition.lock()
-        defer { condition.unlock() }
-        return log
-    }
-
-    func wait(until done: ([Event]) -> Bool) -> Bool {
-        let limit = Date().addingTimeInterval(10)
-        condition.lock()
-        defer { condition.unlock() }
-        while !done(log) {
-            guard condition.wait(until: limit) else { return done(log) }
-        }
-        return true
-    }
-}
-
-extension Events where Event: Equatable {
-    func wait(for event: Event) -> Bool { wait { $0.contains(event) } }
-}
 
 extension ExportLockSuites {
     @Suite struct ExportPruneTests {
@@ -148,36 +83,37 @@ extension ExportLockSuites {
             #expect(exists(f.directory.storeURL))
         }
 
-        @Test func anAttachmentOpenedAgainWhilePruningIsNotRemovedWithItsOldFolder() throws {
+        @Test func anAttachmentOpenedAgainWhilePruningIsNotRemovedWithItsOldFolder() async throws {
+            enum Step: Sendable, Equatable { case judgedOld, reopening }
             let data = pattern(1000)
             let (f, plain, cache, reader) = try exportFixture(data)
             defer { withExtendedLifetime(f) {} }
             let old = try plain.export(from: reader, filename: "photo.webp")
             try makeOld(old)
             let again = try #require(try cache.open(mediaID: "media/x"))
-            let reopened = Locked<URL?>(nil)
-            let busy = Events<ExportDirectory.LockSite>()
-            var contending = ExportDirectory.Seams()
-            contending.onLockBusy = { busy.record($0) }
-            let contender = ExportDirectory(directory: f.directory, seams: contending)
-            let export = DispatchGroup()
+            let directory = f.directory
+            let steps = Events<Step>()
+            defer { steps.close() }
             let blocked = Locked<Bool?>(nil)
-            var seams = ExportDirectory.Seams()
-            seams.beforePruneRemoval = { _ in
+            var sweeping = ExportDirectory.Seams.patient
+            sweeping.beforePruneRemoval = { _ in
                 // The folder has been judged old, and the attachment is opened again right now, on another thread.
-                export.enter()
-                Thread.detachNewThread {
-                    let url = try? contender.export(from: again, filename: "photo.webp")
-                    reopened.update { $0 = url }
-                    export.leave()
-                }
-                blocked.update { $0 = busy.wait(for: .claim) }
+                steps.record(.judgedOld)
+                blocked.update { $0 = steps.block { $0.contains(.reopening) } }
+            }
+            var contending = ExportDirectory.Seams.patient
+            contending.onLockBusy = { if $0 == .claim { steps.record(.reopening) } }
+            let sweep = onThread { [sweeping] in
+                try ExportDirectory(directory: directory, seams: sweeping).prune(changedBefore: cutoff())
+            }
+            try await steps.wait(for: .judgedOld)
+            let reopened = onThread { [contending] in
+                try ExportDirectory(directory: directory, seams: contending).export(from: again, filename: "photo.webp")
             }
 
-            try ExportDirectory(directory: f.directory, seams: seams).prune(changedBefore: cutoff())
+            try await sweep.value.get()
             #expect(blocked.current == true)
-            #expect(export.wait(timeout: .now() + 10) == .success)
-            let url = try #require(reopened.current)
+            let url = try await reopened.value.get()
             #expect(try Data(contentsOf: url) == data)
         }
 
@@ -415,386 +351,6 @@ extension ExportLockSuites {
             try prune.run(f)
             #expect(exists(link))
             #expect(try Data(contentsOf: v.file) == Data("precious".utf8))
-        }
-    }
-}
-
-extension ExportLockSuites {
-    /// Another process is simulated with a second descriptor: flock locks belong to the open file, so they conflict
-    /// within one process the way they do between two.
-    @Suite struct ExportCrossProcessTests {
-        private func heldElsewhere(_ url: URL) -> Bool {
-            let fd = open(url.path, O_RDWR | O_CREAT, 0o600)
-            guard fd >= 0 else { return false }
-            defer { close(fd) }
-            return flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK
-        }
-
-        @Test func pruningHoldsTheSharedLockWhileItDecidesAndRemoves() throws {
-            let (f, exports, _, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let a = try exports.export(from: reader, filename: "a.bin")
-            try makeOld(a)
-            let lock = f.temp.url.appendingPathComponent(ExportDirectory.lockName)
-            let held = Locked<Bool?>(nil)
-            var seams = ExportDirectory.Seams()
-            seams.beforePruneRemoval = { _ in held.update { $0 = self.heldElsewhere(lock) } }
-
-            try ExportDirectory(directory: f.directory, seams: seams).prune(changedBefore: cutoff())
-            #expect(held.current == true)
-            #expect(!exists(a))
-        }
-
-        @Test func handingOutAStoredCopyHoldsTheSharedLock() throws {
-            let (f, exports, cache, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            _ = try exports.export(from: reader, filename: "a.bin")
-            let lock = f.temp.url.appendingPathComponent(ExportDirectory.lockName)
-            let held = Locked<Bool?>(nil)
-            var seams = ExportDirectory.Seams()
-            seams.beforeHandingOutStored = { _ in held.update { $0 = self.heldElsewhere(lock) } }
-
-            _ = try ExportDirectory(directory: f.directory, seams: seams).export(
-                from: try #require(try cache.open(mediaID: "media/x")), filename: "a.bin")
-            #expect(held.current == true)
-        }
-
-        @Test func aTemporaryIsLockedAsSoonAsItExists() throws {
-            let (f, _, _, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let locked = Locked<[Bool]>([])
-            var seams = ExportDirectory.Seams()
-            seams.afterFolderCreated = { folder in
-                let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
-                let temporaries = names.filter(ExportDirectory.isTemporaryName)
-                locked.update { $0 = temporaries.map { self.heldElsewhere(folder.appendingPathComponent($0)) } }
-            }
-
-            _ = try ExportDirectory(directory: f.directory, seams: seams).export(from: reader, filename: "a.bin")
-            #expect(locked.current == [true])
-        }
-
-        @Test func withoutAUsableSharedLockNothingIsTouched() throws {
-            let (f, exports, cache, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let a = try exports.export(from: reader, filename: "a.bin")
-            try makeOld(a)
-            let elsewhere = f.temp.url.appendingPathComponent("elsewhere")
-            try Data("not a lock".utf8).write(to: elsewhere)
-            let lock = f.temp.url.appendingPathComponent(ExportDirectory.lockName)
-            try FileManager.default.removeItem(at: lock)
-            try FileManager.default.createSymbolicLink(at: lock, withDestinationURL: elsewhere)
-            let again = try #require(try cache.open(mediaID: "media/x"))
-
-            #expect(throws: ExportError.io(code: Int(ELOOP))) { try exports.export(from: again, filename: "b.bin") }
-            #expect(throws: ExportError.self) { try exports.prune(changedBefore: cutoff()) }
-            #expect(throws: ExportError.self) { try exports.wipe() }
-            #expect(exists(a))
-            #expect(!exists(a.deletingLastPathComponent().appendingPathComponent("b.bin")))
-            #expect(try Data(contentsOf: elsewhere) == Data("not a lock".utf8))
-        }
-
-        @Test func theFirstExportIntoAFreshFolderTakesTheSharedLock() throws {
-            let (f, _, _, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let root = f.temp.url.appendingPathComponent("fresh", isDirectory: true)
-            let directory = AccountDirectory(root: root, account: AccountID())
-            let lockExisted = Locked<Bool?>(nil)
-            var seams = ExportDirectory.Seams()
-            seams.afterFolderCreated = { _ in
-                lockExisted.update { $0 = exists(root.appendingPathComponent(ExportDirectory.lockName)) }
-            }
-
-            let url = try ExportDirectory(directory: directory, seams: seams).export(from: reader, filename: "a.bin")
-            #expect(lockExisted.current == true)
-            #expect(exists(url))
-        }
-
-        @Test func anExportAndAWipeGiveUpWhileAnotherProcessKeepsTheSharedLock() throws {
-            let (f, plain, cache, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let a = try plain.export(from: reader, filename: "a.bin")
-            let holder = open(f.temp.url.appendingPathComponent(ExportDirectory.lockName).path, O_RDWR | O_CREAT, 0o600)
-            defer { close(holder) }
-            #expect(flock(holder, LOCK_EX) == 0)
-            let busy = Events<ExportDirectory.LockSite>()
-            var seams = ExportDirectory.Seams()
-            seams.lockWait = .milliseconds(200)
-            seams.onLockBusy = { busy.record($0) }
-            let impatient = ExportDirectory(directory: f.directory, seams: seams)
-            let again = try #require(try cache.open(mediaID: "media/x"))
-            let export = Locked<Result<URL, ExportError>?>(nil)
-            let wipe = Locked<Result<Void, ExportError>?>(nil)
-            let done = DispatchGroup()
-            done.enter()
-            // On a thread of its own, so a wait that never gives up fails the test instead of hanging it.
-            Thread.detachNewThread {
-                let exported = Result { () throws(ExportError) in try impatient.export(from: again, filename: "b.bin") }
-                export.update { $0 = exported }
-                let wiped = Result { () throws(ExportError) in try impatient.wipe() }
-                wipe.update { $0 = wiped }
-                done.leave()
-            }
-
-            try #require(done.wait(timeout: .now() + 10) == .success)
-            #expect(throws: ExportError.io(code: Int(ETIMEDOUT))) { try export.current?.get() }
-            #expect(throws: ExportError.io(code: Int(ETIMEDOUT))) { try wipe.current?.get() }
-            #expect(busy.all.contains(.claim))
-            #expect(busy.all.contains(.wipe))
-            #expect(exists(a))
-        }
-
-        @Test func aWipeThatCantLookIntoItsRootFailsInsteadOfSkipping() throws {
-            let (f, _, _, _) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let parent = f.temp.url.appendingPathComponent("unreadable", isDirectory: true)
-            let root = parent.appendingPathComponent("Accounts", isDirectory: true)
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            let exports = ExportDirectory(directory: AccountDirectory(root: root, account: AccountID()))
-            #expect(chmod(parent.path, 0) == 0)
-            defer { chmod(parent.path, 0o700) }
-
-            #expect(throws: ExportError.io(code: Int(EACCES))) { try exports.wipe() }
-            #expect(throws: ExportError.io(code: Int(EACCES))) { try ExportDirectory.wipeAll(root: root) }
-        }
-
-        @Test func aSweepStopsAtTheFirstLockTimeout() throws {
-            let (f, plain, cache, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            var copies = [try plain.export(from: reader, filename: "0.bin", placement: .unique)]
-            for index in 1..<10 {
-                let again = try #require(try cache.open(mediaID: "media/x"))
-                copies.append(try plain.export(from: again, filename: "\(index).bin", placement: .unique))
-            }
-            for copy in copies { try makeOld(copy) }
-            let holder = open(f.temp.url.appendingPathComponent(ExportDirectory.lockName).path, O_RDWR | O_CREAT, 0o600)
-            defer { close(holder) }
-            #expect(flock(holder, LOCK_EX) == 0)
-            let attempts = Locked(0)
-            let removals = Locked(0)
-            var seams = ExportDirectory.Seams()
-            seams.lockWait = .milliseconds(100)
-            seams.onPruneEntryAttempt = { _ in attempts.update { $0 += 1 } }
-            seams.beforePruneRemoval = { _ in removals.update { $0 += 1 } }
-
-            #expect(throws: ExportError.io(code: Int(ETIMEDOUT))) {
-                try ExportDirectory(directory: f.directory, seams: seams).prune(changedBefore: cutoff())
-            }
-            // One wait, not one for each of the ten copies.
-            #expect(attempts.current == 1)
-            #expect(removals.current == 0)
-            #expect(copies.allSatisfy(exists))
-        }
-
-        @Test func waitingForTheSharedLockDoesntHoldUpOtherWork() throws {
-            let (f, _, _, waitingReader) = try exportFixture(pattern(10))
-            let (g, other, _, otherReader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime((f, g)) {} }
-            let holder = open(f.temp.url.appendingPathComponent(ExportDirectory.lockName).path, O_RDWR | O_CREAT, 0o600)
-            #expect(flock(holder, LOCK_EX) == 0)
-            let busy = Events<ExportDirectory.LockSite>()
-            var seams = ExportDirectory.Seams()
-            seams.lockWait = .seconds(5)
-            seams.onLockBusy = { busy.record($0) }
-            let waiting = ExportDirectory(directory: f.directory, seams: seams)
-            let outcome = Locked<Bool?>(nil)
-            let done = DispatchGroup()
-            done.enter()
-            Thread.detachNewThread {
-                let url = try? waiting.export(from: waitingReader, filename: "a.bin")
-                outcome.update { $0 = url != nil }
-                done.leave()
-            }
-            // Once that export has found the shared lock held, another account's tree (a separate root here) gets its
-            // copy while it's still waiting: had the wait held the process-wide lock, this would only finish once the
-            // wait gave up.
-            #expect(busy.wait(for: .claim))
-            _ = try other.export(from: otherReader, filename: "b.bin")
-            #expect(outcome.current == nil)
-            close(holder)
-            done.wait()
-            #expect(outcome.current == true)
-        }
-
-        @Test func aWipeGivesUpOnTimeWhileThisProcessIsBusyWithTheTree() throws {
-            let (f, exports, _, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let a = try exports.export(from: reader, filename: "a.bin")
-            try makeOld(a)
-            let directory = f.directory
-            let inside = DispatchSemaphore(value: 0)
-            let resume = DispatchSemaphore(value: 0)
-            var pausing = ExportDirectory.Seams()
-            pausing.beforePruneRemoval = { _ in
-                inside.signal()
-                _ = resume.wait(timeout: .now() + 10)
-            }
-            let pruned = DispatchGroup()
-            pruned.enter()
-            Thread.detachNewThread {
-                try? ExportDirectory(directory: directory, seams: pausing).prune(changedBefore: cutoff())
-                pruned.leave()
-            }
-            #expect(inside.wait(timeout: .now() + 10) == .success)
-            let busy = Events<ExportDirectory.LockSite>()
-            var impatient = ExportDirectory.Seams()
-            impatient.lockWait = .milliseconds(200)
-            impatient.onLockBusy = { busy.record($0) }
-
-            // The sweep is stuck holding the lock; the wipe gives up on its own deadline instead of waiting it out.
-            #expect(throws: ExportError.io(code: Int(ETIMEDOUT))) {
-                try ExportDirectory(directory: directory, seams: impatient).wipe()
-            }
-            #expect(busy.all.contains(.wipe))
-            #expect(exists(a))
-            resume.signal()
-            pruned.wait()
-        }
-
-        @Test func nothingStartsOnceTheWaitHasRunOut() throws {
-            let (f, exports, _, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let a = try exports.export(from: reader, filename: "a.bin")
-            var seams = ExportDirectory.Seams()
-            // Both locks are free, but the attempt that finds them so comes after the wait has run out, as a retry can.
-            seams.lockWait = .zero
-
-            #expect(throws: ExportError.io(code: Int(ETIMEDOUT))) {
-                try ExportDirectory(directory: f.directory, seams: seams).wipe()
-            }
-            #expect(exists(a))
-        }
-
-        @Test func aFailedExportReturnsWithoutWaitingForASweepAndItsTemporaryGoesLater() throws {
-            let (f, plain, cache, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            // Something old for the sweep to stop at.
-            try makeOld(try plain.export(from: reader, filename: "old.bin", placement: .unique))
-            let directory = f.directory
-            let inside = DispatchSemaphore(value: 0)
-            let resume = DispatchSemaphore(value: 0)
-            let resumed = Locked(false)
-            var pausing = ExportDirectory.Seams()
-            pausing.beforePruneRemoval = { _ in
-                inside.signal()
-                _ = resume.wait(timeout: .now() + 60)
-                resumed.update { $0 = true }
-            }
-            let pausingSeams = pausing
-            let pruned = DispatchGroup()
-            let staged = Locked<URL?>(nil)
-            let busy = Events<ExportDirectory.LockSite>()
-            var failing = ExportDirectory.Seams()
-            failing.lockWait = .milliseconds(200)
-            failing.onLockBusy = { busy.record($0) }
-            failing.beforeQuarantine = { url in
-                staged.update { $0 = url }
-                pruned.enter()
-                Thread.detachNewThread {
-                    try? ExportDirectory(directory: directory, seams: pausingSeams).prune(changedBefore: cutoff())
-                    pruned.leave()
-                }
-                _ = inside.wait(timeout: .now() + 10)
-            }
-            let again = try #require(try cache.open(mediaID: "media/x"))
-
-            // The sweep holds the lock throughout, so the copy can't be published nor its temporary removed; the export
-            // gives up on its own deadline rather than waiting for the sweep.
-            #expect(throws: ExportError.io(code: Int(ETIMEDOUT))) {
-                try ExportDirectory(directory: directory, seams: failing).export(from: again, filename: "a.bin")
-            }
-            #expect(resumed.current == false)
-            #expect(busy.all.contains(.publish))
-            #expect(busy.all.contains(.cleanup))
-            let temporary = try #require(staged.current)
-            #expect(exists(temporary))
-            resume.signal()
-            pruned.wait()
-
-            // The export let go of its temporary, so the next cleanup takes it.
-            try plain.prune(changedBefore: cutoff())
-            #expect(!exists(temporary))
-        }
-
-        /// Relies on production's pause between entries outlasting the 10 ms lock-retry poll: whether the waiting
-        /// export takes its turn within one pause comes down to those two durations, not to this test.
-        @Test func anExportGetsItsTurnDuringALongSweep() throws {
-            enum Event: Sendable, Equatable { case removing, exported, swept }
-            enum Contender: Sendable, Equatable { case waiting, writing, finished }
-            let (f, plain, cache, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            var copies = [try plain.export(from: reader, filename: "0.bin", placement: .unique)]
-            for index in 1..<30 {
-                let again = try #require(try cache.open(mediaID: "media/x"))
-                copies.append(try plain.export(from: again, filename: "\(index).bin", placement: .unique))
-            }
-            for copy in copies { try makeOld(copy) }
-            let directory = f.directory
-            let order = Events<Event>()
-            let contender = Events<Contender>()
-            let yields = Locked(0)
-            let stalled = Locked(false)
-            var sweeping = ExportDirectory.Seams()
-            // Each entry is removed only once the export is queued for the lock (or done), so every pause finds it
-            // waiting. Blocking here holds the lock, so it never hands the export a turn itself.
-            sweeping.beforePruneRemoval = { _ in
-                order.record(.removing)
-                let queued = contender.wait { $0.last == .waiting || $0.last == .finished }
-                if !queued { stalled.update { $0 = true } }
-            }
-            sweeping.onYieldToWaiters = { yields.update { $0 += 1 } }
-            let pruned = DispatchGroup()
-            pruned.enter()
-            Thread.detachNewThread {
-                try? ExportDirectory(directory: directory, seams: sweeping).prune(changedBefore: cutoff())
-                order.record(.swept)
-                pruned.leave()
-            }
-            #expect(order.wait(for: .removing))
-            var contending = ExportDirectory.Seams()
-            contending.lockWait = .seconds(60)
-            contending.onLockBusy = { _ in contender.record(.waiting) }
-            let again = try #require(try cache.open(mediaID: "media/x"))
-
-            let url = try ExportDirectory(directory: directory, seams: contending).export(
-                from: again, filename: "a.bin"
-            ) {
-                stage in
-                if stage == .claiming { contender.record(.writing) }
-                return true
-            }
-            contender.record(.finished)
-            order.record(.exported)
-            #expect(pruned.wait(timeout: .now() + 60) == .success)
-            #expect(exists(url))
-            #expect(stalled.current == false)
-            #expect(yields.current > 0)
-            #expect(order.all.filter { $0 != .removing } == [.exported, .swept])
-        }
-
-        @Test func aWipeWaitsWhileAnotherProcessHoldsTheSharedLock() throws {
-            let (f, exports, _, reader) = try exportFixture(pattern(10))
-            defer { withExtendedLifetime(f) {} }
-            let a = try exports.export(from: reader, filename: "a.bin")
-            let holder = open(f.temp.url.appendingPathComponent(ExportDirectory.lockName).path, O_RDWR | O_CREAT, 0o600)
-            #expect(flock(holder, LOCK_EX) == 0)
-            let busy = Events<ExportDirectory.LockSite>()
-            var seams = ExportDirectory.Seams()
-            seams.onLockBusy = { busy.record($0) }
-            let waiting = ExportDirectory(directory: f.directory, seams: seams)
-            let wiped = DispatchGroup()
-            wiped.enter()
-            Thread.detachNewThread {
-                try? waiting.wipe()
-                wiped.leave()
-            }
-
-            #expect(busy.wait(for: .wipe))
-            #expect(wiped.wait(timeout: .now()) == .timedOut)
-            #expect(exists(a))
-            close(holder)
-            #expect(wiped.wait(timeout: .now() + 10) == .success)
-            #expect(!exists(a))
         }
     }
 }

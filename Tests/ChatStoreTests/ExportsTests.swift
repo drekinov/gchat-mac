@@ -20,8 +20,9 @@ func exportFixture(
     return (f, ExportDirectory(directory: f.directory), cache, reader)
 }
 
-/// Suites that take the process-wide export lock, run one at a time so a test's lock contention is its own.
-@Suite(.serialized) enum ExportLockSuites {}
+/// Suites that take the export lock. Each test has a root of its own, so none waits for another. A test that waits
+/// for a signal from another thread ends at the time limit if the signal never comes.
+@Suite(.timeLimit(.minutes(1))) enum ExportLockSuites {}
 
 extension ExportLockSuites {
     @Suite struct ExportTests {
@@ -338,24 +339,17 @@ extension ExportLockSuites {
             )
         }
 
-        @Test func concurrentExportsOfOneAttachmentAllSucceedWithOneCopy() throws {
+        @Test func concurrentExportsOfOneAttachmentAllSucceedWithOneCopy() async throws {
             let data = pattern(64 * 1024)
-            let (f, exports, cache, first) = try exportFixture(data)
+            let (f, _, cache, first) = try exportFixture(data)
             defer { withExtendedLifetime(f) {} }
             let readers = try [first] + (1..<8).map { _ in try #require(try cache.open(mediaID: "media/x")) }
-            let results = Locked<[Result<URL, ExportError>]>([])
+            // However long each waits for its turn, none gives up.
+            let exports = ExportDirectory(directory: f.directory, seams: .patient)
 
-            DispatchQueue.concurrentPerform(iterations: readers.count) { index in
-                let result: Result<URL, ExportError>
-                do throws(ExportError) {
-                    result = .success(try exports.export(from: readers[index], filename: "same.bin"))
-                } catch {
-                    result = .failure(error)
-                }
-                results.update { $0.append(result) }
-            }
-
-            let urls = try results.current.map { try $0.get() }
+            let running = readers.map { reader in onThread { try exports.export(from: reader, filename: "same.bin") } }
+            var urls: [URL] = []
+            for export in running { urls.append(try await export.value.get()) }
             #expect(Set(urls).count == 1)
             let url = try #require(urls.first)
             #expect(try Data(contentsOf: url) == data)
