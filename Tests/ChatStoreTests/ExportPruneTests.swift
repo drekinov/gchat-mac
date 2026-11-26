@@ -529,14 +529,14 @@ extension ExportLockSuites {
             done.enter()
             // On a thread of its own, so a wait that never gives up fails the test instead of hanging it.
             Thread.detachNewThread {
-                export.update {
-                    $0 = Result { () throws(ExportError) in try impatient.export(from: again, filename: "b.bin") }
-                }
-                wipe.update { $0 = Result { () throws(ExportError) in try impatient.wipe() } }
+                let exported = Result { () throws(ExportError) in try impatient.export(from: again, filename: "b.bin") }
+                export.update { $0 = exported }
+                let wiped = Result { () throws(ExportError) in try impatient.wipe() }
+                wipe.update { $0 = wiped }
                 done.leave()
             }
 
-            #expect(done.wait(timeout: .now() + 10) == .success)
+            try #require(done.wait(timeout: .now() + 10) == .success)
             #expect(throws: ExportError.io(code: Int(ETIMEDOUT))) { try export.current?.get() }
             #expect(throws: ExportError.io(code: Int(ETIMEDOUT))) { try wipe.current?.get() }
             #expect(busy.all.contains(.claim))
