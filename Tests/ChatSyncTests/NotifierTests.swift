@@ -939,6 +939,16 @@ struct SessionNotificationRetryTests {
             guard await recorder.wait(where: { $0.status == .ok && $0.spaces.count == spaces.count }) != nil else {
                 return nil
             }
+            // A wake before the first tick has parked would leave the loop parked for 1 ms of frozen time.
+            let session = session
+            guard
+                await pollAsync(
+                    timeout: .seconds(10),
+                    {
+                        let (parked, nextSidebar, _, _) = await session.loopAndNotifier()
+                        return parked && nextSidebar != nil
+                    })
+            else { return nil }
             server.advance(.seconds(1))
             let messages = spaces.map { server.post("hello", in: $0, from: .account(bob)).name }
             server.advance(.seconds(5))
