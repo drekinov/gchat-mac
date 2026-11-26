@@ -48,18 +48,24 @@ final class ServerTimeClock: SyncClock {
         try Task.checkCancellation()
     }
 
-    /// Wakes every sleeper whose deadline the server has reached, then gives them a moment to park again, so
-    /// simulated time doesn't run ahead of the work it woke.
-    func tick() async {
+    /// Wakes every sleeper whose deadline the server has reached and returns how many woke. It doesn't wait for
+    /// the woken work: each test waits for its own signal.
+    @discardableResult
+    func tick() -> Int {
         let now = server.now
-        let parked = sleepers
-        let woken = resume { $0.deadline <= now }
-        guard woken > 0 else { return }
-        let deadline = ContinuousClock.now.advanced(by: .milliseconds(300))
-        while sleepers < parked, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(1)) }
+        return resume { $0.deadline <= now }
     }
 
     var sleepers: Int { state.withLock { $0.waiters.count } }
+
+    /// True once a sleeper with exactly this deadline is parked; `timeout` is only a hang guard.
+    func waitForSleeper(until deadline: Timestamp, timeout: Duration = .seconds(10)) async -> Bool {
+        await poll(timeout: timeout) { self.state.withLock { $0.waiters.contains { $0.deadline == deadline } } }
+    }
+
+    func hasSleeper(until deadline: Timestamp) -> Bool {
+        state.withLock { $0.waiters.contains { $0.deadline == deadline } }
+    }
 
     func stop() {
         state.withLock { $0.stopped = true }
@@ -114,7 +120,7 @@ final class StaleGets: Sendable {
     func answer(_ name: EventSubscriptionName) -> EventSubscription? { value.withLock { $0?.name == name ? $0 : nil } }
 }
 
-/// Lets a test answer create with ALREADY_EXISTS, park create or get until released, or script a get.
+/// Lets a test answer create with ALREADY_EXISTS, park a create's answer or a get until released, or script a get.
 struct ScriptedEvents: WorkspaceEventsAPI {
     let base: any WorkspaceEventsAPI
     let conflictOnCreate: Bool
@@ -123,11 +129,12 @@ struct ScriptedEvents: WorkspaceEventsAPI {
     let staleGets: StaleGets
 
     func createSubscription(topic: PubSubTopicPath) async throws(ChatAPIError) -> EventSubscription {
-        await createBarrier.pass()
         if conflictOnCreate {
             throw .conflict(GoogleErrorInfo(httpStatus: 409, status: "ALREADY_EXISTS"))
         }
-        return try await base.createSubscription(topic: topic)
+        let created = try await base.createSubscription(topic: topic)
+        await createBarrier.pass()
+        return created
     }
 
     func getSubscription(_ name: EventSubscriptionName) async throws(ChatAPIError) -> EventSubscription {
@@ -208,7 +215,7 @@ final class EventWorld: Sendable {
         while server.now < end {
             if await condition() { return true }
             server.advance(step)
-            await clock.tick()
+            clock.tick()
             try? await Task.sleep(for: .milliseconds(1))
         }
         let grace = ContinuousClock.now.advanced(by: .seconds(3))
@@ -224,7 +231,7 @@ final class EventWorld: Sendable {
         let end = server.now.adding(duration)
         while server.now < end {
             server.advance(step)
-            await clock.tick()
+            clock.tick()
             try? await Task.sleep(for: .milliseconds(1))
         }
     }
@@ -308,6 +315,19 @@ struct Mac: Sendable {
         ((try? store.meta(EventChannel.expiryKey)) ?? nil).flatMap { Timestamp(rfc3339: $0) }
     }
 
+    /// Waits until the channel has parked more than `parks` times and sits on the clock at its latest deadline.
+    func parked(after parks: UInt64) async -> (parks: UInt64, deadline: Timestamp)? {
+        let end = ContinuousClock.now.advanced(by: .seconds(10))
+        while ContinuousClock.now < end {
+            let state = await channel.parkState
+            if state.parks > parks, let deadline = state.deadline, world.clock.hasSleeper(until: deadline) {
+                return (state.parks, deadline)
+            }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        return nil
+    }
+
     func shutdown() async {
         recorder.cancel()
         let session = session
@@ -316,7 +336,7 @@ struct Mac: Sendable {
         let ticker = Task {
             while !finished.withLock({ $0 }) {
                 world.server.advance(.milliseconds(100))
-                await world.clock.tick()
+                world.clock.tick()
                 try? await Task.sleep(for: .milliseconds(2))
             }
         }
@@ -324,6 +344,10 @@ struct Mac: Sendable {
         finished.withLock { $0 = true }
         await ticker.value
     }
+}
+
+extension EventChannel {
+    var parkState: (parks: UInt64, deadline: Timestamp?) { (parks, parkDeadline) }
 }
 
 extension EventWorld {
@@ -480,11 +504,12 @@ extension EventWorld {
         world.post("verify me")
         #expect(await world.run(step: .milliseconds(20)) { mac.getBarrier.arrivals == 1 })
 
+        let superseded = try #require(await mac.channel.runTask)
         let elsewhere = EventWorld.path("elsewhere").rawValue
         await mac.session.configureEvents(EventSettings(subscriptionPath: elsewhere))
         #expect(await world.run { mac.status == .setupIncomplete })
         mac.getBarrier.release()
-        try await Task.sleep(for: .milliseconds(100))
+        await superseded.value
         #expect(mac.storedSubscription == old)
         #expect(await mac.channel.subscription?.rawValue == old)
         #expect(await mac.channel.accepted.isEmpty)
@@ -677,16 +702,24 @@ extension EventWorld {
         for pending in [false, true] {
             let stored = try #require(mac.storedExpiry)
             let patches = world.requests("PATCH", name)
+            let before = try #require(await mac.parked(after: 0))
+            let failures = await mac.channel.healthFailures
             if pending {
                 world.server.eventOperationPollsBeforeDone = 50
             } else {
                 world.server.failNextEventOperation(code: 14)
             }
             world.server.advance(.seconds(6 * 86_400 + 3600))
-            #expect(await world.run(step: .milliseconds(20)) { world.requests("PATCH", name) > patches })
-            try await Task.sleep(for: .milliseconds(50))
+            let failedAt = world.server.now
+            #expect(world.clock.tick() > 0)
+            // Time stands still until the channel has handled the failed renewal and parked for its next pull.
+            let after = try #require(await mac.parked(after: before.parks))
+            #expect(after.deadline == failedAt.adding(EventChannel.emptyFloor))
+            #expect(world.requests("PATCH", name) > patches)
+            #expect(await mac.channel.healthFailures == failures + 1)
+            #expect(await mac.channel.nextHealth == failedAt.adding(.seconds(60)))
             #expect(mac.storedExpiry == stored, "an unfinished renewal doesn't move the expiry")
-            #expect(await world.run(step: .milliseconds(20)) { mac.status != .live })
+            #expect(mac.status != .live)
 
             world.server.eventOperationPollsBeforeDone = 0
             #expect(await world.run(upTo: .seconds(900), step: .seconds(2)) { (mac.storedExpiry ?? stored) > stored })
@@ -873,9 +906,11 @@ extension EventWorld {
         mac.createBarrier.arm()
         #expect(await mac.start())
         #expect(await mac.createBarrier.waitForArrival())
+        let hung = try #require(await mac.channel.runTask)
         await mac.shutdown()
         mac.createBarrier.release()
-        try await Task.sleep(for: .milliseconds(100))
+        await hung.value
+        #expect(await mac.channel.subscription == nil)
         #expect(mac.storedSubscription == nil)
         #expect(world.deletes == 0)
         world.clock.stop()
