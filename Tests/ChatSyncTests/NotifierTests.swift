@@ -836,27 +836,29 @@ struct SessionNotificationTests {
             store: InMemoryAccountStore(), clock: RealSleepClock(server: server),
             logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
             timing: .fast, notifications: poster)
+        let notifier = try #require(await session.notifier)
+        notifier.tracePasses()
         let recorder = SnapshotRecorder(session.snapshots.values)
         await session.start()
         let synced = await recorder.wait { $0.status == .ok && $0.spaces.contains { $0.name == space } }
         #expect(synced != nil)
         try #require(await notifierCaughtUp(session, after: 0))
-        #expect(poster.posted.all.isEmpty, "history is never announced")
 
         server.advance(.seconds(1))
         server.post("new one", in: space, from: .account(bob))
         server.advance(.seconds(5))
         #expect(await poll { poster.posted.all.count == 1 })
-        #expect(poster.posted.all.first?.body == "Bob: new one")
+        #expect(poster.attempted.all.map(\.body) == ["Bob: new one"], "history is never announced")
 
         await session.setFocus(space)
-        let passes = await session.notifyPasses
         server.advance(.seconds(1))
-        server.post("while looking", in: space, from: .account(bob))
+        let looking = server.post("while looking", in: space, from: .account(bob))
         server.advance(.seconds(5))
-        #expect(await poll { ((try? session.messages(in: space)) ?? []).contains { $0.text == "while looking" } })
-        try #require(await notifierCaughtUp(session, after: passes))
-        #expect(poster.posted.all.count == 1)
+        #expect(
+            await poll { Self.settledWithoutPost(looking.name, in: space, notifier.tracedPasses) },
+            "the focused message leaves its record without a post")
+        #expect(!notifier.tracedPasses.contains { $0.attempted.contains(looking.name.rawValue) })
+        #expect(poster.attempted.all.count == 1)
 
         await session.setAppActive(false)
         server.advance(.seconds(1))
@@ -869,17 +871,28 @@ struct SessionNotificationTests {
         _ = await session.logout(refreshToken: nil)
     }
 
+    static func settledWithoutPost(_ message: MessageName, in space: SpaceName, _ passes: [NotifyPassTrace]) -> Bool {
+        passes.contains { $0.settled[space]?.contains(message) == true && !$0.attempted.contains(message.rawValue) }
+    }
+
     /// True once a notifier pass newer than `passes` has finished and nothing is queued behind it.
     func notifierCaughtUp(_ session: AccountSession, after passes: UInt64) async -> Bool {
         await pollAsync {
-            let done = await session.notifyPasses
-            let running = await session.notifyRunning
-            let pending = await session.notifyPending.isEmpty
-            return done > passes && !running && pending
+            let state = await session.notifierState()
+            return state.passes > passes && state.idle
         }
     }
 }
 
+extension AccountSession {
+    /// The loop's and the notifier's state in one read.
+    func loopAndNotifier() -> (parked: Bool, nextSidebar: Timestamp?, catchUpPending: Bool, notifier: NotifierState) {
+        (sleepTask != nil, nextSidebar, catchUpPending, notifierState())
+    }
+}
+
+/// Server time moves only when a test advances it, so the sidebar stays parked and a retry timer fires only when
+/// the test moves time to its deadline.
 struct SessionNotificationRetryTests {
     struct World {
         let server = FakeChatServer()
@@ -888,9 +901,11 @@ struct SessionNotificationRetryTests {
         let spaces: [SpaceName]
         let scratch = ScratchDirectory()
         let poster = RecordingPoster()
+        let store = InMemoryAccountStore()
+        let clock: ServerTimeClock
         let session: AccountSession
 
-        init(spaces count: Int, clock: (FakeChatServer) -> any SyncClock) {
+        init(spaces count: Int) {
             alice = server.addAccount(displayName: "Alice")
             bob = server.addAccount(displayName: "Bob")
             var spaces: [SpaceName] = []
@@ -899,67 +914,137 @@ struct SessionNotificationRetryTests {
             }
             self.spaces = spaces
             server.advance(.seconds(5))
+            clock = ServerTimeClock(server: server)
             var timing = SessionTiming.fast
             timing.sidebarInterval = .seconds(3600)
             timing.inactiveSidebarInterval = .seconds(3600)
+            timing.liveSidebarInterval = .seconds(3600)
+            timing.idleSleep = .seconds(3600)
             session = AccountSession(
                 account: AccountID(), me: alice.user.name,
                 api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: alice.token)),
-                store: InMemoryAccountStore(), clock: clock(server),
+                store: store, clock: clock,
                 logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
                 timing: timing, notifications: poster)
         }
 
-        /// Starts the session, waits for the first sync, then posts one message per space and catches up.
-        func startAndPost() async -> Bool {
+        /// Starts the session with every notifier pass traced, waits for the first sync, then posts one message per
+        /// space and asks for a catch-up.
+        func startAndPost() async -> (notifier: Notifier, messages: [MessageName])? {
+            guard let notifier = await session.notifier else { return nil }
+            notifier.tracePasses()
             let recorder = SnapshotRecorder(session.snapshots.values)
             defer { recorder.cancel() }
             await session.start()
             guard await recorder.wait(where: { $0.status == .ok && $0.spaces.count == spaces.count }) != nil else {
-                return false
+                return nil
             }
             server.advance(.seconds(1))
-            for space in spaces { server.post("hello", in: space, from: .account(bob)) }
+            let messages = spaces.map { server.post("hello", in: $0, from: .account(bob)).name }
             server.advance(.seconds(5))
             await session.systemDidWake()
-            return true
+            return (notifier, messages)
+        }
+
+        /// Waits until the loop is parked far ahead, the notifier has finished a pass after `passes` with nothing
+        /// queued, and its retry timer, if `armed`, is parked on the clock.
+        func settled(after passes: UInt64, armed: Bool) async -> NotifierState? {
+            let end = ContinuousClock.now.advanced(by: .seconds(10))
+            while ContinuousClock.now < end {
+                let (parked, nextSidebar, catchingUp, state) = await session.loopAndNotifier()
+                let farSidebar = nextSidebar.map { $0 > server.now.adding(.seconds(1800)) } ?? false
+                let timer = !armed || state.retryDue.map(clock.hasSleeper(until:)) == true
+                if parked, farSidebar, !catchingUp, state.passes > passes, state.idle, state.retryArmed == armed, timer
+                {
+                    return state
+                }
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+            return nil
+        }
+
+        /// Moves server time to the armed retry's deadline and wakes that timer alone.
+        func fireRetry(_ state: NotifierState) throws {
+            let due = try #require(state.retryDue)
+            server.advance(due.interval(since: server.now))
+            #expect(clock.tick() == 1, "only the retry timer is due")
+        }
+
+        func attempts(of message: MessageName, in passes: ArraySlice<NotifyPassTrace>) -> Int {
+            passes.reduce(0) { $0 + $1.attempted.filter { $0 == message.rawValue }.count }
+        }
+
+        func close() async {
+            _ = await session.logout(refreshToken: nil)
+            clock.stop()
         }
     }
 
     @Test func failingPostsAtTheCapDoNotSpin() async throws {
-        let world = World(spaces: 12, clock: { RealSleepClock(server: $0) })
+        let world = World(spaces: Notifier.maxPerPass + 2)
         world.poster.setOutcome { _ in .retryable("notifications.1") }
-        #expect(await world.startAndPost())
-        #expect(await poll { world.poster.attempted.all.count >= Notifier.maxPerPass })
-        try await Task.sleep(for: .milliseconds(300))
+        let (notifier, messages) = try #require(await world.startAndPost())
+        let first = try #require(await world.settled(after: 0, armed: true))
+        #expect(try world.store.notifyRecords().count == messages.count)
+        let traced = notifier.tracedPasses.count
+        #expect(UInt64(traced) == first.passes)
 
-        #expect(world.poster.attempted.all.count <= 3 * Notifier.maxPerPass)
+        // Each retry runs exactly one pass, which tries every pending message once and arms the next retry.
+        var state = first
+        for delay in Notifier.retryDelays.dropFirst() {
+            let due = try #require(state.retryDue)
+            try world.fireRetry(state)
+            state = try #require(await world.settled(after: state.passes, armed: true))
+            #expect(state.retryDue == due.adding(delay))
+        }
+        let window = notifier.tracedPasses[traced...]
+        #expect(window.count == 2)
+        #expect(state.passes == first.passes + 2)
+        for message in messages { #expect(world.attempts(of: message, in: window) == 2) }
+        #expect(window.allSatisfy { $0.attempted.count == messages.count && $0.settled.isEmpty })
         #expect(world.poster.posted.all.isEmpty)
-        _ = await world.session.logout(refreshToken: nil)
+        await world.close()
     }
 
     @Test func tenFailingSpacesDoNotStarveAHealthyOne() async throws {
-        let world = World(spaces: Notifier.maxPerPass + 1, clock: { RealSleepClock(server: $0) })
+        let world = World(spaces: Notifier.maxPerPass + 1)
         let healthy = try #require(world.spaces.max())
         world.poster.setOutcome { $0.space == healthy ? .accepted : .retryable("notifications.1") }
-        #expect(await world.startAndPost())
+        let (notifier, messages) = try #require(await world.startAndPost())
+        let first = try #require(await world.settled(after: 0, armed: true))
+        #expect(world.poster.posted.all.map(\.space) == [healthy])
+        let traced = notifier.tracedPasses.count
 
-        #expect(await poll(timeout: .seconds(2)) { world.poster.posted.all.map(\.space) == [healthy] })
-        try await Task.sleep(for: .milliseconds(200))
-        #expect(world.poster.attempted.all.count <= 3 * (Notifier.maxPerPass + 1))
-        _ = await world.session.logout(refreshToken: nil)
+        try world.fireRetry(first)
+        let second = try #require(await world.settled(after: first.passes, armed: true))
+        #expect(second.passes == first.passes + 1)
+        let window = notifier.tracedPasses[traced...]
+        #expect(window.count == 1)
+        for (space, message) in zip(world.spaces, messages) {
+            #expect(world.attempts(of: message, in: window) == (space == healthy ? 0 : 1))
+        }
+        #expect(world.poster.posted.all.map(\.space) == [healthy])
+        await world.close()
     }
 
     @Test func theRetryTimerPostsWithoutANewCommit() async throws {
-        let world = World(spaces: 1, clock: { SteppingClock(server: $0) })
+        let world = World(spaces: 1)
         let failing = Mutex(true)
         world.poster.setOutcome { _ in failing.withLock { $0 } ? .retryable("notifications.1") : .accepted }
-        #expect(await world.startAndPost())
-        #expect(await poll { !world.poster.attempted.all.isEmpty })
+        let (_, messages) = try #require(await world.startAndPost())
+        let armed = try #require(await world.settled(after: 0, armed: true))
+        #expect(world.poster.posted.all.isEmpty)
         failing.withLock { $0 = false }
+        let revision = await world.session.revision
+        let requests = world.server.requests.count
 
-        #expect(await poll { world.poster.posted.all.count == 1 })
+        try world.fireRetry(armed)
+        let done = try #require(await world.settled(after: armed.passes, armed: false))
+        #expect(done.passes == armed.passes + 1)
+        #expect(world.poster.posted.all.map(\.identifier) == messages.map(\.rawValue))
         #expect(world.poster.posted.all.first?.body == "Bob: hello")
-        _ = await world.session.logout(refreshToken: nil)
+        #expect(await world.session.revision == revision, "no sync commit led to the post")
+        #expect(world.server.requests.count == requests)
+        await world.close()
     }
 }
