@@ -84,7 +84,7 @@ extension ExportLockSuites {
         }
 
         @Test func anAttachmentOpenedAgainWhilePruningIsNotRemovedWithItsOldFolder() async throws {
-            enum Step: Sendable, Equatable { case judgedOld, reopening }
+            enum Step: Sendable, Equatable { case judgedOld, reopening, reopened }
             let data = pattern(1000)
             let (f, plain, cache, reader) = try exportFixture(data)
             defer { withExtendedLifetime(f) {} }
@@ -99,7 +99,9 @@ extension ExportLockSuites {
             sweeping.beforePruneRemoval = { _ in
                 // The folder has been judged old, and the attachment is opened again right now, on another thread.
                 steps.record(.judgedOld)
-                blocked.update { $0 = steps.block { $0.contains(.reopening) } }
+                _ = steps.block { $0.contains(.reopening) || $0.contains(.reopened) }
+                // In line for the lock this sweep holds, not through with the folder it is about to remove.
+                blocked.update { $0 = !steps.all.contains(.reopened) }
             }
             var contending = ExportDirectory.Seams.patient
             contending.onLockBusy = { if $0 == .claim { steps.record(.reopening) } }
@@ -108,7 +110,9 @@ extension ExportLockSuites {
             }
             try await steps.wait(for: .judgedOld)
             let reopened = onThread { [contending] in
-                try ExportDirectory(directory: directory, seams: contending).export(from: again, filename: "photo.webp")
+                defer { steps.record(.reopened) }
+                return try ExportDirectory(directory: directory, seams: contending).export(
+                    from: again, filename: "photo.webp")
             }
 
             try await sweep.value.get()
