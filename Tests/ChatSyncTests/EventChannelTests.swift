@@ -63,6 +63,8 @@ final class ServerTimeClock: SyncClock {
         await poll(timeout: timeout) { self.state.withLock { $0.waiters.contains { $0.deadline == deadline } } }
     }
 
+    var deadlines: [Timestamp] { state.withLock { $0.waiters.map(\.deadline) } }
+
     func hasSleeper(until deadline: Timestamp) -> Bool {
         state.withLock { $0.waiters.contains { $0.deadline == deadline } }
     }

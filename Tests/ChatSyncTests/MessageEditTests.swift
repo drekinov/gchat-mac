@@ -15,15 +15,18 @@ private struct EditRig {
     let session: AccountSession
     let team: SpaceName
     let scratch = ScratchDirectory()
+    /// Set when the rig runs on server time that moves only when the test advances it.
+    let frozen: ServerTimeClock?
 
-    init(timing: SessionTiming = EditRig.timing) async throws {
+    init(timing: SessionTiming = EditRig.timing, frozenTime: Bool = false) async throws {
         alice = server.addAccount(displayName: "Alice")
         bob = server.addAccount(displayName: "Bob")
         team = server.addSpace(.space, displayName: "Team", members: [alice, bob])
+        frozen = frozenTime ? ServerTimeClock(server: server) : nil
         session = AccountSession(
             account: AccountID(), me: alice.user.name,
             api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: alice.token)),
-            store: store, clock: SteppingClock(server: server),
+            store: store, clock: frozen ?? SteppingClock(server: server),
             logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
             timing: timing)
     }
@@ -242,7 +245,9 @@ struct MessageEditTests {
     }
 
     @Test func pausingDuringPacingStopsTheWrite() async throws {
-        let rig = try await EditRig()
+        let rig = try await EditRig(frozenTime: true)
+        let clock = try #require(rig.frozen)
+        defer { clock.stop() }
         let mine = rig.post("x", from: rig.alice)
         let other = rig.post("y", from: rig.alice)
         try await rig.sync()
@@ -256,7 +261,14 @@ struct MessageEditTests {
                 return error as? MessageEditError
             }
         }
+        // Nothing else sleeps here: the session loop isn't running and no follow-up polls are set.
+        #expect(await poll { clock.sleepers == 1 }, "the second delete waits out the spacing")
+        let paced = try #require(clock.deadlines.first)
+        let now = rig.server.now
+        #expect(paced > now && paced <= now.adding(SendQueue.spacing))
         await rig.session.setPaused(true)
+        rig.server.advance(paced.interval(since: now))
+        #expect(clock.tick() == 1)
         #expect(await second.value == MessageEditError.notAdmitted)
         #expect(rig.requests("DELETE").count == 1)
     }
