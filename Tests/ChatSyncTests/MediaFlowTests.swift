@@ -620,3 +620,32 @@ final class HeldDownloads: ChatMediaAPI {
         return MediaDownload(byteCount: bytes.count)
     }
 }
+
+struct UploadAdmissionTests {
+    @Test func admissionClosingDuringAnUploadStartsNoFurtherRequest() async throws {
+        let rig = MediaFlowTests.Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let attachments = try (0..<2).map { index in
+            let file = try rig.tempFile(Data("file \(index)".utf8), name: "f\(index).txt")
+            return PendingAttachment(
+                bookmark: PathFileAccess.bookmark(for: file), filename: "f\(index).txt", contentType: "text/plain",
+                byteCount: 6)
+        }
+        let item = try rig.sends.enqueue(
+            text: "two files", space: rig.team, thread: nil, attachments: attachments, rig.h.generation)
+        let server = rig.h.server
+        let uploads: @Sendable () -> Int = {
+            server.requests.filter { $0.path.contains(":upload") || $0.path.hasPrefix("/upload/") }.count
+        }
+
+        let outcomes = try #require(try await rig.sends.drain(rig.team, rig.h.generation) { uploads() == 0 })
+
+        #expect(outcomes[item.id] == .notAdmitted)
+        #expect(uploads() == 1)
+        #expect(server.messages(in: rig.team).isEmpty)
+        let held = try #require(try rig.h.store.outbox().first)
+        #expect(held.state == .queued && held.attempts == 0)
+        #expect(held.payload.attachments.first?.uploadToken != nil, "the finished upload is kept")
+        #expect(held.payload.attachments.last?.uploadToken == nil)
+    }
+}

@@ -20,7 +20,7 @@ extension AccountSession {
 
     func startEventChannel() {
         guard let channel = eventChannel else { return }
-        setEventChannelRestart { Task { await channel.restart() } }
+        setEventChannelRestart { [work] in work.spawn { await channel.restart() } }
         work.spawn { [weak self] in
             guard let self else { return }
             await channel.attach(self)

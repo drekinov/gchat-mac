@@ -472,6 +472,17 @@ final class SnapshotRecorder: Sendable {
         }
     }
 
+    /// The consumer is a task of `world`, so at every settled point it has recorded all that was sent.
+    init(_ stream: AsyncStream<AccountSnapshot>, in world: SimWorld) {
+        let storage = Storage()
+        self.storage = storage
+        task =
+            world.start {
+                for await snapshot in stream { storage.history.withLock { $0.append(snapshot) } }
+                storage.finished.withLock { $0 = true }
+            }.task
+    }
+
     var history: [AccountSnapshot] { storage.history.withLock { $0 } }
     var latest: AccountSnapshot? { storage.history.withLock { $0.last } }
     var isFinished: Bool { storage.finished.withLock { $0 } }

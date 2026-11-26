@@ -66,7 +66,7 @@ public actor AccountSession {
     let store: any AccountStore
     let clock: any SyncClock
     let timing: SessionTiming
-    let work = WorkRegistry()
+    let work: WorkRegistry
     let logoutRunner: LogoutRunner
     let revoker: (any TokenRevoker)?
     let backoff = Backoff()
@@ -147,8 +147,9 @@ public actor AccountSession {
         gate: SessionGate = SessionGate(),
         timing: SessionTiming = SessionTiming(), notifications: (any NotificationPoster)? = nil,
         media: (any ChatMediaAPI)? = nil, files: any FileAccess = SecurityScopedFileAccess(),
-        mediaLoader: MediaLoader? = nil, events: EventServices? = nil
+        mediaLoader: MediaLoader? = nil, events: EventServices? = nil, executor: (any TaskExecutor)? = nil
     ) {
+        work = WorkRegistry(executor: executor)
         self.mediaLoader = mediaLoader
         self.account = account
         self.gate = gate
@@ -461,7 +462,7 @@ public actor AccountSession {
             _ = try await running.value.get()
             return false
         }
-        let task = Task { [contacts] () -> Result<Bool, SyncError> in
+        let task = work.unowned { [contacts] () -> Result<Bool, SyncError> in
             do throws(SyncError) {
                 return .success(try await contacts.ensureMembers(in: space, generation))
             } catch {
@@ -651,7 +652,7 @@ public actor AccountSession {
             wait = min(wait, max(remaining, .milliseconds(1)))
         }
         let clock = clock
-        let sleeper = Task { _ = try? await clock.sleep(for: wait) }
+        let sleeper = work.unowned { [wait] in _ = try? await clock.sleep(for: wait) }
         sleepTask = sleeper
         await sleeper.value
         sleepTask = nil

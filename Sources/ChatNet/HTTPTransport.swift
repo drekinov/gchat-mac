@@ -168,6 +168,27 @@ public enum TransportError: Error, Sendable, Equatable {
     }
 }
 
+extension TransportError {
+    /// How a URL loading failure is reported to callers.
+    package init(_ error: URLError) {
+        self =
+            switch error.code {
+            case .timedOut: .timedOut
+            case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff, .cannotFindHost, .dnsLookupFailed,
+                .cannotConnectToHost:
+                .offline
+            case .networkConnectionLost: .connectionLost
+            case .cancelled: .cancelled
+            case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate,
+                .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid, .clientCertificateRejected,
+                .clientCertificateRequired, .appTransportSecurityRequiresSecureConnection:
+                .tls
+            case .dataLengthExceedsMaximum: .responseTooLarge
+            default: .other(code: error.code.rawValue)
+            }
+    }
+}
+
 public protocol HTTPTransport: Sendable {
     func send(_ request: HTTPRequest) async throws(TransportError) -> HTTPResponse
 }
