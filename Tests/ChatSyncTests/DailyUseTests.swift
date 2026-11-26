@@ -29,7 +29,7 @@ struct DailyUseTests {
                     store: try SQLiteAccountStore.open(directory: directory, key: key), clock: world.clock(),
                     logoutRunner: runner, timing: .lifecycle, executor: world.executor)
                 await session.setPaused(true)
-                world.lifecycleRetireAtTeardown(session)
+                world.lifecycleRetireAtTeardown(session, keeping: rig.scratch)
                 return session
             }
             _ = try await manager.startup()

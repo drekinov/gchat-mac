@@ -18,6 +18,7 @@ final class SimExecutor: TaskExecutor, @unchecked Sendable {
     private var queue: [Item] = []
     private var head = 0
     private var stopped = false
+    private var exited = false
     private var thread: Thread?
     /// Called on the simulation thread when the queue is empty; true means it produced more work.
     private var whenIdle: @Sendable () -> Bool = { false }
@@ -50,10 +51,12 @@ final class SimExecutor: TaskExecutor, @unchecked Sendable {
 
     var onThread: Bool { Thread.current === thread }
 
+    /// Ends the thread and returns once it has let go of the world.
     func stop() {
         condition.lock()
         stopped = true
-        condition.signal()
+        condition.broadcast()
+        while !exited { condition.wait() }
         condition.unlock()
     }
 
@@ -80,6 +83,9 @@ final class SimExecutor: TaskExecutor, @unchecked Sendable {
                 if !produced, head == queue.count, !stopped { condition.wait() }
             }
         }
+        whenIdle = { false }
+        exited = true
+        condition.broadcast()
         condition.unlock()
     }
 }
@@ -165,10 +171,11 @@ final class SimWorld: Sendable {
     ) async throws {
         let world = SimWorld(server: server)
         world.executor.start { [world] in world.whenIdle() }
-        let guardian = Watchdog(limit: watchdog) { [world] in world.dump() }
+        let guardian = Watchdog(limit: watchdog) { [weak world] in world?.dump() ?? "" }
         defer {
             guardian.disarm()
             world.executor.stop()
+            world.forgetFixtures()
         }
         let outcome = Mutex<Result<Void, any Error>?>(nil)
         let root = Task(executorPreference: world.executor) {
@@ -260,6 +267,16 @@ final class SimWorld: Sendable {
         }
         for gate in gates { gate() }
         for cancel in cancels { cancel() }
+    }
+
+    /// Drops what the test registered, so a finished world keeps none of its sessions alive.
+    private func forgetFixtures() {
+        state.withLock { state in
+            state.cancels = []
+            state.gates = []
+            state.teardowns = []
+            state.completion = nil
+        }
     }
 
     private func tearDown() async {

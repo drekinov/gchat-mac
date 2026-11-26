@@ -3,7 +3,7 @@ import Testing
 
 @testable import ChatAuth
 
-struct LoopbackListenerTests {
+@Suite(.timeLimit(.minutes(2))) struct LoopbackListenerTests {
     /// Waits for the callback in its own task, with a timeout that ends only if the test fires it.
     func callback(
         on listener: LoopbackListener, timeout: ManualTimeout = ManualTimeout()

@@ -48,7 +48,7 @@ struct ConnectivityRig: Sendable {
             logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
             timing: timing, executor: world.executor)
         recorder = SnapshotRecorder(session.snapshots.values, in: world)
-        world.lifecycleRetireAtTeardown(session)
+        world.lifecycleRetireAtTeardown(session, keeping: scratch)
     }
 
     /// Starts the session and runs to the end of its first sidebar sync, with the next tick scheduled.
@@ -315,7 +315,7 @@ struct ConnectivityTests {
                     api: GoogleChatClient(transport: world.transport(), tokens: StaticTokens(token: alice.token)),
                     store: InMemoryAccountStore(), clock: world.clock(), logoutRunner: runner, timing: timing,
                     executor: world.executor)
-                world.lifecycleRetireAtTeardown(session)
+                world.lifecycleRetireAtTeardown(session, keeping: scratch)
                 return session
             }
 

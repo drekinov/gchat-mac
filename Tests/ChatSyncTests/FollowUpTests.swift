@@ -36,7 +36,7 @@ struct FollowUpTests {
                     api: GoogleChatClient(transport: world.transport(), tokens: StaticTokens(token: fake.token)),
                     store: InMemoryAccountStore(), clock: world.clock(), logoutRunner: runner, timing: .lifecycle,
                     executor: world.executor)
-                world.lifecycleRetireAtTeardown(session)
+                world.lifecycleRetireAtTeardown(session, keeping: scratch)
                 return session
             }
             let record = AccountRecord(email: "a@example.com", displayName: "Alice", me: fake.user.name)

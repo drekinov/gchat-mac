@@ -35,9 +35,11 @@ extension SimWorld {
         try await perform { await session.logout(refreshToken: refreshToken) }
     }
 
-    /// Logs `session` out when the world ends, unless the test already retired it.
-    func lifecycleRetireAtTeardown(_ session: AccountSession) {
+    /// Logs `session` out when the world ends, unless the test already retired it. `scratch` holds the tombstone
+    /// that logout writes, so it has to outlive the test body.
+    func lifecycleRetireAtTeardown(_ session: AccountSession, keeping scratch: ScratchDirectory) {
         onTeardown { [self] in
+            _ = scratch
             guard await !session.closing else { return }
             _ = try? await lifecycleLogout(session)
         }

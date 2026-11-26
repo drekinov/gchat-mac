@@ -246,14 +246,12 @@ struct UnreadThreadsTests {
                 FailureRule(
                     account: rig.alice, route: .getMessage, times: nil,
                     response: .http(status: 403, googleStatus: "PERMISSION_DENIED")))
-            rig.server.fail(
-                FailureRule(
-                    account: rig.alice, route: .listReactions, times: nil,
-                    response: .http(status: 403, googleStatus: "PERMISSION_DENIED")))
             rig.server.advance(AccountSession.threadReadRecheck + .seconds(1))
             let before = rig.lookups
+            let refused = rig.log.count("getMessage")
 
             await rig.tick()
+            #expect(rig.log.count("getMessage") > refused, "the tick asked for the message it can't read")
             #expect(rig.lookups == before + 1, "thread read times are still checked")
             #expect(try await rig.latestSnapshot().status == .ok)
         }
