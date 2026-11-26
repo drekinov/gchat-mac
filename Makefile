@@ -39,7 +39,8 @@ build: gen
 	$(XCODEBUILD) build
 
 test:
-	swift test
+	swift test --skip MemorySensitive
+	swift test --filter MemorySensitive
 
 run:
 	open $(APP)

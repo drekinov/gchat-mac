@@ -39,7 +39,9 @@ jobs:
         run: make lint
 
       - name: Test
-        run: swift test
+        run: |
+          swift test --skip MemorySensitive
+          swift test --filter MemorySensitive
 
       - name: Build app
         run: make build
