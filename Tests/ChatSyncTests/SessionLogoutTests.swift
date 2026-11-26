@@ -141,10 +141,13 @@ struct SessionLogoutTests {
         #expect(await rig.startAndSync())
         let old = try #require(rig.gate.current)
         let stuck = UncancellableWait()
+        defer { stuck.release() }
+        let arrived = Recorder<Int>()
         let attempt = Recorder<String>()
         let store = rig.store
         let gate = rig.gate
-        await rig.session.spawnRegistered { [stuck] in
+        let spawned = await rig.session.spawnRegistered { [stuck] in
+            arrived.append(1)
             await stuck.wait()
             do throws(StoreError) {
                 try store.write(gate: gate, generation: old) { $0.append(.setMeta(key: "straggler", value: "x")) }
@@ -153,17 +156,17 @@ struct SessionLogoutTests {
                 attempt.append("rejected:\(error)")
             }
         }
+        #expect(spawned)
+        #expect(await poll { arrived.all.count == 1 })
 
-        let started = ContinuousClock.now
-        let logout = Task { await rig.session.logout(refreshToken: "rt") }
-        let finishedInTime = await poll(timeout: .seconds(3)) { rig.gate.snapshot.1 == .closed }
-        let elapsed = ContinuousClock.now - started
-        stuck.release()
-        let report = await logout.value
-
-        #expect(finishedInTime, "logout took \(elapsed) with a task that ignores cancellation")
+        // Returns while the task is still held; the wait's own 60 s release is only a hang guard.
+        let report = await rig.session.logout(refreshToken: "rt")
         #expect(report.drained == false)
         #expect(report.failedSteps.isEmpty)
+        #expect(rig.gate.snapshot.1 == .closed)
+        #expect(attempt.all.isEmpty, "the stuck task hasn't tried its write yet")
+
+        stuck.release()
         #expect(await poll { attempt.all.count == 1 })
         #expect(attempt.all == ["rejected:gateClosed"])
         rig.assertNothingLeft()
