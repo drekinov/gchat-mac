@@ -96,15 +96,6 @@ struct ConnectivityRig: Sendable {
     func passSeveralIdleRounds() async { await world.pass(timing.idleSleep * 3) }
 }
 
-func pollAsync(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now.advanced(by: timeout)
-    while ContinuousClock.now < deadline {
-        if await condition() { return true }
-        try? await Task.sleep(for: .milliseconds(2))
-    }
-    return await condition()
-}
-
 final class AdmissionSwitch: Sendable {
     private let open = Mutex(true)
 
