@@ -94,33 +94,31 @@ extension Fixtures {
 }
 
 @Suite struct TimedReserveTests {
-    @Test func aTimerFiringBeforeTheWaiterIsQueuedStillTimesOut() async throws {
+    @Test(.timeLimit(.minutes(1))) func theExpiryLaunchesOnlyAfterTheWaiterIsQueued() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(100)
-        let queuedWhenFired = Mutex<Int?>(nil)
-        let outcome = await withTaskGroup(of: String.self) { group in
-            group.addTask {
-                do {
-                    _ = try await budget.reserve(50, timeout: .milliseconds(1)) {
-                        queuedWhenFired.withLock { $0 = budget.waiterCount }
-                    }
-                    return "granted"
-                } catch MemoryBudgetError.timedOut {
-                    return "timedOut"
-                } catch {
-                    return "other"
-                }
+        defer { held.release() }
+        let queuedAtLaunch = Mutex<Bool?>(nil)
+        let expiry = Gate()
+        let waiter = Recorded { () -> MemoryBudgetError? in
+            do {
+                _ = try await budget.reserve(
+                    50, timeout: .seconds(3600), expiry: { try await expiry.wait() },
+                    onExpiryLaunch: { queued in queuedAtLaunch.withLock { $0 = queued } })
+                return nil
+            } catch let error as MemoryBudgetError {
+                return error
+            } catch {
+                return .invalidSize
             }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(10))
-                return "hung"
-            }
-            let first = await group.next()!
-            group.cancelAll()
-            return first
         }
-        #expect(outcome == "timedOut")
-        #expect(queuedWhenFired.withLock { $0 } == 1)
+        defer { waiter.cancel() }
+        try #require(await waitUntil { queuedAtLaunch.withLock { $0 } != nil && expiry.waiting == 1 })
+        #expect(queuedAtLaunch.withLock { $0 } == true)
+        #expect(budget.waiterCount == 1)
+        expiry.open()
+        #expect(await waiter.settled() == .some(.timedOut))
+        #expect(budget.waiterCount == 0)
         held.release()
         #expect(await budget.available == 100)
     }

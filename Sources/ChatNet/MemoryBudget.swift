@@ -36,12 +36,13 @@ public actor MemoryBudget {
         try await core.reserve(bytes, timeout: timeout)
     }
 
-    /// The wait times out when `expiry` returns, in place of sleeping for `timeout`. Its task starts only after
-    /// the request has joined the queue.
-    func reserve(_ bytes: Int, timeout: Duration, expiry: @escaping @Sendable () async throws -> Void) async throws
-        -> Reservation
-    {
-        try await core.reserve(bytes, timeout: timeout, expiry: expiry)
+    /// A non-nil `expiry` ends the wait when it returns, in place of sleeping for `timeout`. Its task starts only
+    /// after the request has joined the queue; `onExpiryLaunch` reports, as the task is created, whether it had.
+    func reserve(
+        _ bytes: Int, timeout: Duration, expiry: (@Sendable () async throws -> Void)?,
+        onExpiryLaunch: (@Sendable (_ queued: Bool) -> Void)? = nil
+    ) async throws -> Reservation {
+        try await core.reserve(bytes, timeout: timeout, expiry: expiry, onExpiryLaunch: onExpiryLaunch)
     }
 
     /// Requests currently queued.
@@ -140,7 +141,8 @@ private final class BudgetCore: Sendable {
     }
 
     func reserve(
-        _ bytes: Int, timeout: Duration? = nil, expiry: (@Sendable () async throws -> Void)? = nil
+        _ bytes: Int, timeout: Duration? = nil, expiry: (@Sendable () async throws -> Void)? = nil,
+        onExpiryLaunch: (@Sendable (Bool) -> Void)? = nil
     ) async throws -> Reservation {
         try validate(bytes)
         let id = state.withLock { state -> UInt64 in
@@ -163,17 +165,24 @@ private final class BudgetCore: Sendable {
                 if let immediate {
                     continuation.resume(with: immediate)
                 } else if let timeout {
-                    timer.arm(
-                        Task {
-                            do {
-                                if let expiry { try await expiry() } else { try await Task.sleep(for: timeout) }
-                            } catch { return }
-                            remove(id, with: MemoryBudgetError.timedOut)
-                        })
+                    timer.arm(launchExpiry(for: id, timeout: timeout, expiry: expiry, probe: onExpiryLaunch))
                 }
             }
         } onCancel: {
             remove(id, with: CancellationError())
+        }
+    }
+
+    private func launchExpiry(
+        for id: UInt64, timeout: Duration, expiry: (@Sendable () async throws -> Void)?,
+        probe: (@Sendable (Bool) -> Void)?
+    ) -> Task<Void, Never> {
+        probe?(state.withLock { $0.waiters.contains { $0.id == id } })
+        return Task {
+            do {
+                if let expiry { try await expiry() } else { try await Task.sleep(for: timeout) }
+            } catch { return }
+            remove(id, with: MemoryBudgetError.timedOut)
         }
     }
 

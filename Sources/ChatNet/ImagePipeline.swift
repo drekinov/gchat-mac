@@ -100,12 +100,24 @@ public final class ImagePipeline: Sendable {
     let budget: MemoryBudget
     let limits: ImageLimits
     let heldWaitTimeout: Duration
+    /// Ends a held wait in place of sleeping for `heldWaitTimeout`.
+    let heldWaitExpiry: (@Sendable () async throws -> Void)?
 
     /// `heldWaitTimeout` bounds any wait for memory made while already holding an `EncodedAdmission`.
-    public init(budget: MemoryBudget, limits: ImageLimits = ImageLimits(), heldWaitTimeout: Duration = .seconds(5)) {
+    public convenience init(
+        budget: MemoryBudget, limits: ImageLimits = ImageLimits(), heldWaitTimeout: Duration = .seconds(5)
+    ) {
+        self.init(budget: budget, limits: limits, heldWaitTimeout: heldWaitTimeout, heldWaitExpiry: nil)
+    }
+
+    init(
+        budget: MemoryBudget, limits: ImageLimits, heldWaitTimeout: Duration,
+        heldWaitExpiry: (@Sendable () async throws -> Void)?
+    ) {
         self.budget = budget
         self.limits = limits
         self.heldWaitTimeout = heldWaitTimeout
+        self.heldWaitExpiry = heldWaitExpiry
     }
 
     /// Admits `byteCount` encoded bytes before any of them are allocated. Fails with `.tooLarge` over
@@ -166,7 +178,7 @@ public final class ImagePipeline: Sendable {
         if let admission {
             guard data.count <= admission.byteCount else { throw .tooLarge }
             guard admission.byteCount + plan.workspace + plan.output <= budget.capacity else { throw .tooLarge }
-            working = try await reserve(plan.workspace + plan.output, timeout: heldWaitTimeout)
+            working = try await reserve(plan.workspace + plan.output, timeout: heldWaitTimeout, expiry: heldWaitExpiry)
         } else {
             working = try await reserve(data.count + plan.workspace + plan.output)
         }
@@ -192,7 +204,7 @@ public final class ImagePipeline: Sendable {
             guard data.count <= admission.byteCount else { throw .tooLarge }
             guard admission.byteCount + extra <= budget.capacity else { throw .tooLarge }
             holds.append(admission.reservation)
-            base = try await reserve(extra, timeout: heldWaitTimeout)
+            base = try await reserve(extra, timeout: heldWaitTimeout, expiry: heldWaitExpiry)
         } else {
             base = try await reserve(data.count + extra)
         }
@@ -205,9 +217,11 @@ public final class ImagePipeline: Sendable {
         return AnimatedImage(source: source, plans: plans, pool: FramePool(slots), holds: holds)
     }
 
-    func reserve(_ bytes: Int, timeout: Duration? = nil) async throws(ImageError) -> Reservation {
+    func reserve(
+        _ bytes: Int, timeout: Duration? = nil, expiry: (@Sendable () async throws -> Void)? = nil
+    ) async throws(ImageError) -> Reservation {
         do {
-            if let timeout { return try await budget.reserve(bytes, timeout: timeout) }
+            if let timeout { return try await budget.reserve(bytes, timeout: timeout, expiry: expiry) }
             return try await budget.reserve(bytes)
         } catch is CancellationError {
             throw .cancelled

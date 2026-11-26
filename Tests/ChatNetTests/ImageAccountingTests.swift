@@ -49,6 +49,26 @@ extension Fixtures {
         return (ImagePipeline(budget: budget, limits: limits, heldWaitTimeout: heldWait), budget)
     }
 
+    /// Held waits end only when `heldWaitExpiry` opens, so a wait that should never start hangs instead.
+    func pipeline(capacity: Int, heldWaitExpiry: Gate) -> (ImagePipeline, MemoryBudget) {
+        let budget = MemoryBudget(capacity: capacity)
+        let pipeline = ImagePipeline(
+            budget: budget, limits: ImageLimits(), heldWaitTimeout: .seconds(3600),
+            heldWaitExpiry: { try await heldWaitExpiry.wait() })
+        return (pipeline, budget)
+    }
+
+    func outcome(_ body: @escaping @Sendable () async throws(ImageError) -> Void) -> Recorded<ImageError?> {
+        Recorded {
+            do throws(ImageError) {
+                try await body()
+                return nil
+            } catch {
+                return error
+            }
+        }
+    }
+
     // MARK: M1: bit depth and row alignment
 
     @Test func sixteenBitPNGIsRetainedAtItsRealSize() async throws {
@@ -146,14 +166,18 @@ extension Fixtures {
         #expect(await budget.available == 64 << 20)
     }
 
-    @Test func admissionReservesBeforeAnyBytesExistAndWaitsInTurn() async throws {
+    @Test(.timeLimit(.minutes(1))) func admissionReservesBeforeAnyBytesExistAndWaitsInTurn() async throws {
         let (pipeline, budget) = pipeline(capacity: 4 << 20)
         let first = try await pipeline.reserveEncoded(byteCount: 3 << 20)
         #expect(await budget.available == 1 << 20)
-        let second = Task { try await pipeline.reserveEncoded(byteCount: 2 << 20) }
-        try await Task.sleep(for: .milliseconds(50))
+        let second = outcome { () async throws(ImageError) in _ = try await pipeline.reserveEncoded(byteCount: 2 << 20)
+        }
+        defer { second.cancel() }
+        try #require(await waitUntil { budget.waiterCount == 1 })
+        #expect(second.current == nil)
         second.cancel()
-        await #expect(throws: ImageError.self) { _ = try await second.value }
+        #expect(await second.settled() == .some(.cancelled))
+        #expect(budget.waiterCount == 0)
         #expect(await budget.available == 1 << 20)
         _ = first
     }
@@ -163,21 +187,24 @@ extension Fixtures {
         await #expect(throws: ImageError.tooLarge) { _ = try await pipeline.reserveEncoded(byteCount: 2 << 20) }
     }
 
-    @Test func anAdmittedImageWhosePeakCannotFitIsTooLargeAtOnce() async throws {
+    @Test(.timeLimit(.minutes(1))) func anAdmittedImageWhosePeakCannotFitIsTooLargeAtOnce() async throws {
         let data = Fixtures.png(400, 300)
-        let (pipeline, budget) = pipeline(capacity: data.count + 1000)
+        let (probe, _) = pipeline()
+        let (_, header) = try probe.inspect(data, allFrames: false)
+        let plan = probe.plan(for: header.frames[0], type: header.type, maxPixelSize: 100)
+        let capacity = data.count + plan.workspace + plan.output - 1
+        let never = Gate()
+        let (pipeline, budget) = pipeline(capacity: capacity, heldWaitExpiry: never)
         let admission = try await pipeline.reserveEncoded(byteCount: data.count)
-        let clock = ContinuousClock()
-        let start = clock.now
-        var caught: ImageError?
-        do {
+        let thumbnail = Mutex<EncodedAdmission?>(admission)
+        let decode = outcome { () async throws(ImageError) in
+            let admission = thumbnail.withLock { $0.take() }!
             _ = try await pipeline.thumbnail(from: data, admission: admission, maxPixelSize: 100)
-        } catch {
-            caught = error
         }
-        #expect(caught == .tooLarge)
-        #expect(clock.now - start < .seconds(1))
-        #expect(await budget.available == data.count + 1000)
+        defer { decode.cancel() }
+        #expect(await decode.settled() == .some(.tooLarge))
+        #expect(budget.waiterCount == 0)
+        #expect(await budget.available == capacity)
     }
 
     @Test func decodingWithAnAdmissionReleasesItAfterwards() async throws {
@@ -219,21 +246,24 @@ extension Fixtures {
         #expect(await budget.available == 64 << 20)
     }
 
-    @Test func holdingAnAdmissionNeverWaitsForeverForTheDecodeMemory() async throws {
+    @Test(.timeLimit(.minutes(1))) func holdingAnAdmissionNeverWaitsForeverForTheDecodeMemory() async throws {
         let data = Fixtures.png(300, 300)
-        let (pipeline, budget) = pipeline(capacity: data.count + 600_000, heldWait: .milliseconds(200))
+        let expiry = Gate()
+        let (pipeline, budget) = pipeline(capacity: data.count + 600_000, heldWaitExpiry: expiry)
         let admission = try await pipeline.reserveEncoded(byteCount: data.count)
         let blocker = try await budget.reserve(await budget.available)
-        let clock = ContinuousClock()
-        let start = clock.now
-        var caught: ImageError?
-        do {
+        defer { blocker.release() }
+        let thumbnail = Mutex<EncodedAdmission?>(admission)
+        let decode = outcome { () async throws(ImageError) in
+            let admission = thumbnail.withLock { $0.take() }!
             _ = try await pipeline.thumbnail(from: data, admission: admission, maxPixelSize: 100)
-        } catch {
-            caught = error
         }
-        #expect(caught == .budget)
-        #expect(clock.now - start < .seconds(2))
+        defer { decode.cancel() }
+        try #require(await waitUntil { budget.waiterCount == 1 })
+        #expect(decode.current == nil)
+        expiry.open()
+        #expect(await decode.settled() == .some(.budget))
+        #expect(budget.waiterCount == 0)
         blocker.release()
         #expect(await budget.available == data.count + 600_000)
     }
@@ -299,43 +329,54 @@ extension Fixtures {
 
     // MARK: M4: no waiting on memory while holding some
 
-    @Test func animationFramesNeverWaitOnTheBudget() async throws {
+    @Test(.timeLimit(.minutes(1))) func animationFramesNeverWaitOnTheBudget() async throws {
         let (pipeline, budget) = pipeline(capacity: 64 << 20)
         let animation = try await pipeline.animation(from: Fixtures.gif(frames: 6, size: 32), maxPixelSize: 32)
         let squatter = try await budget.reserve(await budget.available)
-        let clock = ContinuousClock()
-        let start = clock.now
-        for index in 0..<6 { _ = try await animation.frame(at: index) }
-        #expect(clock.now - start < .seconds(2))
+        defer { squatter.release() }
+        let frames = outcome { () async throws(ImageError) in
+            for index in 0..<6 { _ = try await animation.frame(at: index) }
+        }
+        defer { frames.cancel() }
+        let settled = await waitUntil { frames.current != nil }
+        let availableWhenSettled = await budget.available
         squatter.release()
+        try #require(settled)
+        #expect(frames.current! == nil)
+        #expect(availableWhenSettled == 0)
     }
 
-    @Test func anAnimationWhoseCombinedPeakExceedsTheBudgetIsTooLargeAtOnce() async {
+    @Test(.timeLimit(.minutes(1))) func anAnimationWhoseCombinedPeakExceedsTheBudgetIsTooLargeAtOnce() async {
         let (pipeline, budget) = pipeline(capacity: 100_000)
-        let clock = ContinuousClock()
-        let start = clock.now
-        await #expect(throws: ImageError.tooLarge) {
+        let decode = outcome { () async throws(ImageError) in
             _ = try await pipeline.animation(from: Fixtures.gif(frames: 4, size: 64), maxPixelSize: 64)
         }
-        #expect(clock.now - start < .seconds(1))
+        defer { decode.cancel() }
+        #expect(await decode.settled() == .some(.tooLarge))
+        #expect(budget.waiterCount == 0)
         #expect(await budget.available == 100_000)
     }
 
-    @Test func anAdmittedAnimationWhosePeakCannotFitIsTooLargeAtOnce() async throws {
+    @Test(.timeLimit(.minutes(1))) func anAdmittedAnimationWhosePeakCannotFitIsTooLargeAtOnce() async throws {
         let data = Fixtures.gif(frames: 4, size: 64)
-        let (pipeline, budget) = pipeline(capacity: data.count + 1000)
+        let (probe, _) = pipeline()
+        let (_, header) = try probe.inspect(data, allFrames: true)
+        let plans = header.frames.map { probe.plan(for: $0, type: header.type, maxPixelSize: 64) }
+        let extra =
+            (plans.map(\.workspace).max() ?? 0) + ImagePipeline.animationSlots * (plans.map(\.output).max() ?? 0)
+        let capacity = data.count + extra - 1
+        let never = Gate()
+        let (pipeline, budget) = pipeline(capacity: capacity, heldWaitExpiry: never)
         let admission = try await pipeline.reserveEncoded(byteCount: data.count)
-        let clock = ContinuousClock()
-        let start = clock.now
-        var caught: ImageError?
-        do {
+        let held = Mutex<EncodedAdmission?>(admission)
+        let decode = outcome { () async throws(ImageError) in
+            let admission = held.withLock { $0.take() }!
             _ = try await pipeline.animation(from: data, admission: admission, maxPixelSize: 64)
-        } catch {
-            caught = error
         }
-        #expect(caught == .tooLarge)
-        #expect(clock.now - start < .seconds(1))
-        #expect(await budget.available == data.count + 1000)
+        defer { decode.cancel() }
+        #expect(await decode.settled() == .some(.tooLarge))
+        #expect(budget.waiterCount == 0)
+        #expect(await budget.available == capacity)
     }
 
     @Test func manyAnimationsOnATightBudgetEitherRunOrFailButNeverDeadlock() async throws {
@@ -351,7 +392,7 @@ extension Fixtures {
                 group.addTask {
                     let animation = try await pipeline.animation(from: data, maxPixelSize: 48)
                     for index in 0..<4 { _ = try await animation.frame(at: index) }
-                    try await Task.sleep(for: .milliseconds(10))
+                    await Task.yield()
                     finished.withLock { $0 += 1 }
                 }
             }

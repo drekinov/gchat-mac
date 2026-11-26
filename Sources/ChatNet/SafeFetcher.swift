@@ -21,6 +21,15 @@ public final class SafeFetcher: Sendable {
     static let lookupSlots = MemoryBudget(capacity: maxResolverThreads)
 
     typealias Resolver = @Sendable (String) throws -> [[UInt8]]
+    /// Returns when a wait has run out, in place of sleeping for its duration; throws if the wait is cancelled.
+    typealias Expiry = @Sendable () async throws -> Void
+
+    /// Stand-ins for the fetch deadline, the wait for a lookup slot and the lookup itself.
+    struct Expiries: Sendable {
+        var fetch: Expiry?
+        var slot: Expiry?
+        var lookup: Expiry?
+    }
 
     private struct Fetched: Sendable {
         var data: Data
@@ -31,6 +40,8 @@ public final class SafeFetcher: Sendable {
     private let session: TransferSession
     private let resolver: Resolver?
     private let deadline: Duration
+    private let slots: MemoryBudget
+    private let expiries: Expiries
 
     /// A non-nil `protocolClasses` replaces the network with an in-process stub, so the DNS check is skipped.
     public convenience init(allowedHosts: Set<String> = SafeFetcher.productionHosts, protocolClasses: [AnyClass]? = nil)
@@ -42,11 +53,14 @@ public final class SafeFetcher: Sendable {
 
     init(
         allowedHosts: Set<String>, protocolClasses: [AnyClass]?, resolver: Resolver?,
-        deadline: Duration = SafeFetcher.deadline
+        deadline: Duration = SafeFetcher.deadline, slots: MemoryBudget = SafeFetcher.lookupSlots,
+        expiries: Expiries = Expiries()
     ) {
         self.allowedHosts = Set(allowedHosts.map { $0.lowercased() })
         self.resolver = resolver
         self.deadline = deadline
+        self.slots = slots
+        self.expiries = expiries
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieStorage = nil
         configuration.httpShouldSetCookies = false
@@ -80,7 +94,13 @@ public final class SafeFetcher: Sendable {
         let outcome = await withTaskGroup(of: Result<Fetched, TransportError>?.self) { group in
             group.addTask { await self.followRedirects(from: url, maxBytes: maxBytes) }
             group.addTask {
-                do { try await Task.sleep(for: self.deadline) } catch { return nil }
+                do {
+                    if let expiry = self.expiries.fetch {
+                        try await expiry()
+                    } else {
+                        try await Task.sleep(for: self.deadline)
+                    }
+                } catch { return nil }
                 return .failure(.timedOut)
             }
             var first: Result<Fetched, TransportError>?
@@ -128,7 +148,10 @@ public final class SafeFetcher: Sendable {
     private func validate(_ url: URL) async throws(TransportError) {
         let host = try Self.validateSyntax(url, allowedHosts: allowedHosts)
         guard let resolver else { return }
-        switch await Self.resolve(host, using: resolver, timeout: deadline) {
+        let resolution = await Self.resolve(
+            host, using: resolver, timeout: deadline, slots: slots, slotExpiry: expiries.slot,
+            lookupExpiry: expiries.lookup)
+        switch resolution {
         case .addresses(let addresses):
             guard !addresses.isEmpty else { throw .offline }
             guard addresses.allSatisfy(Self.isPublicAddress) else { throw .hostNotAllowed }
@@ -149,13 +172,14 @@ public final class SafeFetcher: Sendable {
     /// Lookups beyond `maxResolverThreads` wait their turn within `timeout`. On timeout or cancellation the thread is
     /// abandoned and keeps its slot until it finishes, so stuck lookups can't pile up threads.
     static func resolve(
-        _ host: String, using resolver: @escaping Resolver, timeout: Duration, slots: MemoryBudget = lookupSlots
+        _ host: String, using resolver: @escaping Resolver, timeout: Duration, slots: MemoryBudget = lookupSlots,
+        slotExpiry: Expiry? = nil, lookupExpiry: Expiry? = nil
     ) async -> Resolution {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         let slot: Reservation
         do {
-            slot = try await slots.reserve(1, timeout: timeout)
+            slot = try await slots.reserve(1, timeout: timeout, expiry: slotExpiry)
         } catch {
             return Task.isCancelled || error is CancellationError ? .cancelled : .timedOut
         }
@@ -172,7 +196,9 @@ public final class SafeFetcher: Sendable {
         thread.stackSize = 512 * 1024
         thread.start()
         let timer = Task {
-            do { try await Task.sleep(for: remaining) } catch { return }
+            do {
+                if let lookupExpiry { try await lookupExpiry() } else { try await Task.sleep(for: remaining) }
+            } catch { return }
             latch.set(.timedOut)
         }
         let outcome = await withTaskCancellationHandler {
