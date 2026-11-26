@@ -18,6 +18,10 @@ public struct SignInFlow: Sendable {
     let endpoints: OAuthEndpoints
     let browser: any BrowserOpener
     let timeout: Duration
+    /// Waits out `timeout`, throwing when cancelled; a test seam.
+    var sleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    /// Replaces the listener's header deadline; a test seam.
+    var headerTimer: LoopbackListener.HeaderTimer?
 
     public init(endpoints: OAuthEndpoints, browser: any BrowserOpener, timeout: Duration = defaultTimeout) {
         self.endpoints = endpoints
@@ -34,7 +38,7 @@ public struct SignInFlow: Sendable {
         let pkce = PKCE()
         let listener: LoopbackListener
         do {
-            listener = try await LoopbackListener.start(expectedState: pkce.state)
+            listener = try await LoopbackListener.start(expectedState: pkce.state, headerTimer: headerTimer)
         } catch {
             throw .transport("loopback")
         }
@@ -46,7 +50,7 @@ public struct SignInFlow: Sendable {
 
         let components: URLComponents
         do {
-            components = try await listener.callback(timeout: timeout)
+            components = try await listener.callback(timeout: timeout, sleep: sleep)
         } catch .timedOut {
             throw .timedOut
         } catch {

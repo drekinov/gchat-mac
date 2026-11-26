@@ -9,8 +9,19 @@ extension OAuthNetworkTests {
         let harness = OAuthHarness()
         var fake: FakeGoogleOAuth { harness.fake }
 
-        func flow(_ browser: TestBrowser, timeout: Duration = .seconds(5)) -> SignInFlow {
-            SignInFlow(endpoints: harness.endpoints, browser: browser, timeout: timeout)
+        /// A flow whose waits end only when the test ends them: its timeout when `timeout` fires, and no header
+        /// deadline.
+        func flow(_ browser: TestBrowser, timeout: ManualTimeout = ManualTimeout()) -> SignInFlow {
+            var flow = SignInFlow(endpoints: harness.endpoints, browser: browser)
+            flow.sleep = timeout.sleep
+            flow.headerTimer = { _ in }
+            return flow
+        }
+
+        func start(_ flow: SignInFlow) -> Recorded<Result<SignInResult, AuthError>> {
+            Recorded {
+                do throws(AuthError) { return .success(try await flow.run()) } catch { return .failure(error) }
+            }
         }
 
         func browser(_ behavior: TestBrowser.Behavior = .approve) -> TestBrowser {
@@ -104,24 +115,31 @@ extension OAuthNetworkTests {
             #expect(code.allSatisfy { ("a"..."z").contains($0) || $0 == "_" })
         }
 
-        /// A wrong-state callback is refused at the listener and waiting continues, so only a timeout ends it.
-        @Test func wrongStateIsRefusedWithoutExchangingTheCode() async {
+        /// A wrong-state callback is refused at the listener and waiting continues, so only the timeout, fired here
+        /// once the refusal has been answered, ends it.
+        @Test func wrongStateIsRefusedWithoutExchangingTheCode() async throws {
             let browser = browser(.wrongState)
-            let result = await runSignIn(flow(browser, timeout: .milliseconds(800)))
-            #expect(result == .failure(.timedOut))
+            let timeout = ManualTimeout()
+            let signIn = start(flow(browser, timeout: timeout))
+            defer { signIn.cancel() }
+            try #require(await eventually { browser.redirectStatuses.count == 1 })
+            #expect(browser.redirectStatuses == [400])
+            timeout.fire()
+            #expect(await signIn.settled() == .some(.failure(.timedOut)))
             #expect(fake.tokenRequests().isEmpty)
             #expect(fake.userinfoRequests.isEmpty)
-            await browser.settle()
-            #expect(browser.redirectStatuses == [400])
         }
 
-        @Test func duplicateStateIsRefusedWithoutExchangingTheCode() async {
+        @Test func duplicateStateIsRefusedWithoutExchangingTheCode() async throws {
             let browser = browser(.duplicateState)
-            let result = await runSignIn(flow(browser, timeout: .milliseconds(800)))
-            #expect(result == .failure(.timedOut))
-            #expect(fake.tokenRequests().isEmpty)
-            await browser.settle()
+            let timeout = ManualTimeout()
+            let signIn = start(flow(browser, timeout: timeout))
+            defer { signIn.cancel() }
+            try #require(await eventually { browser.redirectStatuses.count == 1 })
             #expect(browser.redirectStatuses == [400])
+            timeout.fire()
+            #expect(await signIn.settled() == .some(.failure(.timedOut)))
+            #expect(fake.tokenRequests().isEmpty)
         }
 
         @Test func forgedCallbacksBeforeTheRealOneDontAbortSignIn() async throws {
@@ -138,9 +156,13 @@ extension OAuthNetworkTests {
             #expect(fake.tokenRequests().isEmpty)
         }
 
-        @Test func timesOutWhenNothingRedirects() async {
-            let result = await runSignIn(flow(browser(.neverRedirect), timeout: .milliseconds(200)))
-            #expect(result == .failure(.timedOut))
+        @Test func timesOutWhenNothingRedirects() async throws {
+            let timeout = ManualTimeout()
+            let signIn = start(flow(browser(.neverRedirect), timeout: timeout))
+            defer { signIn.cancel() }
+            try #require(await eventually { timeout.asked == [SignInFlow.defaultTimeout] })
+            timeout.fire()
+            #expect(await signIn.settled() == .some(.failure(.timedOut)))
             #expect(fake.tokenRequests().isEmpty)
         }
 
@@ -152,22 +174,21 @@ extension OAuthNetworkTests {
 
         @Test func cancellingTheTaskCancelsTheFlow() async throws {
             let browser = browser(.neverRedirect)
-            let flow = flow(browser, timeout: .seconds(30))
-            let task = Task { await runSignIn(flow) }
-            #expect(await eventually { !browser.urls.isEmpty })
-            task.cancel()
-            #expect(await task.value == .failure(.cancelled))
+            let signIn = start(flow(browser))
+            defer { signIn.cancel() }
+            try #require(await eventually { !browser.urls.isEmpty })
+            signIn.cancel()
+            #expect(await signIn.settled() == .some(.failure(.cancelled)))
             #expect(fake.tokenRequests().isEmpty)
         }
 
         @Test func cancellationBeforeStartDoesNotHang() async {
-            let flow = flow(browser(.neverRedirect), timeout: .seconds(30))
-            let task = Task {
+            let flow = flow(browser(.neverRedirect))
+            let signIn = Recorded { () async -> Result<SignInResult, AuthError> in
                 withUnsafeCurrentTask { $0?.cancel() }
-                return await runSignIn(flow)
+                do throws(AuthError) { return .success(try await flow.run()) } catch { return .failure(error) }
             }
-            let result = await task.value
-            #expect(result == .failure(.cancelled))
+            #expect(await signIn.settled() == .some(.failure(.cancelled)))
         }
 
         @Test func replayedRedirectIsRefusedAndDoesNotChangeTheResult() async throws {
@@ -222,17 +243,17 @@ extension OAuthNetworkTests {
         }
 
         @Test func reconnectRequiresTheSameSubjectAndKeepsAnExistingGrant() async throws {
-            let wrong = UserName(unchecked: "users/12")
-            await #expect(throws: AuthError.wrongAccount) {
-                try await flow(browser()).run(reconnecting: wrong)
+            func reconnect(_ account: UserName) async -> Result<SignInResult, AuthError> {
+                let flow = flow(browser())
+                return await settle { () async throws(AuthError) in try await flow.run(reconnecting: account) }
             }
+            let wrong = UserName(unchecked: "users/12")
+            #expect(await reconnect(wrong) == .failure(.wrongAccount))
             let correct = UserName(unchecked: "users/112233445566778899001")
-            let accepted = try await flow(browser()).run(reconnecting: correct)
+            let accepted = try await reconnect(correct).get()
             #expect(accepted.credentials.identity.subject == correct.id(at: 0))
             fake.configure { $0.scopeOverride = "" }
-            await #expect(throws: AuthError.insufficientScopes(missing: OAuthScopes.required)) {
-                try await flow(browser()).run(reconnecting: correct)
-            }
+            #expect(await reconnect(correct) == .failure(.insufficientScopes(missing: OAuthScopes.required)))
             #expect(fake.revokeRequests.isEmpty)
         }
 

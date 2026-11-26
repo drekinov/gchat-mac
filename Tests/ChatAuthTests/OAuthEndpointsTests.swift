@@ -210,8 +210,9 @@ extension OAuthNetworkTests {
 
         @Test func revokeSwallowsFailures() async {
             await endpoints.revoke("unknown-token")
-            let offline = OAuthEndpoints(
+            var offline = OAuthEndpoints(
                 transport: AuthTransport(allowedHosts: []), client: fake.client, clock: harness.clock.reader)
+            offline.sleep = OAuthHarness.untilCancelled
             await offline.revoke("anything")
             #expect(fake.revokeRequests.count == 1)
         }

@@ -39,7 +39,7 @@ extension OAuthNetworkTests {
             let provider = try provider()
             let a = Task { await fetchToken(provider) }
             let b = Task { await fetchToken(provider) }
-            try #require(await eventuallyAsync { await provider.refreshWaiters == 2 })
+            try #require(await eventually { await provider.refreshWaiters == 2 })
             try #require(await eventually { fake.parkedTokenResponses == 1 })
             fake.releaseTokens()
             let first = try await a.value.get()
@@ -81,40 +81,6 @@ extension OAuthNetworkTests {
     }
 }
 
-/// Opens once. `wait` resumes when it does, or returns false once `limit`, a guard against hangs, runs out.
-final class Gate: Sendable {
-    private let state = Mutex<(open: Bool, waiters: [UUID: CheckedContinuation<Bool, Never>])>((false, [:]))
-
-    var isOpen: Bool { state.withLock { $0.open } }
-
-    func open() {
-        let waiters = state.withLock { state in
-            state.open = true
-            defer { state.waiters = [:] }
-            return state.waiters
-        }
-        for waiter in waiters.values { waiter.resume(returning: true) }
-    }
-
-    func wait(within limit: Duration? = .seconds(10)) async -> Bool {
-        let id = UUID()
-        let expiry = limit.map { limit in
-            Task {
-                try? await Task.sleep(for: limit)
-                self.state.withLock { $0.waiters.removeValue(forKey: id) }?.resume(returning: false)
-            }
-        }
-        defer { expiry?.cancel() }
-        return await withCheckedContinuation { continuation in
-            let ready = state.withLock { state in
-                if !state.open { state.waiters[id] = continuation }
-                return state.open
-            }
-            if ready { continuation.resume(returning: true) }
-        }
-    }
-}
-
 /// A6: revoke ends at its deadline or with the response, whichever comes first, and cancels the other.
 @Suite struct RevokeDeadlineTests {
     /// Answers only once `release` opens, ignoring cancellation apart from reporting it, with no timeout of its own.
@@ -127,7 +93,7 @@ final class Gate: Sendable {
         func send(_ request: HTTPRequest) async throws(TransportError) -> HTTPResponse {
             arrived.open()
             await withTaskCancellationHandler {
-                _ = await release.wait(within: nil)
+                await release.waitThroughCancellation()
             } onCancel: {
                 cancelled.open()
             }
@@ -138,6 +104,7 @@ final class Gate: Sendable {
 
     final class Race: Sendable {
         let transport = GatedTransport()
+        let asked = Mutex<[Duration]>([])
         let sleeping = Gate()
         let deadline = Gate()
         let sleepCancelled = Gate()
@@ -149,10 +116,11 @@ final class Gate: Sendable {
         func start() -> Task<Void, Never> {
             var endpoints = OAuthEndpoints(
                 transport: transport, client: OAuthClientConfig(clientID: "id", clientSecret: "secret"))
-            endpoints.sleep = { [self] _ in
+            endpoints.sleep = { [self] duration in
+                asked.withLock { $0.append(duration) }
                 sleeping.open()
                 await withTaskCancellationHandler {
-                    _ = await deadline.wait(within: nil)
+                    await deadline.waitThroughCancellation()
                 } onCancel: {
                     sleepCancelled.open()
                 }
@@ -174,36 +142,69 @@ final class Gate: Sendable {
         let race = Race()
         defer { race.releaseAll() }
         _ = race.start()
-        try #require(await race.transport.arrived.wait())
-        try #require(await race.sleeping.wait())
+        try #require(await race.transport.arrived.opened())
+        try #require(await race.sleeping.opened())
 
+        #expect(race.asked.withLock { $0 } == [OAuthEndpoints.revokeDeadline])
         race.deadline.open()
-        try #require(await race.returned.wait())
+        try #require(await race.returned.opened())
         #expect(race.outcomes == [.deadline])
-        #expect(await race.transport.cancelled.wait())
-        #expect(!race.transport.completed.isOpen)
+        #expect(await race.transport.cancelled.opened())
     }
 
     @Test func revokeReturnsWithTheResponseAndStopsWaitingForTheDeadline() async throws {
         let race = Race()
         defer { race.releaseAll() }
         _ = race.start()
-        try #require(await race.transport.arrived.wait())
-        try #require(await race.sleeping.wait())
+        try #require(await race.transport.arrived.opened())
+        try #require(await race.sleeping.opened())
 
         race.transport.release.open()
-        try #require(await race.returned.wait())
+        try #require(await race.returned.opened())
         #expect(race.outcomes == [.response])
         #expect(race.transport.completed.isOpen)
-        #expect(await race.sleepCancelled.wait())
-        #expect(!race.deadline.isOpen)
+        #expect(await race.sleepCancelled.opened())
+    }
+}
+
+/// The header deadlines a listener armed, for the test to run when it chooses.
+final class HeaderDeadlines: Sendable {
+    private let pending = Mutex<[@Sendable () -> Void]>([])
+
+    var armed: Int { pending.withLock { $0.count } }
+
+    var timer: LoopbackListener.HeaderTimer {
+        { expire in self.pending.withLock { $0.append(expire) } }
+    }
+
+    func expireAll() {
+        for expire in pending.withLock({ $0 }) { expire() }
     }
 }
 
 /// A4: idle connections are capped, time out, and are all closed when the flow ends.
 struct LoopbackConnectionTests {
+    func connect(to listener: LoopbackListener) throws -> NWConnection {
+        let port = try #require(listener.redirectURI.port.flatMap { NWEndpoint.Port(rawValue: UInt16($0)) })
+        let connection = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)
+        connection.start(queue: .global())
+        return connection
+    }
+
+    @Test func aConnectionThatSendsNothingIsClosedAtItsHeaderDeadline() async throws {
+        let deadlines = HeaderDeadlines()
+        let listener = try await LoopbackListener.start(expectedState: "s", headerTimer: deadlines.timer)
+        defer { listener.cancel() }
+        let idle = try connect(to: listener)
+        defer { idle.cancel() }
+        try #require(await eventually { listener.openConnections == 1 && deadlines.armed == 1 })
+        deadlines.expireAll()
+        #expect(await eventually { listener.openConnections == 0 })
+        #expect(listener.refusedConnections == 0)
+    }
+
     @Test func idleConnectionsAreCappedAndClosedOnFinish() async throws {
-        let listener = try await LoopbackListener.start(expectedState: "s")
+        let listener = try await LoopbackListener.start(expectedState: "s", headerTimer: { _ in })
         defer { listener.cancel() }
         let port = try #require(listener.redirectURI.port.flatMap { NWEndpoint.Port(rawValue: UInt16($0)) })
         var idle: [NWConnection] = []

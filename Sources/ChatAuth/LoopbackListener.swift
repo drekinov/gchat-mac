@@ -15,9 +15,13 @@ public final class LoopbackListener: Sendable {
     static let maxConnections = 16
     static let headerDeadline = DispatchTimeInterval.seconds(5)
 
+    /// Arranges for `expire` to run once a connection has had `headerDeadline` to send its request.
+    typealias HeaderTimer = @Sendable (_ expire: @escaping @Sendable () -> Void) -> Void
+
     public let redirectURI: URL
     private let listener: NWListener
     private let queue: DispatchQueue
+    private let headerTimer: HeaderTimer
     private let state = Mutex(State())
 
     /// Only a callback carrying this `state` ends the wait; anything else is refused and waiting continues.
@@ -30,14 +34,25 @@ public final class LoopbackListener: Sendable {
         var refused = 0
     }
 
-    private init(listener: NWListener, port: UInt16, queue: DispatchQueue, expectedState: String?) {
+    private init(
+        listener: NWListener, port: UInt16, queue: DispatchQueue, expectedState: String?, headerTimer: HeaderTimer?
+    ) {
         self.listener = listener
         self.queue = queue
         self.expectedState = expectedState
+        self.headerTimer =
+            headerTimer ?? { expire in queue.asyncAfter(deadline: .now() + Self.headerDeadline, execute: expire) }
         self.redirectURI = URL(string: "http://127.0.0.1:\(port)\(Self.callbackPath)")!
     }
 
     public static func start(expectedState: String? = nil) async throws(LoopbackError) -> LoopbackListener {
+        try await start(expectedState: expectedState, headerTimer: nil)
+    }
+
+    /// A nil `headerTimer` closes each connection `headerDeadline` after it was accepted.
+    static func start(
+        expectedState: String?, headerTimer: HeaderTimer?
+    ) async throws(LoopbackError) -> LoopbackListener {
         let queue = DispatchQueue(label: "io.github.drekinov.gchat-mac.loopback")
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
@@ -83,7 +98,8 @@ public final class LoopbackListener: Sendable {
             throw (error as? LoopbackError) ?? .listenerFailed(String(describing: error))
         }
 
-        let loopback = LoopbackListener(listener: nwListener, port: port, queue: queue, expectedState: expectedState)
+        let loopback = LoopbackListener(
+            listener: nwListener, port: port, queue: queue, expectedState: expectedState, headerTimer: headerTimer)
         nwListener.stateUpdateHandler = { [weak loopback] newState in
             switch newState {
             case .failed(let error):
@@ -103,11 +119,18 @@ public final class LoopbackListener: Sendable {
 
     /// Waits for the first request to `callbackPath`; other paths get a 404 and waiting continues.
     public func callback(timeout: Duration) async throws(LoopbackError) -> URLComponents {
+        try await callback(timeout: timeout, sleep: { try await Task.sleep(for: $0) })
+    }
+
+    /// `sleep` waits out `timeout` and throws when its task is cancelled, which is how a callback ends the wait.
+    func callback(
+        timeout: Duration, sleep: @escaping @Sendable (Duration) async throws -> Void
+    ) async throws(LoopbackError) -> URLComponents {
         do {
             return try await withThrowingTaskGroup(of: URLComponents.self) { group in
                 group.addTask { try await self.awaitResult() }
                 group.addTask {
-                    try await Task.sleep(for: timeout)
+                    try await sleep(timeout)
                     throw LoopbackError.timedOut
                 }
                 defer { group.cancelAll() }
@@ -187,7 +210,7 @@ public final class LoopbackListener: Sendable {
             }
         }
         connection.start(queue: queue)
-        queue.asyncAfter(deadline: .now() + Self.headerDeadline) { connection.cancel() }
+        headerTimer { connection.cancel() }
         receive(on: connection, buffer: Data())
     }
 

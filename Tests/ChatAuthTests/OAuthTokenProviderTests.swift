@@ -93,7 +93,7 @@ extension OAuthNetworkTests {
             let provider = try provider()
             let (joined, tokens) = await withTaskGroup(of: Result<String, ChatAPIError>.self) { group in
                 for _ in 0..<12 { group.addTask { await fetchToken(provider) } }
-                let joined = await eventuallyAsync { await provider.refreshWaiters == 12 }
+                let joined = await eventually { await provider.refreshWaiters == 12 }
                 fake.releaseTokens()
                 var all: [Result<String, ChatAPIError>] = []
                 for await result in group { all.append(result) }
@@ -113,7 +113,7 @@ extension OAuthNetworkTests {
             fake.script(.network(.networkConnectionLost))
             let (joined, results) = await withTaskGroup(of: Result<String, ChatAPIError>.self) { group in
                 for _ in 0..<5 { group.addTask { await fetchToken(provider) } }
-                let joined = await eventuallyAsync { await provider.refreshWaiters == 5 }
+                let joined = await eventually { await provider.refreshWaiters == 5 }
                 fake.releaseTokens()
                 var all: [Result<String, ChatAPIError>] = []
                 for await result in group { all.append(result) }
