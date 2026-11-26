@@ -20,6 +20,9 @@ private actor Journal {
     }
 }
 
+/// Blocks the calling thread, which an async function may not do directly.
+private func blockThread(until semaphore: DispatchSemaphore) { semaphore.wait() }
+
 @concurrent private func hopsOffItsCaller(_ world: SimWorld) async -> Bool { world.executor.onThread }
 
 /// The guarantees every `SimWorld` rig relies on.
@@ -51,9 +54,8 @@ struct SimWorldTests {
     @Test func callersQueuedBehindABusyActorStayOnTheThread() async throws {
         try await SimWorld.run { world in
             let journal = Journal(world)
-            let gate = Barrier()
+            let gate = world.barrier()
             gate.arm()
-            world.onTeardown(open: { gate.release() })
             let first = world.start {
                 await journal.note("first in")
                 await gate.pass()
@@ -88,9 +90,8 @@ struct SimWorldTests {
     @Test func aGroupChildHeldAtAGateDoesNotHideItsSiblingsWork() async throws {
         try await SimWorld.run { world in
             let journal = Journal(world)
-            let gate = Barrier()
+            let gate = world.barrier()
             gate.arm()
-            world.onTeardown(open: { gate.release() })
             let group = world.start {
                 await withTaskGroup(of: Void.self) { group in
                     group.addTask {
@@ -208,6 +209,26 @@ struct SimWorldTests {
         }
     }
 
+    @Test func advancingOneClockBringsOnlyItsOwnSleepersNearer() async throws {
+        try await SimWorld.run { world in
+            let first = world.clock()
+            let second = world.clock()
+            let start = world.now
+            let sleepers = [first, second].map { clock in
+                world.start { try? await clock.sleep(for: .seconds(60)) }
+            }
+            await first.advance(by: .seconds(59))
+            #expect(first.now() == second.now().adding(.seconds(59)))
+            #expect(!sleepers[0].isFinished && !sleepers[1].isFinished)
+            await first.advance(by: .seconds(1))
+            #expect(sleepers[0].isFinished)
+            #expect(!sleepers[1].isFinished)
+            #expect(world.now == start)
+            await world.jump(by: .seconds(60))
+            #expect(sleepers[1].isFinished)
+        }
+    }
+
     @Test func cancellingBeforeTheSleepIsRegisteredLeavesNoSleeper() async throws {
         try await SimWorld.run { world in
             let clock = world.clock()
@@ -267,9 +288,8 @@ struct SimWorldTests {
 
     @Test func performReportsAnOperationThatCanNeverEnd() async throws {
         try await SimWorld.run { world in
-            let gate = Barrier()
+            let gate = world.barrier()
             gate.arm()
-            world.onTeardown(open: { gate.release() })
             await #expect(throws: SimError.self) {
                 try await world.perform { await gate.pass() }
             }
@@ -294,9 +314,8 @@ struct SimWorldTests {
         try await SimWorld.run { world in
             let clock = world.clock()
             let registry = WorkRegistry(executor: world.executor)
-            let gate = Barrier()
+            let gate = world.barrier()
             gate.arm()
-            world.onTeardown(open: { gate.release() })
             registry.spawn { await gate.pass() }
             await world.settle()
             let start = world.now
@@ -316,9 +335,8 @@ struct SimWorldTests {
         let reached = Recorder<String>()
         await withKnownIssue {
             try await SimWorld.run { world in
-                let gate = Barrier()
+                let gate = world.barrier()
                 gate.arm()
-                world.onTeardown(open: { gate.release() })
                 await gate.pass()
                 reached.append("after the gate")
             }
@@ -355,12 +373,32 @@ struct SimWorldTests {
         _ = await test.result
     }
 
+    /// The body blocks until the other thread has run, so the trap is the only way this process can fail.
     @Test func workThatLeavesTheThreadTraps() async {
         await #expect(processExitsWith: .failure) {
             try await SimWorld.run { world in
-                let clock = world.clock()
-                let escaped = Task.detached { try? await clock.sleep(for: .seconds(1)) }
-                await escaped.value
+                let ran = DispatchSemaphore(value: 0)
+                Thread.detachNewThread {
+                    world.requireThread()
+                    ran.signal()
+                }
+                blockThread(until: ran)
+            }
+        }
+    }
+
+    @Test func aBarrierReachedOffTheThreadTraps() async {
+        await #expect(processExitsWith: .failure) {
+            try await SimWorld.run { world in
+                let barrier = world.barrier()
+                let ran = DispatchSemaphore(value: 0)
+                Thread.detachNewThread {
+                    Task {
+                        await barrier.pass()
+                        ran.signal()
+                    }
+                }
+                blockThread(until: ran)
             }
         }
     }
@@ -388,8 +426,7 @@ struct SimWorldTests {
             let server = world.server
             let alice = server.addAccount(displayName: "Alice")
             let space = server.addSpace(.space, displayName: "Team", members: [alice])
-            let client = GoogleChatClient(
-                transport: server.makeDirectTransport(), tokens: StaticTokens(token: alice.token))
+            let client = GoogleChatClient(transport: world.transport(), tokens: StaticTokens(token: alice.token))
             let order = Recorder<Int>()
             for index in 0..<8 {
                 world.start {

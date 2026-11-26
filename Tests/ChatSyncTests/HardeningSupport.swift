@@ -39,41 +39,6 @@ final class ManualClock: SyncClock {
     var sleeps: [Duration] { state.withLock { $0.sleeps } }
 }
 
-/// Server time plus virtual time that runs ahead by every sleep, so polling loops tick fast. While held, only
-/// `advance` moves it, and sleeps still return.
-final class SteppingClock: SyncClock {
-    private struct State {
-        var drift = Duration.zero
-        var held = false
-        var sleepsBegun = 0
-    }
-
-    let server: FakeChatServer
-    private let state = Mutex(State())
-
-    init(server: FakeChatServer) { self.server = server }
-
-    func now() -> Timestamp { server.now.adding(state.withLock { $0.drift }) }
-
-    func sleep(for duration: Duration) async throws {
-        state.withLock { $0.sleepsBegun += 1 }
-        try await Task.sleep(for: .milliseconds(1))
-        state.withLock { if !$0.held { $0.drift += duration } }
-    }
-
-    var sleepsBegun: Int { state.withLock { $0.sleepsBegun } }
-    func hold() { state.withLock { $0.held = true } }
-    func release() { state.withLock { $0.held = false } }
-    func advance(_ duration: Duration) { state.withLock { $0.drift += duration } }
-}
-
-/// Server time, with sleeps that really wait.
-struct RealSleepClock: SyncClock {
-    let server: FakeChatServer
-    func now() -> Timestamp { server.now }
-    func sleep(for duration: Duration) async throws { try await Task.sleep(for: duration) }
-}
-
 extension Timestamp {
     func offset(from other: Timestamp) -> Duration {
         .seconds(seconds - other.seconds) + .nanoseconds(Int64(nanos) - Int64(other.nanos))
@@ -124,6 +89,9 @@ final class Barrier: Sendable {
     }
 
     private let state = Mutex(State())
+    private let onPass: @Sendable () -> Void
+
+    init(onPass: @escaping @Sendable () -> Void = {}) { self.onPass = onPass }
 
     func arm() {
         state.withLock { state in
@@ -133,6 +101,7 @@ final class Barrier: Sendable {
     }
 
     func pass() async {
+        onPass()
         if state.withLock({ !$0.armed }) { return }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let resumeNow = state.withLock { state -> Bool in
@@ -472,15 +441,17 @@ final class SnapshotRecorder: Sendable {
         }
     }
 
-    /// The consumer is a task of `world`, so at every settled point it has recorded all that was sent.
-    init(_ stream: AsyncStream<AccountSnapshot>, in world: SimWorld) {
+    /// `spawn` decides where the consumer runs.
+    init(
+        _ stream: AsyncStream<AccountSnapshot>,
+        spawn: (@escaping @Sendable () async -> Void) -> Task<Void, Never>
+    ) {
         let storage = Storage()
         self.storage = storage
-        task =
-            world.start {
-                for await snapshot in stream { storage.history.withLock { $0.append(snapshot) } }
-                storage.finished.withLock { $0 = true }
-            }.task
+        task = spawn {
+            for await snapshot in stream { storage.history.withLock { $0.append(snapshot) } }
+            storage.finished.withLock { $0 = true }
+        }
     }
 
     var history: [AccountSnapshot] { storage.history.withLock { $0 } }

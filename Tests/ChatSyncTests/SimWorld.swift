@@ -1,4 +1,5 @@
 import ChatModel
+import ChatNet
 import FakeChatServer
 import Foundation
 import Synchronization
@@ -124,7 +125,8 @@ final class SimTask<Value: Sendable>: Sendable {
 final class SimWorld: Sendable {
     private struct Sleeper {
         let id: UInt64
-        let deadline: Timestamp
+        let clock: ObjectIdentifier
+        var deadline: Timestamp
         let continuation: CheckedContinuation<Void, Never>
     }
 
@@ -299,12 +301,17 @@ final class SimWorld: Sendable {
         return simTask
     }
 
-    /// Runs `operation` to its end, moving time as far as it needs. For anything that waits on the clock, such as
-    /// a logout whose drain has a deadline.
+    /// Runs `operation` to its end, moving time as far as it needs within `limit` of virtual time. For anything
+    /// that waits on the clock, such as a logout whose drain has a deadline.
     @discardableResult
-    func perform<Value: Sendable>(_ operation: @escaping @Sendable () async -> Value) async throws -> Value {
+    func perform<Value: Sendable>(
+        upTo limit: Duration = .seconds(86_400), _ operation: @escaping @Sendable () async -> Value
+    ) async throws -> Value {
         let task = start(operation)
-        guard await run(upTo: nil, until: { task.isFinished }) else { throw SimError.stalled(dump()) }
+        guard await run(upTo: limit, until: { task.isFinished }) else {
+            task.cancel()
+            throw SimError.stalled(dump())
+        }
         return await task.value
     }
 
@@ -314,7 +321,28 @@ final class SimWorld: Sendable {
 
     func clock(offset: Duration = .zero) -> SimClock { SimClock(world: self, offset: offset) }
 
-    fileprivate func sleep(until deadline: Timestamp) async throws {
+    /// A direct transport to this world's server that traps when used off the simulation thread.
+    func transport() -> SimTransport { SimTransport(world: self, base: server.makeDirectTransport()) }
+
+    /// A barrier that traps when reached off the simulation thread and opens when the world ends.
+    func barrier() -> Barrier {
+        let barrier = Barrier(onPass: { [executor] in
+            precondition(executor.onThread, "a barrier was reached off the simulation thread")
+        })
+        onTeardown(open: { barrier.release() })
+        return barrier
+    }
+
+    /// Brings every sleeper of `clock` nearer by `duration`: that clock alone moved forward.
+    fileprivate func shift(_ clock: ObjectIdentifier, by duration: Duration) {
+        state.withLock { state in
+            for index in state.sleepers.indices where state.sleepers[index].clock == clock {
+                state.sleepers[index].deadline = state.sleepers[index].deadline.adding(.zero - duration)
+            }
+        }
+    }
+
+    fileprivate func sleep(until deadline: Timestamp, on clock: ObjectIdentifier) async throws {
         requireThread()
         let id = state.withLock { state -> UInt64 in
             state.nextID += 1
@@ -325,7 +353,8 @@ final class SimWorld: Sendable {
                 let now = server.now
                 let resumeNow = state.withLock { state -> Bool in
                     if now >= deadline || Task.isCancelled { return true }
-                    state.sleepers.append(Sleeper(id: id, deadline: deadline, continuation: continuation))
+                    state.sleepers.append(
+                        Sleeper(id: id, clock: clock, deadline: deadline, continuation: continuation))
                     return false
                 }
                 if resumeNow { continuation.resume() }
@@ -407,17 +436,39 @@ final class SimWorld: Sendable {
 /// `now()` is the world's time shifted by `offset`. A sleep parks until the driver reaches its deadline.
 final class SimClock: SyncClock {
     let world: SimWorld
-    let offset: Duration
+    private let shifted: Mutex<Duration>
 
     fileprivate init(world: SimWorld, offset: Duration) {
         self.world = world
-        self.offset = offset
+        shifted = Mutex(offset)
     }
+
+    var offset: Duration { shifted.withLock { $0 } }
 
     func now() -> Timestamp { world.now.adding(offset) }
 
     func sleep(for duration: Duration) async throws {
-        try await world.sleep(until: world.now.adding(duration))
+        try await world.sleep(until: world.now.adding(duration), on: ObjectIdentifier(self))
+    }
+
+    /// Moves this clock alone forward: its sleepers come due sooner, everyone else's are untouched.
+    func advance(by duration: Duration) async {
+        precondition(duration >= .zero, "a clock only moves forward")
+        await world.settle()
+        shifted.withLock { $0 += duration }
+        world.shift(ObjectIdentifier(self), by: duration)
+        await world.settle()
+    }
+}
+
+/// The fake server's direct transport, confined to the world's thread.
+struct SimTransport: HTTPTransport {
+    let world: SimWorld
+    let base: DirectTransport
+
+    func send(_ request: HTTPRequest) async throws(TransportError) -> HTTPResponse {
+        world.requireThread("a request")
+        return try await base.send(request)
     }
 }
 
@@ -448,6 +499,11 @@ private final class Watchdog: Sendable {
 }
 
 extension SnapshotRecorder {
+    /// The consumer is a task of `world`, so at every settled point it has recorded all that was sent.
+    convenience init(_ stream: AsyncStream<AccountSnapshot>, in world: SimWorld) {
+        self.init(stream) { body in world.start(body).task }
+    }
+
     /// Runs until `predicate` holds for a snapshot at or after position `since`.
     func wait(
         in world: SimWorld, since: Int = 0, where predicate: @escaping @Sendable (AccountSnapshot) -> Bool

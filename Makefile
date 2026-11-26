@@ -88,6 +88,8 @@ format:
 
 lint:
 	swift format lint --strict --recursive $(FORMAT_PATHS)
+	python3 -I scripts/check_test_timing.py --self-test
+	python3 -I scripts/check_test_timing.py
 
 clean:
 	rm -rf build App/gchat-mac.xcodeproj

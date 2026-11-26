@@ -9,83 +9,6 @@ import Testing
 
 @testable import ChatSync
 
-/// `now()` is server time. A sleep parks until `tick()` finds the server past its deadline, or until `stop()`.
-final class ServerTimeClock: SyncClock {
-    private struct Waiter {
-        let id: UUID
-        let deadline: Timestamp
-        let continuation: CheckedContinuation<Void, Never>
-    }
-
-    private struct State {
-        var waiters: [Waiter] = []
-        var stopped = false
-    }
-
-    let server: FakeChatServer
-    private let state = Mutex(State())
-
-    init(server: FakeChatServer) { self.server = server }
-
-    func now() -> Timestamp { server.now }
-
-    func sleep(for duration: Duration) async throws {
-        let deadline = server.now.adding(duration)
-        let id = UUID()
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let now = server.now
-                let resumeNow = state.withLock { state -> Bool in
-                    if state.stopped || now >= deadline || Task.isCancelled { return true }
-                    state.waiters.append(Waiter(id: id, deadline: deadline, continuation: continuation))
-                    return false
-                }
-                if resumeNow { continuation.resume() }
-            }
-        } onCancel: {
-            resume { $0.id == id }
-        }
-        try Task.checkCancellation()
-    }
-
-    /// Wakes every sleeper whose deadline the server has reached and returns how many woke. It doesn't wait for
-    /// the woken work: each test waits for its own signal.
-    @discardableResult
-    func tick() -> Int {
-        let now = server.now
-        return resume { $0.deadline <= now }
-    }
-
-    var sleepers: Int { state.withLock { $0.waiters.count } }
-
-    /// True once a sleeper with exactly this deadline is parked; `timeout` is only a hang guard.
-    func waitForSleeper(until deadline: Timestamp, timeout: Duration = .seconds(10)) async -> Bool {
-        await poll(timeout: timeout) { self.state.withLock { $0.waiters.contains { $0.deadline == deadline } } }
-    }
-
-    var deadlines: [Timestamp] { state.withLock { $0.waiters.map(\.deadline) } }
-
-    func hasSleeper(until deadline: Timestamp) -> Bool {
-        state.withLock { $0.waiters.contains { $0.deadline == deadline } }
-    }
-
-    func stop() {
-        state.withLock { $0.stopped = true }
-        resume { _ in true }
-    }
-
-    @discardableResult
-    private func resume(where match: (Waiter) -> Bool) -> Int {
-        let due = state.withLock { state -> [Waiter] in
-            let due = state.waiters.filter(match)
-            state.waiters.removeAll(where: match)
-            return due
-        }
-        for waiter in due { waiter.continuation.resume() }
-        return due.count
-    }
-}
-
 /// Holds an empty pull on the clock for `hold`, as Google does when nothing is queued.
 struct HoldingPubSub: PubSubAPI {
     let base: any PubSubAPI
@@ -196,7 +119,7 @@ final class EventWorld: Sendable {
 
     func client(_ account: FakeAccount? = nil) -> WorkspaceEventsClient {
         WorkspaceEventsClient(
-            transport: server.makeDirectTransport(), tokens: StaticTokens(token: (account ?? alice).token),
+            transport: sim.transport(), tokens: StaticTokens(token: (account ?? alice).token),
             sleeper: { _ in })
     }
 
@@ -245,9 +168,9 @@ struct Mac: Sendable {
     let scratch = ScratchDirectory()
     let poster = RecordingPoster()
     let pulls = CallLog()
-    let createBarrier = Barrier()
-    let getBarrier = Barrier()
-    let ackBarrier = Barrier()
+    let createBarrier: Barrier
+    let getBarrier: Barrier
+    let ackBarrier: Barrier
     let staleGets = StaleGets()
     let session: AccountSession
     let recorder: SnapshotRecorder
@@ -257,6 +180,10 @@ struct Mac: Sendable {
         conflictOnCreate: Bool = false, hasScope: Bool = true
     ) {
         self.world = world
+        let sim = world.sim
+        createBarrier = sim.barrier()
+        getBarrier = sim.barrier()
+        ackBarrier = sim.barrier()
         path = EventWorld.path(device)
         if register { world.server.addPullSubscription(path.rawValue, topic: EventWorld.topic.rawValue) }
         var timing = SessionTiming.fast
@@ -272,17 +199,15 @@ struct Mac: Sendable {
                 staleGets: staleGets),
             pubsub: HoldingPubSub(base: client, clock: world.clock, hold: hold, pulls: pulls, ackBarrier: ackBarrier),
             hasScope: hasScope)
-        let sim = world.sim
         let session = AccountSession(
             account: AccountID(), me: world.alice.user.name,
             api: GoogleChatClient(
-                transport: world.server.makeDirectTransport(), tokens: StaticTokens(token: world.alice.token)),
+                transport: sim.transport(), tokens: StaticTokens(token: world.alice.token)),
             store: store, clock: world.clock,
             logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
             timing: timing, notifications: poster, events: services, executor: sim.executor)
         self.session = session
         recorder = SnapshotRecorder(session.snapshots.values, in: sim)
-        for barrier in [createBarrier, getBarrier, ackBarrier] { sim.onTeardown(open: { barrier.release() }) }
         sim.onTeardown {
             guard await !session.closing else { return }
             _ = try? await sim.perform { await session.logout(refreshToken: nil) }
@@ -849,6 +774,20 @@ struct Mac: Sendable {
         }
     }
 
+    @Test func aWakeRestartsTheChannelOnceItsCatchUpHasRun() async throws {
+        try await EventWorld.run { world in
+            let mac = Mac(world)
+            #expect(await mac.startLive())
+            let cycle = await mac.channel.cycle
+            let listings = world.requests("GET", "/v1/spaces")
+            await mac.session.systemDidWake()
+            #expect(await world.run { await mac.channel.cycle > cycle })
+            #expect(world.requests("GET", "/v1/spaces") > listings, "the catch-up listed spaces first")
+            #expect(await world.run { mac.status == .live })
+            try await world.shutdown(mac)
+        }
+    }
+
     @Test func pausingStopsPullingAndResumingRestarts() async throws {
         try await EventWorld.run { world in
             let mac = Mac(world)
@@ -982,27 +921,26 @@ struct EventSettingsTests {
             let mac = Mac(world)
             #expect(await mac.startLive())
             let session = mac.session
-            // A task that ignores cancellation keeps logout inside its drain while the wake arrives.
-            let stuck = Barrier()
-            stuck.arm()
-            world.sim.onTeardown(open: { stuck.release() })
-            #expect(await session.spawnRegistered { await stuck.pass() })
+            // A health check parked at its barrier ignores cancellation, so logout stays in its drain.
+            mac.getBarrier.arm()
+            await mac.channel.restart()
+            #expect(await world.run { mac.getBarrier.arrivals == 1 })
             let logout = world.sim.start { await session.logout(refreshToken: nil) }
             await world.sim.settle()
-            #expect(stuck.arrivals == 1)
             #expect(!logout.isFinished)
+            let pulls = mac.pullRequests
+            let requests = world.server.requests.count
+
             await session.systemDidWake()
             await session.setConnectivity(.unreachable)
             await session.setConnectivity(.reachable)
             await world.sim.settle()
-            stuck.release()
+            mac.getBarrier.release()
             #expect(await world.run { logout.isFinished })
             #expect(await logout.value.drained)
-            let pulls = mac.pullRequests
-            let requests = world.server.requests.count
             await world.pass(.seconds(30))
             #expect(mac.pullRequests == pulls)
-            #expect(world.server.requests.count == requests)
+            #expect(world.server.requests.count == requests, "the session sent nothing once it was retired")
             #expect(await session.closing)
             #expect(world.sim.sleeperDeadlines.isEmpty, "nothing is left waiting on the clock")
         }
@@ -1017,8 +955,7 @@ struct EventSettingsReplacementTests {
             let scratch = ScratchDirectory()
             let tombstones = LogoutTombstones(root: scratch.url)
             let runner = LogoutRunner(eraser: NoopEraser(), tombstones: tombstones)
-            let hold = Barrier()
-            sim.onTeardown(open: { hold.release() })
+            let hold = sim.barrier()
             let built = Recorder<Int>()
             var timing = SessionTiming.fast
             timing.idleSleep = .seconds(3600)
@@ -1029,12 +966,12 @@ struct EventSettingsReplacementTests {
                 built.append(1)
                 await hold.pass()
                 let client = WorkspaceEventsClient(
-                    transport: server.makeDirectTransport(), tokens: StaticTokens(token: alice.token),
+                    transport: sim.transport(), tokens: StaticTokens(token: alice.token),
                     sleeper: { _ in })
                 let session = AccountSession(
                     account: record.id, me: record.me,
                     api: GoogleChatClient(
-                        transport: server.makeDirectTransport(), tokens: StaticTokens(token: alice.token)),
+                        transport: sim.transport(), tokens: StaticTokens(token: alice.token)),
                     store: InMemoryAccountStore(), clock: sim.clock(), logoutRunner: runner, timing: timing,
                     events: EventServices(events: client, pubsub: client, hasScope: false), executor: sim.executor)
                 await session.setPaused(true)
