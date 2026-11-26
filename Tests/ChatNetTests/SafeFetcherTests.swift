@@ -392,6 +392,7 @@ extension SafeFetcher.Resolution {
         queuedExpiry.open()
         #expect(await queued.settled()?.isTimedOut == true)
         #expect(slots.waiterCount == 0)
+        #expect(calls.count == 1)
         lookups.open()
         #expect(await stuck.settled()?.isAddresses == true)
         #expect(await eventually { await slots.available == 1 })

@@ -115,6 +115,7 @@ struct ComposerDraftsTests {
         #expect(drafts.draft(key).text == "kept")
         #expect(drafts.draft(key).attachments.map(\.filename) == ["a.pdf"])
         #expect(await storage.row(key)?.text == "kept")
+        #expect(drafts.isSettled, "something typed before the load is waiting to be saved")
     }
 
     @Test func aFailedLoadWritesNothing() async {
@@ -216,6 +217,39 @@ struct ComposerDraftsTests {
         #expect(await sent.settled() == true)
         #expect(await flushing.settled() != nil)
         #expect(await drafts.flush())
+        #expect(await storage.row(key) == nil)
+        #expect(!drafts.hasDraft(in: Self.room))
+    }
+
+    /// A save still queued when the send takes the composer runs before the send does, with the composer cleared.
+    @Test func aSaveStillQueuedWhenTheSendStartsLeavesTheStoredDraftAlone() async throws {
+        await drafts.hydrate(key)
+        drafts.setText("outgoing", for: key)
+        #expect(await drafts.flush())
+        drafts.setText("outgoing!", for: key)
+        await storage.hold()
+        let flushing = Running { [drafts] in await drafts.flush() }
+        let parked = await eventually { await storage.parked == 1 }
+        #expect(parked)
+        drafts.retryUnsaved()
+        let commit = Hold()
+        defer { commit.open() }
+        let sending = drafts.send(key) { [storage, key] _ in
+            await commit.pass()
+            await storage.delete(key)
+            return true
+        }
+        await storage.release()
+
+        let committing = await eventually { commit.arrived == 1 }
+        try #require(committing)
+        #expect(await storage.row(key)?.text == "outgoing!")
+
+        commit.open()
+        let sent = Running { await sending?.value ?? false }
+        #expect(await sent.settled() == true)
+        #expect(await flushing.settled() != nil)
+        await drafts.settle()
         #expect(await storage.row(key) == nil)
         #expect(!drafts.hasDraft(in: Self.room))
     }

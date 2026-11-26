@@ -13,6 +13,11 @@ struct LoopbackListenerTests {
 
     static let timeout: Duration = .seconds(300)
 
+    /// A listener that never cuts a connection for being slow to send its request.
+    func patientListener() async throws -> LoopbackListener {
+        try await LoopbackListener.start(expectedState: nil, headerTimer: { _ in })
+    }
+
     @Test func redirectURIIsLoopbackWithEphemeralPort() async throws {
         let listener = try await LoopbackListener.start()
         defer { listener.cancel() }
@@ -24,7 +29,7 @@ struct LoopbackListenerTests {
     }
 
     @Test func deliversCallbackAfterIgnoringOtherPaths() async throws {
-        let listener = try await LoopbackListener.start()
+        let listener = try await patientListener()
         defer { listener.cancel() }
         let callback = callback(on: listener)
         defer { callback.cancel() }
@@ -44,7 +49,7 @@ struct LoopbackListenerTests {
     }
 
     @Test func singleUse() async throws {
-        let listener = try await LoopbackListener.start()
+        let listener = try await patientListener()
         defer { listener.cancel() }
         let callback = callback(on: listener)
         defer { callback.cancel() }
