@@ -302,9 +302,12 @@ struct Mac: Sendable {
         return await recorder.wait { $0.status == .ok && $0.spaces.contains { $0.name == space } } != nil
     }
 
+    /// The channel publishes its status before it tells the session, so tests wait for both.
+    func liveChannelIs(_ live: Bool) async -> Bool { await session.liveChannel == live }
+
     func startLive() async -> Bool {
         guard await start() else { return false }
-        return await world.run { status == .live }
+        return await world.run { await liveChannelIs(true) && status == .live }
     }
 
     var pullRequests: Int { world.requests("POST", path.rawValue + ":pull") }
@@ -593,7 +596,10 @@ extension EventWorld {
         #expect(await mac.startLive())
         world.server.fail(.unavailable(route: .acknowledge, times: nil))
         world.post("never acked")
-        #expect(await world.run(upTo: .seconds(300)) { if case .degraded = mac.status { true } else { false } })
+        #expect(
+            await world.run(upTo: .seconds(300)) {
+                if case .degraded = mac.status { await mac.liveChannelIs(false) } else { false }
+            })
         #expect(!(await mac.session.liveChannel))
         await world.shutdown(mac)
     }
@@ -842,7 +848,10 @@ extension EventWorld {
         let mac = Mac(world)
         #expect(await mac.startLive())
         world.server.fail(.unavailable(route: .pull, times: 4))
-        #expect(await world.run { if case .degraded(.server) = mac.status { true } else { false } })
+        #expect(
+            await world.run {
+                if case .degraded(.server) = mac.status { await mac.liveChannelIs(false) } else { false }
+            })
         #expect(await mac.session.retryUntil == nil)
         #expect(await mac.session.offlineUntil == nil)
         #expect(await mac.session.status == .ok)
@@ -862,7 +871,7 @@ extension EventWorld {
         #expect(await mac.startLive())
         world.server.fail(.rateLimited(route: .listSpaces, retryAfter: 600, times: nil))
         await mac.session.setConnectivity(.unreachable)
-        #expect(await world.run(step: .milliseconds(50)) { mac.status == .starting })
+        #expect(await world.run(step: .milliseconds(50)) { await mac.liveChannelIs(false) && mac.status == .starting })
         #expect(!(await mac.session.liveChannel))
         let pulls = mac.pullRequests
         await world.pass(.seconds(30))
