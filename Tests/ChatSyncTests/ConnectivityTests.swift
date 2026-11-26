@@ -475,11 +475,12 @@ struct SendAdmissionTests {
     }
 
     @Test func logoutClosesAdmission() async throws {
-        let rig = try LogoutRig()
-        #expect(await rig.startAndSync())
-        #expect(await rig.session.admitted)
-        _ = await rig.session.logout(refreshToken: nil)
-        #expect(await rig.session.closing)
-        #expect(await rig.session.admitted == false)
+        try await LogoutRig.run { rig in
+            #expect(await rig.startAndSync())
+            #expect(await rig.session.admitted)
+            _ = try await rig.logout(refreshToken: nil)
+            #expect(await rig.session.closing)
+            #expect(await rig.session.admitted == false)
+        }
     }
 }

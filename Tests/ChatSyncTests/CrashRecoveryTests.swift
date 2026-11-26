@@ -20,7 +20,6 @@ struct CrashRig: Sendable {
     let secrets = InMemorySecretStore()
     let tombstones: LogoutTombstones
     let registry: AccountRegistry
-    let server = FakeChatServer()
     let victim: Artifacts
     let healthy: Artifacts
     let created = Recorder<AccountID>()
@@ -61,24 +60,34 @@ struct CrashRig: Sendable {
         return (LogoutRecovery(runner: LogoutRunner(eraser: eraser, tombstones: tombstones)), eraser)
     }
 
-    func manager(recovery: LogoutRecovery) -> AccountManager {
-        let server = server
+    /// A manager whose sessions live in `world`; their token is unknown to the server, so they stop at sign-in.
+    func manager(recovery: LogoutRecovery, in world: SimWorld) -> AccountManager {
         let created = created
         let tombstones = tombstones
         return AccountManager(
             registry: registry, recovery: recovery, tombstones: tombstones,
             factory: { record in
                 created.append(record.id)
-                return AccountSession(
+                let session = AccountSession(
                     account: record.id, me: record.me,
-                    api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: "none")),
-                    store: InMemoryAccountStore(), clock: RealSleepClock(server: server),
-                    logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: tombstones), timing: .fast)
+                    api: GoogleChatClient(transport: world.transport(), tokens: StaticTokens(token: "none")),
+                    store: InMemoryAccountStore(), clock: world.clock(),
+                    logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: tombstones), timing: .lifecycle,
+                    executor: world.executor)
+                world.lifecycleRetireAtTeardown(session)
+                return session
             })
     }
 
-    func shutdown(_ manager: AccountManager) async {
-        for session in await manager.sessions.values { _ = await session.logout(refreshToken: nil) }
+    /// Lets the restored sessions run until they are idle, then logs each one out.
+    func shutdown(_ manager: AccountManager, in world: SimWorld) async throws {
+        await world.settle()
+        for session in await manager.sessions.values {
+            #expect(await session.status == .needsLogin, "a restored session is started and gets as far as sign-in")
+            let report = try await world.lifecycleLogout(session)
+            #expect(report.drained)
+        }
+        #expect(world.sleeperDeadlines.isEmpty, "a session outlived its logout")
     }
 
     func expectVictimErased() {
@@ -120,43 +129,48 @@ struct CrashRecoveryTests {
 
     @Test(arguments: 0...LogoutStep.allCases.count)
     func startupFinishesTheLogoutDropsTheAccountAndRestoresTheOther(completedSteps k: Int) async throws {
-        let rig = try CrashRig()
-        try rig.writeFullTombstone()
-        for step in LogoutStep.allCases.prefix(k) { try await rig.victim.eraser.perform(step) }
+        try await SimWorld.run { world in
+            let rig = try CrashRig()
+            try rig.writeFullTombstone()
+            for step in LogoutStep.allCases.prefix(k) { try await rig.victim.eraser.perform(step) }
 
-        let (recovery, _) = rig.recovery()
-        let manager = rig.manager(recovery: recovery)
-        let report = try await manager.startup()
-        await rig.shutdown(manager)
+            let (recovery, _) = rig.recovery()
+            let manager = rig.manager(recovery: recovery, in: world)
+            let report = try await manager.startup()
+            #expect(await Array(manager.sessions.keys) == [rig.healthy.record.id])
+            try await rig.shutdown(manager, in: world)
 
-        #expect(report.incompleteLogouts.isEmpty)
-        #expect(report.restored == [rig.healthy.record.id])
-        #expect(report.failed.isEmpty)
-        #expect(rig.created.all == [rig.healthy.record.id], "the interrupted account must never get a session")
-        #expect(try rig.registry.load().map(\.id) == [rig.healthy.record.id])
-        rig.expectVictimErased()
-        rig.expectHealthyUntouched()
+            #expect(report.incompleteLogouts.isEmpty)
+            #expect(report.restored == [rig.healthy.record.id])
+            #expect(report.failed.isEmpty)
+            #expect(rig.created.all == [rig.healthy.record.id], "the interrupted account must never get a session")
+            #expect(try rig.registry.load().map(\.id) == [rig.healthy.record.id])
+            rig.expectVictimErased()
+            rig.expectHealthyUntouched()
+        }
     }
 
     @Test(arguments: 0...LogoutStep.allCases.count)
     func recoverThenStartupDoesNotResurrectTheAccount(completedSteps k: Int) async throws {
-        let rig = try CrashRig()
-        try rig.writeFullTombstone()
-        for step in LogoutStep.allCases.prefix(k) { try await rig.victim.eraser.perform(step) }
+        try await SimWorld.run { world in
+            let rig = try CrashRig()
+            try rig.writeFullTombstone()
+            for step in LogoutStep.allCases.prefix(k) { try await rig.victim.eraser.perform(step) }
 
-        let (recovery, _) = rig.recovery()
-        let incomplete = try await recovery.recover()
-        #expect(incomplete.isEmpty)
-        let manager = rig.manager(recovery: recovery)
-        let report = try await manager.startup()
-        await rig.shutdown(manager)
+            let (recovery, _) = rig.recovery()
+            let incomplete = try await recovery.recover()
+            #expect(incomplete.isEmpty)
+            let manager = rig.manager(recovery: recovery, in: world)
+            let report = try await manager.startup()
+            try await rig.shutdown(manager, in: world)
 
-        rig.expectVictimErased()
-        rig.expectHealthyUntouched()
-        #expect(report.incompleteLogouts.isEmpty)
-        #expect(report.restored == [rig.healthy.record.id])
-        #expect(rig.created.all == [rig.healthy.record.id], "the interrupted account must never get a session")
-        #expect(try rig.registry.load().map(\.id) == [rig.healthy.record.id])
+            rig.expectVictimErased()
+            rig.expectHealthyUntouched()
+            #expect(report.incompleteLogouts.isEmpty)
+            #expect(report.restored == [rig.healthy.record.id])
+            #expect(rig.created.all == [rig.healthy.record.id], "the interrupted account must never get a session")
+            #expect(try rig.registry.load().map(\.id) == [rig.healthy.record.id])
+        }
     }
 
     @Test(arguments: [
@@ -165,33 +179,36 @@ struct CrashRecoveryTests {
         [.deleteAccountFiles, .unregister],
     ])
     func aStepThatKeepsFailingLeavesOnlyItselfInTheTombstone(failing: [LogoutStep]) async throws {
-        let rig = try CrashRig()
-        try rig.writeFullTombstone()
+        try await SimWorld.run { world in
+            let rig = try CrashRig()
+            try rig.writeFullTombstone()
 
-        let (recovery, stubborn) = rig.recovery(failing: Set(failing))
-        let manager = rig.manager(recovery: recovery)
-        let report = try await manager.startup()
-        await rig.shutdown(manager)
+            let (recovery, stubborn) = rig.recovery(failing: Set(failing))
+            let manager = rig.manager(recovery: recovery, in: world)
+            let report = try await manager.startup()
+            try await rig.shutdown(manager, in: world)
 
-        let victim = rig.victim.record.id
-        let expectedRemaining = LogoutStep.allCases.filter(failing.contains)
-        #expect(report.incompleteLogouts == [victim])
-        #expect(report.restored == [rig.healthy.record.id])
-        #expect(rig.created.all == [rig.healthy.record.id])
-        #expect(try rig.registry.load().map(\.id) == [rig.healthy.record.id])
-        #expect(try rig.tombstones.pending() == [.init(account: victim, remaining: expectedRemaining)])
-        rig.expectHealthyUntouched()
+            let victim = rig.victim.record.id
+            let expectedRemaining = LogoutStep.allCases.filter(failing.contains)
+            #expect(report.incompleteLogouts == [victim])
+            #expect(report.restored == [rig.healthy.record.id])
+            #expect(rig.created.all == [rig.healthy.record.id])
+            #expect(try rig.registry.load().map(\.id) == [rig.healthy.record.id])
+            #expect(try rig.tombstones.pending() == [.init(account: victim, remaining: expectedRemaining)])
+            rig.expectHealthyUntouched()
 
-        stubborn.setFailing([])
-        let next = rig.manager(
-            recovery: LogoutRecovery(runner: LogoutRunner(eraser: stubborn, tombstones: rig.tombstones)))
-        let second = try await next.startup()
-        await rig.shutdown(next)
+            stubborn.setFailing([])
+            let next = rig.manager(
+                recovery: LogoutRecovery(runner: LogoutRunner(eraser: stubborn, tombstones: rig.tombstones)),
+                in: world)
+            let second = try await next.startup()
+            try await rig.shutdown(next, in: world)
 
-        #expect(second.incompleteLogouts.isEmpty)
-        #expect(second.restored == [rig.healthy.record.id])
-        rig.expectVictimErased()
-        rig.expectHealthyUntouched()
+            #expect(second.incompleteLogouts.isEmpty)
+            #expect(second.restored == [rig.healthy.record.id])
+            rig.expectVictimErased()
+            rig.expectHealthyUntouched()
+        }
     }
 
     @Test func recoveryIsIdempotentWhenRunTwice() async throws {
@@ -234,17 +251,20 @@ struct CrashRecoveryTests {
     }
 
     @Test func startupFailsClosedWhenTheTombstoneDirectoryCannotBeRead() async throws {
-        let rig = try CrashRig()
-        try rig.writeFullTombstone()
-        let directory = rig.tombstones.url(for: rig.victim.record.id).deletingLastPathComponent()
-        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: directory.path)
-        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
+        try await SimWorld.run { world in
+            let rig = try CrashRig()
+            try rig.writeFullTombstone()
+            let directory = rig.tombstones.url(for: rig.victim.record.id).deletingLastPathComponent()
+            try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: directory.path)
+            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
 
-        let (recovery, _) = rig.recovery()
-        let manager = rig.manager(recovery: recovery)
-        await #expect(throws: (any Error).self) { _ = try await manager.startup() }
+            let (recovery, _) = rig.recovery()
+            let manager = rig.manager(recovery: recovery, in: world)
+            await #expect(throws: (any Error).self) { _ = try await manager.startup() }
 
-        #expect(rig.created.all.isEmpty, "no session may start while a logout might be pending")
-        #expect(exists(rig.victim.directory.storeURL), "nothing may be erased or restored on a guess")
+            #expect(rig.created.all.isEmpty, "no session may start while a logout might be pending")
+            #expect(await manager.sessions.isEmpty)
+            #expect(exists(rig.victim.directory.storeURL), "nothing may be erased or restored on a guess")
+        }
     }
 }
