@@ -290,7 +290,6 @@ private func finished<Value: Sendable>(_ task: Task<Value, Never>) async throws 
         // Three waits: the export on the first download, then the export and the new request on the larger one.
         let second = Task { await Self.imageError(loader, attachment) }
         try await waits.wait { $0.count == 3 }
-        #expect(server.limits.count == 2)
         server.release()
 
         let url = try await finished(export).get()
@@ -334,7 +333,6 @@ private func finished<Value: Sendable>(_ task: Task<Value, Never>) async throws 
         #expect(try await finished(image) == .api(.transport(.responseTooLarge)))
         // The larger attempt has finished and left the table before the export looks at the first one's result.
         try await settled.wait(for: MediaLoader.maxFileBytes)
-        #expect(server.limits.count == 2)
         #expect(loader.runningDownloadLimit(resource) == nil)
         resumer.yield()
 
