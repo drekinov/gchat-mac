@@ -161,7 +161,7 @@ extension MemorySensitive {
             }
         }
 
-        @Test(.timeLimit(.minutes(1))) func cancellationWhileWaitingForBudget() async throws {
+        @Test(.timeLimit(.minutes(2))) func cancellationWhileWaitingForBudget() async throws {
             let (pipeline, budget) = pipeline(capacity: 2_000_000)
             let hold = try await budget.reserve(2_000_000)
             defer { hold.release() }

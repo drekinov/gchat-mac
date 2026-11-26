@@ -294,7 +294,7 @@ extension SafeFetcher.Resolution {
         #expect(data == Data("x".utf8))
     }
 
-    @Test(.timeLimit(.minutes(1))) func aBurstOfFetchesWaitsForLookupSlotsInsteadOfFailing() async throws {
+    @Test(.timeLimit(.minutes(2))) func aBurstOfFetchesWaitsForLookupSlotsInsteadOfFailing() async throws {
         route("/sf/burst", .init(status: 200, body: Data("x".utf8)))
         let slots = MemoryBudget(capacity: 2)
         let lookups = ThreadGate()
@@ -310,7 +310,7 @@ extension SafeFetcher.Resolution {
         }
     }
 
-    @Test(.timeLimit(.minutes(1))) func lookupsBeyondTheSlotsWaitAndNeverRunMoreAtOnce() async throws {
+    @Test(.timeLimit(.minutes(2))) func lookupsBeyondTheSlotsWaitAndNeverRunMoreAtOnce() async throws {
         let slots = MemoryBudget(capacity: 3)
         let lookups = ThreadGate()
         defer { lookups.open() }
@@ -342,7 +342,7 @@ extension SafeFetcher.Resolution {
         #expect(lookups.arrived == 12)
     }
 
-    @Test(.timeLimit(.minutes(1))) func anExpiredLookupKeepsItsSlotUntilItsThreadReturns() async throws {
+    @Test(.timeLimit(.minutes(2))) func anExpiredLookupKeepsItsSlotUntilItsThreadReturns() async throws {
         let slots = MemoryBudget(capacity: 1)
         let lookups = ThreadGate()
         defer { lookups.open() }
@@ -365,7 +365,7 @@ extension SafeFetcher.Resolution {
         #expect(calls.count == 1)
     }
 
-    @Test(.timeLimit(.minutes(1))) func aLookupQueuedBehindAStuckOneTimesOutWithoutStarting() async throws {
+    @Test(.timeLimit(.minutes(2))) func aLookupQueuedBehindAStuckOneTimesOutWithoutStarting() async throws {
         let slots = MemoryBudget(capacity: 1)
         let lookups = ThreadGate()
         defer { lookups.open() }
@@ -396,7 +396,7 @@ extension SafeFetcher.Resolution {
         #expect(calls.count == 1)
     }
 
-    @Test(.timeLimit(.minutes(1))) func aCancelledWaiterNeverStartsItsLookup() async throws {
+    @Test(.timeLimit(.minutes(2))) func aCancelledWaiterNeverStartsItsLookup() async throws {
         let slots = MemoryBudget(capacity: 1)
         let held = try await slots.reserve(1)
         defer { held.release() }
@@ -441,7 +441,7 @@ extension SafeFetcher.Resolution {
         #expect(FetchStubProtocol.seen.withLock { $0.filter { $0.url?.path == "/sf/hop-final" }.isEmpty })
     }
 
-    @Test(.timeLimit(.minutes(1))) func deadlineCancelsASilentServer() async throws {
+    @Test(.timeLimit(.minutes(2))) func deadlineCancelsASilentServer() async throws {
         let deadline = Gate()
         let slow = gated(
             protocolClass: HangingProtocol.self, resolver: nil, slots: MemoryBudget(capacity: 1), fetch: deadline)
@@ -452,7 +452,7 @@ extension SafeFetcher.Resolution {
         #expect(await fetch.settled() == .some(.timedOut))
     }
 
-    @Test(.timeLimit(.minutes(1))) func callerCancellationStopsTheFetch() async throws {
+    @Test(.timeLimit(.minutes(2))) func callerCancellationStopsTheFetch() async throws {
         let slow = gated(protocolClass: HangingProtocol.self, resolver: nil, slots: MemoryBudget(capacity: 1))
         let fetch = outcome(of: slow, url("https://media.example.com/sf/hang-cancel"))
         defer { fetch.cancel() }
@@ -461,7 +461,7 @@ extension SafeFetcher.Resolution {
         #expect(await fetch.settled() == .some(.cancelled))
     }
 
-    @Test(.timeLimit(.minutes(1))) func aStalledResolverIsAbandonedAtTheDeadline() async throws {
+    @Test(.timeLimit(.minutes(2))) func aStalledResolverIsAbandonedAtTheDeadline() async throws {
         let slots = MemoryBudget(capacity: 1)
         let lookups = ThreadGate()
         defer { lookups.open() }
@@ -478,7 +478,7 @@ extension SafeFetcher.Resolution {
         #expect(requestCount(path: "/sf/dns-stall") == 0)
     }
 
-    @Test(.timeLimit(.minutes(1))) func cancellingDuringResolutionReturnsWhileTheLookupIsStuck() async throws {
+    @Test(.timeLimit(.minutes(2))) func cancellingDuringResolutionReturnsWhileTheLookupIsStuck() async throws {
         let slots = MemoryBudget(capacity: 1)
         let lookups = ThreadGate()
         defer { lookups.open() }

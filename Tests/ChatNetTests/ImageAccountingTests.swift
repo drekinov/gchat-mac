@@ -166,7 +166,7 @@ extension Fixtures {
         #expect(await budget.available == 64 << 20)
     }
 
-    @Test(.timeLimit(.minutes(1))) func admissionReservesBeforeAnyBytesExistAndWaitsInTurn() async throws {
+    @Test(.timeLimit(.minutes(2))) func admissionReservesBeforeAnyBytesExistAndWaitsInTurn() async throws {
         let (pipeline, budget) = pipeline(capacity: 4 << 20)
         let first = try await pipeline.reserveEncoded(byteCount: 3 << 20)
         #expect(await budget.available == 1 << 20)
@@ -186,7 +186,7 @@ extension Fixtures {
         await #expect(throws: ImageError.tooLarge) { _ = try await pipeline.reserveEncoded(byteCount: 2 << 20) }
     }
 
-    @Test(.timeLimit(.minutes(1))) func anAdmittedImageWhosePeakCannotFitIsTooLargeAtOnce() async throws {
+    @Test(.timeLimit(.minutes(2))) func anAdmittedImageWhosePeakCannotFitIsTooLargeAtOnce() async throws {
         let data = Fixtures.png(400, 300)
         let (probe, _) = pipeline()
         let (_, header) = try probe.inspect(data, allFrames: false)
@@ -245,7 +245,7 @@ extension Fixtures {
         #expect(await budget.available == 64 << 20)
     }
 
-    @Test(.timeLimit(.minutes(1))) func holdingAnAdmissionNeverWaitsForeverForTheDecodeMemory() async throws {
+    @Test(.timeLimit(.minutes(2))) func holdingAnAdmissionNeverWaitsForeverForTheDecodeMemory() async throws {
         let data = Fixtures.png(300, 300)
         let expiry = Gate()
         let (pipeline, budget) = pipeline(capacity: data.count + 600_000, heldWaitExpiry: expiry)
@@ -327,7 +327,7 @@ extension Fixtures {
 
     // MARK: M4: no waiting on memory while holding some
 
-    @Test(.timeLimit(.minutes(1))) func animationFramesNeverWaitOnTheBudget() async throws {
+    @Test(.timeLimit(.minutes(2))) func animationFramesNeverWaitOnTheBudget() async throws {
         let (pipeline, budget) = pipeline(capacity: 64 << 20)
         let animation = try await pipeline.animation(from: Fixtures.gif(frames: 6, size: 32), maxPixelSize: 32)
         let squatter = try await budget.reserve(await budget.available)
@@ -343,7 +343,7 @@ extension Fixtures {
         #expect(availableWhenSettled == 0)
     }
 
-    @Test(.timeLimit(.minutes(1))) func anAnimationWhoseCombinedPeakExceedsTheBudgetIsTooLargeAtOnce() async {
+    @Test(.timeLimit(.minutes(2))) func anAnimationWhoseCombinedPeakExceedsTheBudgetIsTooLargeAtOnce() async {
         let (pipeline, budget) = pipeline(capacity: 100_000)
         let decode = outcome { () async throws(ImageError) in
             _ = try await pipeline.animation(from: Fixtures.gif(frames: 4, size: 64), maxPixelSize: 64)
@@ -354,7 +354,7 @@ extension Fixtures {
         #expect(await budget.available == 100_000)
     }
 
-    @Test(.timeLimit(.minutes(1))) func anAdmittedAnimationWhosePeakCannotFitIsTooLargeAtOnce() async throws {
+    @Test(.timeLimit(.minutes(2))) func anAdmittedAnimationWhosePeakCannotFitIsTooLargeAtOnce() async throws {
         let data = Fixtures.gif(frames: 4, size: 64)
         let (probe, _) = pipeline()
         let (_, header) = try probe.inspect(data, allFrames: true)

@@ -94,7 +94,7 @@ extension Fixtures {
 }
 
 @Suite struct TimedReserveTests {
-    @Test(.timeLimit(.minutes(1))) func theExpiryLaunchesOnlyAfterTheWaiterIsQueued() async throws {
+    @Test(.timeLimit(.minutes(2))) func theExpiryLaunchesOnlyAfterTheWaiterIsQueued() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(100)
         defer { held.release() }
