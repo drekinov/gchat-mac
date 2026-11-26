@@ -261,13 +261,14 @@ struct MessageEditTests {
     }
 
     @Test func aRetriedFollowUpPollBringsGooglesTombstone() async throws {
-        try await EditRig.run(followUpPolls: [.seconds(3), .seconds(10)]) { rig in
+        try await EditRig.run(followUpPolls: [.seconds(3), .seconds(10), .seconds(30)]) { rig in
             let mine = rig.post("x", from: rig.alice)
             try await rig.sync()
             rig.server.fail(
                 FailureRule(route: .listSpaceEvents, times: 1, response: .http(status: 500, googleStatus: "INTERNAL")))
             try await rig.delete(mine.name)
             let local = try #require(try rig.stored(mine.name))
+            #expect(rig.eventPolls.isEmpty, "the first follow-up poll waits")
 
             await rig.world.pass(.seconds(3))
             #expect(rig.eventPolls.map(\.status) == [500])

@@ -236,10 +236,15 @@ struct IsolationTests {
             rig.server.fail(
                 .permissionDenied(route: .getSpaceReadState, account: rig.a, space: rig.spaceA, times: nil))
 
+            let messageLists: @Sendable () -> Int = {
+                world.syncRequests(of: rig.a, "GET", suffix: "/\(rig.spaceA.rawValue)/messages")
+            }
+            let listed = messageLists()
             rig.postAndAdvance("after 403", in: rig.spaceA)
 
             let synced = await rig.recA.wait(in: world, where: rig.previewShows("after 403", in: rig.spaceA))
             #expect(synced != nil, "messages stopped syncing after a read-state 403")
+            #expect(messageLists() == listed + 1, "the poll that found the activity fetched the message itself")
             let denied = rig.requests(of: rig.a).filter { $0.path.contains("spaceReadState") && $0.status == 403 }
             #expect(!denied.isEmpty, "the scripted 403 was never hit")
             let stored = try rig.sessionA.storedSpace(rig.spaceA)
@@ -265,10 +270,12 @@ struct IsolationTests {
             #expect(visible?.isHidden == false, "hidden on a 403 alone")
             #expect(rig.recA.latest?.spaces.contains { $0.name == rig.spaceA } == true)
 
-            let seen = rig.recA.history.count
+            // The next poll, at most one interval away, lists the spaces without it.
             rig.server.removeMember(rig.a, from: rig.spaceA)
-            let gone = await rig.recA.wait(in: world, since: seen) { !$0.spaces.contains { $0.name == rig.spaceA } }
-            #expect(gone != nil, "the space stayed after a complete listing no longer contained it")
+            let gone = await world.run(upTo: .seconds(15)) {
+                rig.recA.latest?.spaces.contains { $0.name == rig.spaceA } == false
+            }
+            #expect(gone, "the space stayed after a complete listing no longer contained it")
             let hidden = try rig.sessionA.storedSpace(rig.spaceA)
             #expect(hidden?.isHidden == true)
 

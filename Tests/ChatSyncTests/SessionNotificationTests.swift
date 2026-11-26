@@ -154,10 +154,11 @@ struct SessionNotificationRetryTests {
             var due = try rig.retryDeadline()
             let wait = due.interval(since: world.now)
             // The pass follows the tick's last request, so the clock stands where the timer was armed.
-            #expect(wait == Notifier.retryDelays[0], "the first retry is \(wait) away")
+            #expect(wait == .seconds(30), "the first retry is \(wait) away")
 
             // Each retry runs exactly one pass, which tries every pending message once and arms the next retry.
-            for delay in Notifier.retryDelays.dropFirst() {
+            let later: [Duration] = [.seconds(120), .seconds(600), .seconds(600)]
+            for delay in later {
                 await world.jump(to: due)
                 #expect(world.now == due, "a retry pass calls nothing")
                 let next = try rig.retryDeadline()
@@ -165,10 +166,10 @@ struct SessionNotificationRetryTests {
                 due = next
             }
             let window = rig.notifier.tracedPasses[(startup + 1)...]
-            #expect(window.count == 2)
-            for message in messages { #expect(rig.attempts(of: message, in: window) == 2) }
+            #expect(window.count == later.count)
+            for message in messages { #expect(rig.attempts(of: message, in: window) == later.count) }
             #expect(window.allSatisfy { $0.attempted.count == messages.count && $0.settled.isEmpty })
-            #expect(rig.poster.attempted.all.count == messages.count * 3)
+            #expect(rig.poster.attempted.all.count == messages.count * (1 + later.count))
             #expect(rig.poster.posted.all.isEmpty)
         }
     }

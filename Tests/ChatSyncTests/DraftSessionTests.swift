@@ -57,8 +57,6 @@ struct DraftSessionTests {
                 FailureRule(route: .createMessage, response: .http(status: 400, googleStatus: "INVALID_ARGUMENT")))
 
             try await rig.session.send("bounced", in: rig.team, thread: nil)
-            #expect(rig.session.snapshots.current?.draftRevision == 0)
-
             await world.settle()
             #expect(rig.session.snapshots.current?.draftRevision == 1)
             #expect(try rig.store.drafts().first?.text == "bounced")

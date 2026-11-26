@@ -257,9 +257,15 @@ struct OwedRaceTests {
         }
     }
 
-    @Test func anEventRecordedDuringAStaleListingKeepsItsIDs() async throws {
+    /// With a row from before the listing, the listing asks to clear that row and the event's write outdates it.
+    @Test(arguments: [false, true])
+    func anEventRecordedDuringAStaleListingKeepsItsIDs(rowBefore: Bool) async throws {
         try await SimWorld.run { world in
             let rig = try await OwedRaceRig(world)
+            let early = [MessageName(unchecked: "\(rig.team.rawValue)/messages/early")]
+            if rowBefore {
+                _ = try rig.record([.messagesCreated(space: rig.team, messages: early, time: rig.server.now)])
+            }
             rig.server.removeMember(rig.alice, from: rig.team)
             let listing = try await rig.held { () async throws(SyncError) in
                 _ = try await rig.engine.syncSpaces(rig.generation)
@@ -270,21 +276,25 @@ struct OwedRaceTests {
 
             #expect(try rig.store.space(rig.team)?.isHidden == true)
             let kept = try #require(try rig.owed(), "the listing predates the event")
-            #expect(kept.messages(in: rig.team) == late)
+            #expect(kept.messages(in: rig.team) == (rowBefore ? early : []) + late)
             #expect(kept.omitted == 0, "an omission seen before the event doesn't apply to it")
         }
     }
 
-    @Test func anEventArrivingMidListingKeepsItsRelistRequest() async throws {
+    /// With a request from before the listing, the listing resolves that one and the event's stays pending.
+    @Test(arguments: [false, true])
+    func anEventArrivingMidListingKeepsItsRelistRequest(pendingBefore: Bool) async throws {
         try await SimWorld.run { world in
             let rig = try await OwedRaceRig(world)
+            if pendingBefore { _ = try rig.record([.membershipCreated(space: rig.team, time: rig.server.now)]) }
             let listing = try await rig.held { () async throws(SyncError) in
                 _ = try await rig.engine.syncSpaces(rig.generation)
             }
             _ = try rig.record([.membershipCreated(space: rig.team, time: rig.server.now)])
             try await rig.finish(listing)
 
-            #expect(try rig.store.relist() == RelistRecord(requested: 1, resolved: 0))
+            let before: UInt64 = pendingBefore ? 1 : 0
+            #expect(try rig.store.relist() == RelistRecord(requested: before + 1, resolved: before))
             _ = try await rig.engine.syncSpaces(rig.generation)
             #expect(try !rig.store.relist().isPending)
         }
