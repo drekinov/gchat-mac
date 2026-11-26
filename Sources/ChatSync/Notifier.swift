@@ -39,6 +39,14 @@ struct NotifierContext: Sendable, Equatable {
     var appIsActive: Bool
 }
 
+/// Test seam: what one `Notifier.process` call found pending, removed from the records, and tried to post.
+struct NotifyPassTrace: Sendable, Equatable {
+    var pending: [SpaceName: [MessageName]] = [:]
+    var settled: [SpaceName: [MessageName]] = [:]
+    /// Identifiers in attempt order: a message's name, or a summary's own identifier.
+    var attempted: [String] = []
+}
+
 struct NotifyPass: Sendable, Equatable {
     /// A post failed and stays pending.
     var retry = false
@@ -66,6 +74,7 @@ final class Notifier: Sendable {
     let poster: any NotificationPoster
     let clock: any SyncClock
     private let removed = Mutex(Set<MessageName>())
+    private let passTrace = Mutex<[NotifyPassTrace]?>(nil)
 
     init(
         account: AccountID, store: any AccountStore, gate: SessionGate, me: UserName,
@@ -78,6 +87,11 @@ final class Notifier: Sendable {
         self.poster = poster
         self.clock = clock
     }
+
+    /// Test seam: from now on every pass appends a `NotifyPassTrace`.
+    func tracePasses() { passTrace.withLock { $0 = $0 ?? [] } }
+
+    var tracedPasses: [NotifyPassTrace] { passTrace.withLock { $0 ?? [] } }
 
     private struct Settled {
         var messages: [MessageName] = []
@@ -95,6 +109,9 @@ final class Notifier: Sendable {
         var pass = NotifyPass()
         var posts = 0
         let records = (try? store.notifyRecords()) ?? [:]
+        var trace: NotifyPassTrace? = passTrace.withLock { $0 == nil } ? nil : NotifyPassTrace()
+        defer { if let trace { passTrace.withLock { $0?.append(trace) } } }
+        trace?.pending = Dictionary(uniqueKeysWithValues: records.map { ($0.key, $0.value.messages(in: $0.key)) })
         for (space, record) in records.sorted(by: { $0.key < $1.key }) {
             guard gate.isCurrent(generation), !Task.isCancelled else { return pass }
             guard posts < Self.maxPerPass else {
@@ -103,7 +120,8 @@ final class Notifier: Sendable {
             }
             guard
                 let settled = await post(
-                    record, in: space, generation: generation, context: context, posts: &posts, pass: &pass)
+                    record, in: space, generation: generation, context: context, posts: &posts, pass: &pass,
+                    trace: &trace)
             else {
                 continue
             }
@@ -119,6 +137,7 @@ final class Notifier: Sendable {
             } catch {
                 return pass
             }
+            trace?.settled[space] = settled.messages
             pass.settled = true
         }
 
@@ -132,7 +151,7 @@ final class Notifier: Sendable {
     /// Returns what to remove from the record, or `nil` when the space can't be read this pass.
     private func post(
         _ record: NotifyRecord, in space: SpaceName, generation: Generation, context: NotifierContext,
-        posts: inout Int, pass: inout NotifyPass
+        posts: inout Int, pass: inout NotifyPass, trace: inout NotifyPassTrace?
     ) async -> Settled? {
         let all = record.messages(in: space)
         var settled = Settled()
@@ -163,7 +182,9 @@ final class Notifier: Sendable {
         let count = record.overflow + folded.count
         if count > 0 || record.gap {
             guard gate.isCurrent(generation), !Task.isCancelled else { return settled }
-            switch await poster.post(summary(stored, count: count)) {
+            let request = summary(stored, count: count)
+            trace?.attempted.append(request.identifier)
+            switch await poster.post(request) {
             case .accepted, .suppressed:
                 posts += 1
                 settled.messages += folded
@@ -179,6 +200,7 @@ final class Notifier: Sendable {
                 pass.more = true
                 break
             }
+            trace?.attempted.append(message.name.rawValue)
             switch await poster.post(single(message, in: stored)) {
             case .accepted:
                 posts += 1

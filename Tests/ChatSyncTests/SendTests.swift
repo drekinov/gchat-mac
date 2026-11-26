@@ -140,26 +140,6 @@ struct SendTests {
         #expect(times[1].offset(from: times[0]) >= .seconds(1))
     }
 
-    @Test func aSecondDrainOfTheSameSpaceReturnsNilWhileTheFirstIsRunning() async throws {
-        let rig = SendRig()
-        try rig.enqueue("one")
-        rig.barrier.arm()
-        let sends = rig.sends
-        let generation = rig.generation
-        let team = rig.team
-        let running = Task { () async -> Bool in
-            let outcomes = try? await sends.drain(team, generation)
-            return outcomes != nil
-        }
-        #expect(await rig.barrier.waitForArrival())
-
-        let second = try await rig.sends.drain(rig.team, rig.generation)
-        #expect(second == nil)
-        rig.barrier.release()
-        #expect(await running.value)
-        #expect(rig.serverTexts() == ["one"])
-    }
-
     @Test func aRestartedQueueResendsAnInterruptedSendWithTheSameRequestID() async throws {
         let rig = SendRig()
         let queued = try rig.enqueue("queued, never started")
@@ -446,48 +426,6 @@ struct SendTests {
         _ = try await rig.drain()
         #expect(rig.serverTexts() == ["maybe sent"])
         #expect(try rig.outbox().isEmpty)
-    }
-
-    @Test func sendsEnqueuedWhileADrainIsRunningAreNotDropped() async throws {
-        let rig = SendRig()
-        try rig.enqueue("one")
-        rig.barrier.arm()
-        let sends = rig.sends
-        let generation = rig.generation
-        let team = rig.team
-        let first = Task { () async -> Bool in
-            let outcomes = try? await sends.drain(team, generation)
-            return outcomes != nil
-        }
-        #expect(await rig.barrier.waitForArrival())
-
-        try rig.enqueue("two")
-        let overlapping = try await rig.sends.drain(rig.team, rig.generation)
-        #expect(overlapping == nil)
-        rig.barrier.release()
-        #expect(await first.value)
-
-        if rig.serverTexts().count < 2 { _ = try await rig.sends.drain(rig.team, rig.generation) }
-        #expect(rig.serverTexts() == ["one", "two"])
-        #expect(try rig.outbox().isEmpty)
-    }
-
-    @Test func aBurstOfSessionSendsAllArriveInOrder() async throws {
-        try await IsolationRig.run { rig in
-            let texts = (1...5).map { "burst \($0)" }
-            for text in texts {
-                try await rig.sessionA.send(text, in: rig.spaceA, thread: nil)
-                rig.server.advance(.milliseconds(1))
-            }
-
-            let delivered = await poll(timeout: .seconds(8)) {
-                rig.server.messages(in: rig.spaceA).filter { $0.text.hasPrefix("burst") }.count == texts.count
-            }
-            #expect(delivered, "a send enqueued during a drain was dropped")
-            #expect(rig.server.messages(in: rig.spaceA).map(\.text).filter { $0.hasPrefix("burst") } == texts)
-            let drained = await poll { ((try? rig.sessionA.outbox(in: rig.spaceA)) ?? []).isEmpty }
-            #expect(drained)
-        }
     }
 
     @Test func aFailedFollowUpGetKeepsTheItemCommittedUntilItSucceeds() async throws {

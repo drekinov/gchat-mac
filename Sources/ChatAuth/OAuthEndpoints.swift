@@ -28,6 +28,14 @@ public struct OAuthEndpoints: Sendable {
     let client: OAuthClientConfig
     let clock: @Sendable () -> Timestamp
     let revokeDeadline: Duration
+    /// Waits out the revoke deadline; a test seam.
+    var sleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    /// Reports which side ended a revoke; a test seam.
+    var onRevokeOutcome: @Sendable (RevokeOutcome) -> Void = { _ in }
+
+    enum RevokeOutcome: Sendable, Equatable {
+        case response, deadline
+    }
 
     public init(
         transport: any HTTPTransport, client: OAuthClientConfig,
@@ -96,16 +104,26 @@ public struct OAuthEndpoints: Sendable {
             timeout: Self.revokeDeadline, maxResponseBytes: 64 * 1024)
         let transport = transport
         let deadline = revokeDeadline
+        let sleep = sleep
+        let report = onRevokeOutcome
+        // Unstructured, so a transport that ignores cancellation can't hold revoke past the deadline.
         let send = Task { _ = try? await transport.send(request) }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let once = RevokeOnce()
-            Task {
-                await send.value
-                if once.claim() { continuation.resume() }
+            // The timer claims the race the moment its sleep ends, with no hop in which a late response could win.
+            let timer = Task {
+                do { try await sleep(deadline) } catch { return }
+                if once.claim() {
+                    report(.deadline)
+                    continuation.resume()
+                }
             }
             Task {
-                try? await Task.sleep(for: deadline)
-                if once.claim() { continuation.resume() }
+                await send.value
+                guard once.claim() else { return }
+                timer.cancel()
+                report(.response)
+                continuation.resume()
             }
         }
         send.cancel()

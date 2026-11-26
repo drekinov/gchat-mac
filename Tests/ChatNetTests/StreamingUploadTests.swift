@@ -518,7 +518,7 @@ final class LoopbackSink: @unchecked Sendable {
             prefix: Data("PRE".utf8), file: opened, identity: opened.identity, suffix: Data("SUF".utf8))
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/upload")!)
         request.httpMethod = "POST"
-        request.timeoutInterval = 10
+        request.timeoutInterval = TimeInterval(hangGuard.components.seconds)
         request.setValue(String(stream.totalLength), forHTTPHeaderField: "Content-Length")
         request.httpBodyStream = stream
         let session = URLSession(configuration: .ephemeral)

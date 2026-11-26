@@ -42,8 +42,17 @@ public final class WorkRegistry: Sendable {
     }
 
     private let state = Mutex(State())
+    /// Where this registry's tasks prefer to run; nil leaves them on the default executor.
+    let executor: (any TaskExecutor)?
 
-    public init() {}
+    public init(executor: (any TaskExecutor)? = nil) {
+        self.executor = executor
+    }
+
+    /// A task on the registry's executor that the registry doesn't own: logout neither cancels nor awaits it.
+    func unowned<Success: Sendable>(_ body: @escaping @Sendable () async -> Success) -> Task<Success, Never> {
+        if let executor { Task(executorPreference: executor) { await body() } } else { Task { await body() } }
+    }
 
     /// Starts `body` as a registered task; returns `false` (and runs nothing) once the registry is closed.
     @discardableResult
@@ -56,7 +65,7 @@ public final class WorkRegistry: Sendable {
         let id = UUID()
         return state.withLock { state in
             guard !state.closed else { return nil }
-            let task = Task { [weak self] in
+            let task = unowned { [weak self] in
                 await body()
                 self?.remove(id)
             }
@@ -82,13 +91,15 @@ public final class WorkRegistry: Sendable {
         // Unstructured on purpose: a structured group would wait for tasks that ignore cancellation.
         return await withCheckedContinuation { continuation in
             let once = Once()
-            Task {
-                for task in tasks { await task.value }
-                if once.claim() { continuation.resume(returning: true) }
-            }
-            Task {
+            let timer = unowned {
                 try? await clock.sleep(for: timeout)
                 if once.claim() { continuation.resume(returning: false) }
+            }
+            _ = unowned {
+                for task in tasks { await task.value }
+                guard once.claim() else { return }
+                timer.cancel()
+                continuation.resume(returning: true)
             }
         }
     }

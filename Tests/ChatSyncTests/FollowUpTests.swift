@@ -12,42 +12,62 @@ import Testing
 struct FollowUpTests {
     // R1: the production eraser removes the registry entry, and a restart doesn't bring the account back.
     @Test func logoutThroughTheManagerRemovesThePersistedRecord() async throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: "gchat-followup-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
-        let secrets = InMemorySecretStore()
-        let registry = AccountRegistry(secrets: secrets)
-        let tombstones = LogoutTombstones(root: root)
-        let credential: @Sendable (AccountID) -> SecretID = {
-            SecretID(service: "test.credentials", account: $0.description)
+        try await SimWorld.run { world in
+            let scratch = ScratchDirectory()
+            let root = scratch.url
+            let secrets = InMemorySecretStore()
+            let registry = AccountRegistry(secrets: secrets)
+            let tombstones = LogoutTombstones(root: root)
+            let credential: @Sendable (AccountID) -> SecretID = {
+                SecretID(service: "test.credentials", account: $0.description)
+            }
+            let eraser = LocalAccountEraser(
+                root: root, secrets: secrets, registry: registry, credentialID: credential,
+                notificationRemover: { _ in })
+            let runner = LogoutRunner(eraser: eraser, tombstones: tombstones)
+            let server = world.server
+            let fake = server.addAccount(displayName: "Alice")
+            let space = server.addSpace(.space, displayName: "Team", members: [fake])
+            let built = Recorder<AccountID>()
+            let factory: AccountManager.SessionFactory = { record in
+                built.append(record.id)
+                let session = AccountSession(
+                    account: record.id, me: record.me,
+                    api: GoogleChatClient(transport: world.transport(), tokens: StaticTokens(token: fake.token)),
+                    store: InMemoryAccountStore(), clock: world.clock(), logoutRunner: runner, timing: .lifecycle,
+                    executor: world.executor)
+                world.lifecycleRetireAtTeardown(session)
+                return session
+            }
+            let record = AccountRecord(email: "a@example.com", displayName: "Alice", me: fake.user.name)
+            try secrets.write(Data("refresh".utf8), for: credential(record.id))
+
+            let manager = AccountManager(
+                registry: registry, recovery: LogoutRecovery(runner: runner), tombstones: tombstones,
+                factory: factory)
+            let session = try await manager.add(record)
+            #expect(try registry.load().map(\.id) == [record.id])
+            #expect(await world.run { await session.status == .ok })
+            #expect(session.snapshots.current?.spaces.map(\.name) == [space], "the session was running")
+
+            let start = world.now
+            let report = try await world.lifecyclePerform { try await manager.logout(record.id, refreshToken: nil) }
+            #expect(report.failedSteps.isEmpty)
+            #expect(report.drained)
+            #expect(world.now == start)
+            #expect(try registry.load().isEmpty)
+            #expect(try secrets.read(credential(record.id)) == nil)
+            #expect(try tombstones.pending().isEmpty)
+            #expect(await manager.session(record.id) == nil)
+            #expect(await manager.records.isEmpty)
+
+            let restarted = AccountManager(
+                registry: registry, recovery: LogoutRecovery(runner: runner), tombstones: tombstones,
+                factory: factory)
+            #expect(try await restarted.startup().restored.isEmpty)
+            #expect(built.all == [record.id], "the restart built a session for the removed account")
+            #expect(world.sleeperDeadlines.isEmpty)
         }
-        let eraser = LocalAccountEraser(
-            root: root, secrets: secrets, registry: registry, credentialID: credential, notificationRemover: { _ in })
-        let runner = LogoutRunner(eraser: eraser, tombstones: tombstones)
-        let server = FakeChatServer()
-        let fake = server.addAccount(displayName: "Alice")
-        let factory: AccountManager.SessionFactory = { record in
-            AccountSession(
-                account: record.id, me: record.me,
-                api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: fake.token)),
-                store: InMemoryAccountStore(), clock: ServerClock(server: server), logoutRunner: runner)
-        }
-        let record = AccountRecord(email: "a@example.com", displayName: "Alice", me: fake.user.name)
-        try secrets.write(Data("refresh".utf8), for: credential(record.id))
-
-        let manager = AccountManager(
-            registry: registry, recovery: LogoutRecovery(runner: runner), tombstones: tombstones, factory: factory)
-        _ = try await manager.add(record)
-        #expect(try registry.load().map(\.id) == [record.id])
-
-        let report = try await manager.logout(record.id, refreshToken: nil)
-        #expect(report.failedSteps.isEmpty)
-        #expect(try registry.load().isEmpty)
-        #expect(try secrets.read(credential(record.id)) == nil)
-        #expect(try tombstones.pending().isEmpty)
-
-        let restarted = AccountManager(
-            registry: registry, recovery: LogoutRecovery(runner: runner), tombstones: tombstones, factory: factory)
-        #expect(try await restarted.startup().restored.isEmpty)
     }
 
     // R2: an unreadable ancestor fails closed instead of looking like "no pending logouts".

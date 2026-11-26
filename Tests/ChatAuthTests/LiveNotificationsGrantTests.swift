@@ -14,10 +14,13 @@ extension OAuthNetworkTests {
         var fake: FakeGoogleOAuth { harness.fake }
         var vault: CredentialVault { CredentialVault(secrets: store) }
 
-        func flow() -> SignInFlow {
-            SignInFlow(
-                endpoints: harness.endpoints, browser: TestBrowser(fake: fake, behavior: .approve), timeout: .seconds(5)
-            )
+        /// A flow that takes no time of its own: no timeout and no header deadline can end it.
+        func flow(_ browser: TestBrowser? = nil) -> SignInFlow {
+            var flow = SignInFlow(
+                endpoints: harness.endpoints, browser: browser ?? TestBrowser(fake: fake, behavior: .approve))
+            flow.sleep = ManualTimeout().sleep
+            flow.headerTimer = { _ in }
+            return flow
         }
 
         func seedOld() throws -> StoredCredentials {
@@ -30,8 +33,13 @@ extension OAuthNetworkTests {
 
         /// What the app does: the new credentials are written only when the grant verified.
         func grant(as account: UserName? = nil) async -> Result<SignInResult, AuthError> {
+            let flow = flow()
+            let account = account ?? me
+            let granted = await settle { () async throws(AuthError) in
+                try await flow.grantLiveNotifications(account: account, loginHint: nil)
+            }
             do {
-                let result = try await flow().grantLiveNotifications(account: account ?? me, loginHint: nil)
+                let result = try granted.get()
                 try vault.saveInitial(result.credentials, for: self.account)
                 return .success(result)
             } catch {
@@ -47,9 +55,7 @@ extension OAuthNetworkTests {
 
         @Test func ordinarySignInNeverAsksForPubSub() async throws {
             let browser = TestBrowser(fake: fake, behavior: .approve)
-            let result = try await runSignIn(
-                SignInFlow(endpoints: harness.endpoints, browser: browser, timeout: .seconds(5))
-            ).get()
+            let result = try await runSignIn(flow(browser)).get()
             #expect(!requestedScopes(browser.urls.first).contains(OAuthScopes.pubsub))
             #expect(!OAuthScopes.hasPubSub(result.credentials.grantedScope))
             #expect(!OAuthScopes.required.contains(OAuthScopes.pubsub))
@@ -58,8 +64,11 @@ extension OAuthNetworkTests {
 
         @Test func theGrantIsAFreshConsentForTheWholeSetPlusPubSub() async throws {
             let browser = TestBrowser(fake: fake, behavior: .approve)
-            _ = try await SignInFlow(endpoints: harness.endpoints, browser: browser, timeout: .seconds(5))
-                .grantLiveNotifications(account: me, loginHint: "ada@example.com")
+            let flow = flow(browser)
+            let me = me
+            _ = try await settle { () async throws(AuthError) in
+                try await flow.grantLiveNotifications(account: me, loginHint: "ada@example.com")
+            }.get()
             let url = try #require(browser.urls.first)
             let query = percentDecodedForm(
                 URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery ?? "")

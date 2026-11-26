@@ -198,9 +198,16 @@ extension OAuthNetworkTests {
             #expect(detail.contains("offline"))
         }
 
-        @Test func revokeMarksTheTokenRevoked() async {
+        /// Revokes through `endpoints` in its own task; false if the call never returned.
+        func revoked(_ token: String, by endpoints: OAuthEndpoints) async -> Bool {
+            let revoke = Recorded { await endpoints.revoke(token) }
+            defer { revoke.cancel() }
+            return await revoke.settled() != nil
+        }
+
+        @Test func revokeMarksTheTokenRevoked() async throws {
             let token = fake.seedRefreshToken()
-            await endpoints.revoke(token)
+            try #require(await revoked(token, by: endpoints), "revoke never returned")
             #expect(fake.isRevoked(token))
             let request = fake.revokeRequests.first
             #expect(request?.method == "POST")
@@ -208,11 +215,12 @@ extension OAuthNetworkTests {
             #expect(request?.host == "oauth2.googleapis.com")
         }
 
-        @Test func revokeSwallowsFailures() async {
-            await endpoints.revoke("unknown-token")
-            let offline = OAuthEndpoints(
+        @Test func revokeSwallowsFailures() async throws {
+            try #require(await revoked("unknown-token", by: endpoints), "revoke never returned")
+            var offline = OAuthEndpoints(
                 transport: AuthTransport(allowedHosts: []), client: fake.client, clock: harness.clock.reader)
-            await offline.revoke("anything")
+            offline.sleep = OAuthHarness.untilCancelled
+            try #require(await revoked("anything", by: offline), "revoke never returned")
             #expect(fake.revokeRequests.count == 1)
         }
 

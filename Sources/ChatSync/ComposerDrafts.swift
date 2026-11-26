@@ -59,17 +59,28 @@ public final class ComposerDrafts {
     @ObservationIgnored private let storage: @MainActor () -> (any DraftStorage)?
     @ObservationIgnored private let adopt: @MainActor ([PendingAttachment]) -> [PendingAttachment]
     @ObservationIgnored private let saveDelay: Duration
+    @ObservationIgnored private let sleep: @Sendable (Duration) async throws -> Void
 
     /// `storage` is resolved for every operation, so a reconnected session takes over. `adopt` fixes up stored
     /// attachments as they load (dropping missing copies, moving old ones to durable storage).
-    public init(
+    public convenience init(
         saveDelay: Duration = .milliseconds(600),
         adopt: @escaping @MainActor ([PendingAttachment]) -> [PendingAttachment] = { $0 },
         storage: @escaping @MainActor () -> (any DraftStorage)?
     ) {
+        self.init(saveDelay: saveDelay, adopt: adopt, storage: storage, sleep: { try await Task.sleep(for: $0) })
+    }
+
+    /// `sleep` waits out the pause after typing and throws when its task is cancelled.
+    init(
+        saveDelay: Duration, adopt: @escaping @MainActor ([PendingAttachment]) -> [PendingAttachment],
+        storage: @escaping @MainActor () -> (any DraftStorage)?,
+        sleep: @escaping @Sendable (Duration) async throws -> Void
+    ) {
         self.saveDelay = saveDelay
         self.adopt = adopt
         self.storage = storage
+        self.sleep = sleep
     }
 
     public func draft(_ key: DraftKey) -> ComposerDraft {
@@ -120,8 +131,8 @@ public final class ComposerDrafts {
         entry.text = text
         entry.changed()
         entry.debounce?.cancel()
-        entry.debounce = Task { [weak self, saveDelay] in
-            try? await Task.sleep(for: saveDelay)
+        entry.debounce = Task { [weak self, saveDelay, sleep] in
+            do { try await sleep(saveDelay) } catch { return }
             guard !Task.isCancelled, let self else { return }
             self.enqueue { await self.save(key, entry) }
         }

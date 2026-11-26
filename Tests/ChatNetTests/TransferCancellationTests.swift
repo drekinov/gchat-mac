@@ -12,22 +12,8 @@ import Testing
         DownloadStubProtocol.routes.withLock { $0["/cx/ok"] = .init(status: 200, body: Data("ok".utf8)) }
     }
 
-    /// Returns nil if the task didn't finish within `seconds`.
-    func finish(_ task: Task<TransportError?, Never>, within seconds: Double = 5) async -> TransportError?? {
-        await withTaskGroup(of: TransportError??.self) { group in
-            group.addTask { .some(await task.value) }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(seconds))
-                return .none
-            }
-            let first = await group.next()!
-            group.cancelAll()
-            return first
-        }
-    }
-
-    func send(stream: Bool) -> Task<TransportError?, Never> {
-        Task { [transport, url] () -> TransportError? in
+    func send(stream: Bool) -> Recorded<TransportError?> {
+        Recorded { [transport, url] () -> TransportError? in
             do throws(TransportError) {
                 if stream {
                     _ = try await transport.stream(HTTPRequest(url: url)) { _ in }
@@ -42,30 +28,29 @@ import Testing
     }
 
     @Test(arguments: [false, true])
-    func cancellingImmediatelyAlwaysCompletes(stream: Bool) async {
+    func cancellingImmediatelyAlwaysCompletes(stream: Bool) async throws {
         for _ in 0..<300 {
-            let task = send(stream: stream)
-            task.cancel()
-            let outcome = await finish(task)
-            #expect(outcome != nil, "request never completed after cancel")
-            if let error = outcome ?? nil { #expect(error == .cancelled) }
+            let request = send(stream: stream)
+            request.cancel()
+            let outcome = try #require(await request.settled(), "request never completed after cancel")
+            if let error = outcome { #expect(error == .cancelled) }
         }
     }
 
     @Test(arguments: [false, true])
-    func cancellingAtRandomPointsAlwaysCompletes(stream: Bool) async {
+    func cancellingAtRandomPointsAlwaysCompletes(stream: Bool) async throws {
         for round in 0..<300 {
-            let task = send(stream: stream)
+            let request = send(stream: stream)
             for _ in 0..<(round % 7) { await Task.yield() }
-            task.cancel()
-            #expect(await finish(task) != nil, "request never completed after cancel")
+            request.cancel()
+            _ = try #require(await request.settled(), "request never completed after cancel")
         }
     }
 
     @Test func alreadyCancelledCallerNeverStartsARequest() async {
         DownloadStubProtocol.routes.withLock { $0["/cx/never"] = .init(status: 200, body: Data("ok".utf8)) }
         let never = URL(string: "https://chat.googleapis.com/cx/never")!
-        let task = Task { () -> TransportError? in
+        let request = Recorded { [transport] () -> TransportError? in
             withUnsafeCurrentTask { $0?.cancel() }
             do throws(TransportError) {
                 _ = try await transport.send(HTTPRequest(url: never))
@@ -74,7 +59,7 @@ import Testing
                 return error
             }
         }
-        #expect(await finish(task) == .some(.cancelled))
+        #expect(await request.settled() == .some(.cancelled))
         #expect(!DownloadStubProtocol.seen.withLock { $0.contains { $0.url?.path == "/cx/never" } })
     }
 

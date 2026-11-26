@@ -32,7 +32,6 @@ extension AccountSession {
             notifyForced = false
             let context = NotifierContext(focusedSpace: focused, appIsActive: appActive)
             let pass = await notifier.process(spaces: batch, generation: generation, context: context)
-            notifyPasses &+= 1
             retry = pass.retry
             if pass.more, pass.settled { notifyForced = true }
         }

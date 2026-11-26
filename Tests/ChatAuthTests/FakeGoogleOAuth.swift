@@ -1,4 +1,3 @@
-import ChatAuth
 import ChatModel
 import ChatNet
 import CryptoKit
@@ -6,6 +5,8 @@ import Foundation
 import GoogleChat
 import Synchronization
 import Testing
+
+@testable import ChatAuth
 
 @Suite(.serialized) enum OAuthNetworkTests {}
 
@@ -21,24 +22,6 @@ final class TestClock: Sendable {
     }
 
     var reader: @Sendable () -> Timestamp { { self.now } }
-}
-
-func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now + timeout
-    while ContinuousClock.now < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(5))
-    }
-    return condition()
-}
-
-func eventuallyAsync(timeout: Duration = .seconds(5), _ condition: () async -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now + timeout
-    while ContinuousClock.now < deadline {
-        if await condition() { return true }
-        try? await Task.sleep(for: .milliseconds(5))
-    }
-    return await condition()
 }
 
 func percentDecodedForm(_ text: String) -> [String: String] {
@@ -74,7 +57,6 @@ final class FakeGoogleOAuth: Sendable {
     }
 
     struct Settings: Sendable {
-        var latency: Duration = .zero
         var rotateRefreshTokens = false
         var scopeOverride: String?
         var omitScopeOnRefresh = false
@@ -127,8 +109,8 @@ final class FakeGoogleOAuth: Sendable {
         var tokenScripts: [(grant: Grant?, reply: Reply)] = []
         var userinfoScripts: [Reply] = []
         var counter = 0
-        var holdingTokens = false
-        var parked: [@Sendable () -> Void] = []
+        var holding: Set<String> = []
+        var parked: [String: [@Sendable () -> Void]] = [:]
     }
 
     let clientID: String
@@ -153,27 +135,30 @@ final class FakeGoogleOAuth: Sendable {
         }
     }
 
-    /// Parks `/token` responses until `releaseTokens()`, so a test can act while a refresh is in flight.
-    func holdTokens() {
-        state.withLock { $0.holdingTokens = true }
+    /// Parks responses to `path` until `release(path)`, so a test can act while a request is in flight.
+    func hold(_ path: String) {
+        state.withLock { _ = $0.holding.insert(path) }
     }
 
-    /// Delivers every parked `/token` response and stops holding new ones.
-    func releaseTokens() {
+    /// Delivers every parked response to `path` and stops holding new ones.
+    func release(_ path: String) {
         let parked = state.withLock { state in
-            state.holdingTokens = false
-            defer { state.parked = [] }
-            return state.parked
+            state.holding.remove(path)
+            return state.parked.removeValue(forKey: path) ?? []
         }
         for deliver in parked { deliver() }
     }
 
-    var parkedTokenResponses: Int { state.withLock { $0.parked.count } }
+    func parkedResponses(_ path: String) -> Int { state.withLock { $0.parked[path]?.count ?? 0 } }
+
+    func holdTokens() { hold("/token") }
+    func releaseTokens() { release("/token") }
+    var parkedTokenResponses: Int { parkedResponses("/token") }
 
     func park(path: String, _ deliver: @escaping @Sendable () -> Void) -> Bool {
         state.withLock { state in
-            guard state.holdingTokens, path == "/token" else { return false }
-            state.parked.append(deliver)
+            guard state.holding.contains(path) else { return false }
+            state.parked[path, default: []].append(deliver)
             return true
         }
     }
@@ -243,7 +228,6 @@ final class FakeGoogleOAuth: Sendable {
             case failure(URLError.Code)
         }
         var outcome: Outcome
-        var delay: Duration
     }
 
     func handle(method: String, url: URL, headers: [String: String], body: Data) -> Planned {
@@ -252,17 +236,15 @@ final class FakeGoogleOAuth: Sendable {
         let host = url.host()?.lowercased() ?? ""
         return state.withLock { state in
             state.seen.append(Seen(method: method, host: host, path: url.path, headers: lowered, form: form))
-            let latency = state.settings.latency
             switch (method, host, url.path) {
             case ("POST", "oauth2.googleapis.com", "/token"):
-                return Planned(
-                    outcome: Self.token(&state, form: form, clientID: clientID, secret: clientSecret), delay: latency)
+                return Planned(outcome: Self.token(&state, form: form, clientID: clientID, secret: clientSecret))
             case ("POST", "oauth2.googleapis.com", "/revoke"):
-                return Planned(outcome: Self.revoke(&state, form: form), delay: .zero)
+                return Planned(outcome: Self.revoke(&state, form: form))
             case ("GET", "openidconnect.googleapis.com", "/v1/userinfo"):
-                return Planned(outcome: Self.userinfo(&state, headers: lowered), delay: .zero)
+                return Planned(outcome: Self.userinfo(&state, headers: lowered))
             default:
-                return Planned(outcome: Self.json(404, ["error": "not_found"]), delay: .zero)
+                return Planned(outcome: Self.json(404, ["error": "not_found"]))
             }
         }
     }
@@ -408,13 +390,7 @@ final class FakeGoogleOAuthProtocol: URLProtocol, @unchecked Sendable {
             }
         }
         if fake.park(path: url.path, deliver) { return }
-        if plan.delay > .zero {
-            let (seconds, attoseconds) = plan.delay.components
-            let interval = Double(seconds) + Double(attoseconds) / 1e18
-            DispatchQueue.global().asyncAfter(deadline: .now() + interval, execute: deliver)
-        } else {
-            deliver()
-        }
+        deliver()
     }
 
     override func stopLoading() {
@@ -448,8 +424,13 @@ struct OAuthHarness {
         self.clock = clock
         transport = AuthTransport(
             allowedHosts: AuthTransport.googleHosts, protocolClasses: [FakeGoogleOAuthProtocol.self])
-        endpoints = OAuthEndpoints(transport: transport, client: fake.client, clock: clock.reader)
+        var endpoints = OAuthEndpoints(transport: transport, client: fake.client, clock: clock.reader)
+        endpoints.sleep = Self.untilCancelled
+        self.endpoints = endpoints
     }
+
+    /// A revoke deadline that never arrives, so the fake's answer is the only thing that ends a revoke.
+    static let untilCancelled: @Sendable (Duration) async throws -> Void = { _ in try await Gate().wait() }
 }
 
 final class TestBrowser: BrowserOpener {
@@ -482,7 +463,7 @@ final class TestBrowser: BrowserOpener {
         self.fake = fake
         self.behavior = behavior
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForRequest = TimeInterval(hangGuard.components.seconds)
         session = URLSession(configuration: configuration)
     }
 
@@ -555,8 +536,22 @@ final class TestBrowser: BrowserOpener {
     }
 }
 
+/// What `operation` returned or threw, from its own task. One that never ends is recorded as an issue and
+/// reported as cancelled, so a flow that loses its callback fails its test instead of hanging it.
+func settle<Value: Sendable>(
+    _ operation: @escaping @Sendable () async throws(AuthError) -> Value
+) async -> Result<Value, AuthError> {
+    let run = Recorded { () async -> Result<Value, AuthError> in
+        do throws(AuthError) { return .success(try await operation()) } catch { return .failure(error) }
+    }
+    defer { run.cancel() }
+    if let result = await run.settled() { return result }
+    Issue.record("the operation never finished")
+    return .failure(.cancelled)
+}
+
 func runSignIn(_ flow: SignInFlow, loginHint: String? = nil) async -> Result<SignInResult, AuthError> {
-    do { return .success(try await flow.run(loginHint: loginHint)) } catch { return .failure(error) }
+    await settle { () async throws(AuthError) in try await flow.run(loginHint: loginHint) }
 }
 
 func fetchToken(_ provider: OAuthTokenProvider) async -> Result<String, ChatAPIError> {

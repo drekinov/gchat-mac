@@ -5,10 +5,91 @@ import Testing
 @testable import ChatNet
 
 final class HangingProtocol: URLProtocol, @unchecked Sendable {
+    /// The request timeout each started path carried.
+    static let started = Mutex<[String: TimeInterval]>([:])
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func startLoading() {}
+    override func startLoading() {
+        let path = request.url?.path ?? ""
+        Self.started.withLock { $0[path] = request.timeoutInterval }
+    }
     override func stopLoading() {}
+}
+
+/// Opens once; any number of tasks can wait before or after. A waiter whose task is cancelled throws.
+final class Gate: Sendable {
+    private struct State {
+        var open = false
+        var nextID = 0
+        var waiters: [Int: CheckedContinuation<Void, any Error>] = [:]
+    }
+
+    private let state = Mutex(State())
+
+    var waiting: Int { state.withLock { $0.waiters.count } }
+
+    func open() {
+        let waiters = state.withLock { state in
+            state.open = true
+            defer { state.waiters = [:] }
+            return Array(state.waiters.values)
+        }
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func wait() async throws {
+        let id = state.withLock { state in
+            state.nextID += 1
+            return state.nextID
+        }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                let result: Result<Void, any Error>? = state.withLock { state in
+                    if state.open { return .success(()) }
+                    if Task.isCancelled { return .failure(CancellationError()) }
+                    state.waiters[id] = continuation
+                    return nil
+                }
+                if let result { continuation.resume(with: result) }
+            }
+        } onCancel: {
+            state.withLock { $0.waiters.removeValue(forKey: id) }?.resume(throwing: CancellationError())
+        }
+    }
+}
+
+/// Blocks resolver threads until opened, and counts the ones that have arrived.
+final class ThreadGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var isOpen = false
+    private var arrivals = 0
+
+    var arrived: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return arrivals
+    }
+
+    func pass() {
+        condition.lock()
+        defer { condition.unlock() }
+        arrivals += 1
+        while !isOpen { condition.wait() }
+    }
+
+    func open() {
+        condition.lock()
+        defer { condition.unlock() }
+        isOpen = true
+        condition.broadcast()
+    }
+}
+
+extension SafeFetcher.Resolution {
+    var isTimedOut: Bool { if case .timedOut = self { true } else { false } }
+    var isCancelled: Bool { if case .cancelled = self { true } else { false } }
+    var isAddresses: Bool { if case .addresses = self { true } else { false } }
 }
 
 @Suite(.serialized) struct SafeFetcherTests {
@@ -22,6 +103,44 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
         hosts: Set<String> = SafeFetcherTests.hosts, resolver: SafeFetcher.Resolver? = nil
     ) -> SafeFetcher {
         SafeFetcher(allowedHosts: hosts, protocolClasses: [FetchStubProtocol.self], resolver: resolver)
+    }
+
+    /// A fetcher whose deadlines end only when their gates open, with lookups in their own slots. Its session's
+    /// own request timeout is out of reach, so a `.timedOut` can only come from a gate.
+    func gated(
+        protocolClass: AnyClass = FetchStubProtocol.self, resolver: SafeFetcher.Resolver?, slots: MemoryBudget,
+        fetch: Gate = Gate(), slot: Gate = Gate(), lookup: Gate = Gate()
+    ) -> SafeFetcher {
+        SafeFetcher(
+            allowedHosts: Self.hosts, protocolClasses: [protocolClass], resolver: resolver, deadline: .seconds(3600),
+            requestTimeout: 3600, slots: slots,
+            expiries: .init(
+                fetch: { try await fetch.wait() }, slot: { try await slot.wait() }, lookup: { try await lookup.wait() })
+        )
+    }
+
+    func outcome(of fetcher: SafeFetcher, _ target: URL) -> Recorded<TransportError?> {
+        Recorded {
+            do throws(TransportError) {
+                _ = try await fetcher.fetch(target)
+                return nil
+            } catch {
+                return error
+            }
+        }
+    }
+
+    /// A resolver that waits at `gate`.
+    func held(by gate: ThreadGate, calls: Counter? = nil) -> SafeFetcher.Resolver {
+        { _ in
+            calls?.bump()
+            gate.pass()
+            return [[93, 184, 216, 34]]
+        }
+    }
+
+    func requestCount(path: String) -> Int {
+        FetchStubProtocol.seen.withLock { $0.filter { $0.url?.path == path }.count }
     }
 
     func url(_ text: String) -> URL { URL(string: text)! }
@@ -47,6 +166,7 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
             #expect(request.value(forHTTPHeaderField: "Cookie") == nil)
             #expect(request.httpMethod == "GET")
+            #expect(request.timeoutInterval == 20)
         }
     }
 
@@ -176,88 +296,132 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
         #expect(data == Data("x".utf8))
     }
 
-    @Test func aBurstOfFetchesWaitsForLookupSlotsInsteadOfFailing() async throws {
+    @Test(.timeLimit(.minutes(2))) func aBurstOfFetchesWaitsForLookupSlotsInsteadOfFailing() async throws {
         route("/sf/burst", .init(status: 200, body: Data("x".utf8)))
-        let slow: SafeFetcher.Resolver = { _ in
-            Thread.sleep(forTimeInterval: 0.05)
-            return [[93, 184, 216, 34]]
-        }
-        let fetcher = fetcher(resolver: slow)
+        let slots = MemoryBudget(capacity: 2)
+        let lookups = ThreadGate()
+        defer { lookups.open() }
+        let fetcher = gated(resolver: held(by: lookups), slots: slots)
         let target = url("https://media.example.com/sf/burst")
-        let successes = await withTaskGroup(of: Bool.self) { group in
-            for _ in 0..<20 { group.addTask { (try? await fetcher.fetch(target)) != nil } }
-            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        let fetches = (0..<20).map { _ in outcome(of: fetcher, target) }
+        defer { for fetch in fetches { fetch.cancel() } }
+        try #require(await eventually { lookups.arrived == 2 && slots.waiterCount == 18 })
+        lookups.open()
+        for fetch in fetches {
+            #expect(await fetch.settled() == .some(nil))
         }
-        #expect(successes == 20)
     }
 
-    @Test func lookupsBeyondTheSlotsWaitAndNeverRunMoreAtOnce() async {
+    @Test(.timeLimit(.minutes(2))) func lookupsBeyondTheSlotsWaitAndNeverRunMoreAtOnce() async throws {
         let slots = MemoryBudget(capacity: 3)
+        let lookups = ThreadGate()
+        defer { lookups.open() }
         let running = Atomic<Int>(0)
         let peak = Atomic<Int>(0)
         let resolver: SafeFetcher.Resolver = { _ in
             let now = running.add(1, ordering: .acquiringAndReleasing).newValue
             peak.max(now, ordering: .acquiringAndReleasing)
-            Thread.sleep(forTimeInterval: 0.03)
+            lookups.pass()
             running.subtract(1, ordering: .acquiringAndReleasing)
             return [[93, 184, 216, 34]]
         }
-        let outcomes = await withTaskGroup(of: Bool.self) { group in
-            for _ in 0..<12 {
-                group.addTask {
-                    if case .addresses = await SafeFetcher.resolve(
-                        "media.example.com", using: resolver, timeout: .seconds(5), slots: slots)
-                    {
-                        return true
-                    }
-                    return false
-                }
+        let never = Gate()
+        let resolutions = (0..<12).map { _ in
+            Recorded {
+                await SafeFetcher.resolve(
+                    "media.example.com", using: resolver, timeout: .seconds(3600), slots: slots,
+                    slotExpiry: { try await never.wait() }, lookupExpiry: { try await never.wait() })
             }
-            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
         }
-        #expect(outcomes == 12)
-        #expect(peak.load(ordering: .acquiring) <= 3)
+        defer { for resolution in resolutions { resolution.cancel() } }
+        try #require(await eventually { lookups.arrived == 3 && slots.waiterCount == 9 })
+        #expect(peak.load(ordering: .acquiring) == 3)
+        lookups.open()
+        for resolution in resolutions {
+            #expect(await resolution.settled()?.isAddresses == true)
+        }
+        #expect(peak.load(ordering: .acquiring) == 3)
+        #expect(lookups.arrived == 12)
     }
 
-    @Test func stuckLookupsHoldTheirSlotsAndLaterOnesTimeOut() async {
+    @Test(.timeLimit(.minutes(2))) func anExpiredLookupKeepsItsSlotUntilItsThreadReturns() async throws {
         let slots = MemoryBudget(capacity: 1)
-        let calls = Atomic<Int>(0)
-        let stall: SafeFetcher.Resolver = { _ in
-            calls.add(1, ordering: .acquiringAndReleasing)
-            Thread.sleep(forTimeInterval: 1)
-            return [[93, 184, 216, 34]]
+        let lookups = ThreadGate()
+        defer { lookups.open() }
+        let calls = Counter()
+        let lookupExpiry = Gate()
+        let slotExpiry = Gate()
+        let resolver = held(by: lookups, calls: calls)
+        let first = Recorded {
+            await SafeFetcher.resolve(
+                "a.example.com", using: resolver, timeout: .seconds(3600), slots: slots,
+                slotExpiry: { try await slotExpiry.wait() }, lookupExpiry: { try await lookupExpiry.wait() })
         }
-        let first = await SafeFetcher.resolve("a.example.com", using: stall, timeout: .milliseconds(50), slots: slots)
-        let clock = ContinuousClock()
-        let start = clock.now
-        let second = await SafeFetcher.resolve("a.example.com", using: stall, timeout: .milliseconds(100), slots: slots)
-        guard case .timedOut = first, case .timedOut = second else {
-            Issue.record("expected both to time out")
-            return
-        }
-        #expect(clock.now - start < .milliseconds(800))
-        #expect(calls.load(ordering: .acquiring) == 1)
+        defer { first.cancel() }
+        try #require(await eventually { lookups.arrived == 1 })
+        lookupExpiry.open()
+        #expect(await first.settled()?.isTimedOut == true)
+        #expect(await slots.available == 0)
+        lookups.open()
+        #expect(await eventually { await slots.available == 1 })
+        #expect(calls.count == 1)
     }
 
-    @Test func aCancelledWaiterNeverStartsItsLookup() async {
+    @Test(.timeLimit(.minutes(2))) func aLookupQueuedBehindAStuckOneTimesOutWithoutStarting() async throws {
         let slots = MemoryBudget(capacity: 1)
-        let held = try? await slots.reserve(1)
-        let calls = Atomic<Int>(0)
+        let lookups = ThreadGate()
+        defer { lookups.open() }
+        let calls = Counter()
+        let never = Gate()
+        let queuedExpiry = Gate()
+        let resolver = held(by: lookups, calls: calls)
+        let stuck = Recorded {
+            await SafeFetcher.resolve(
+                "a.example.com", using: resolver, timeout: .seconds(3600), slots: slots,
+                slotExpiry: { try await never.wait() }, lookupExpiry: { try await never.wait() })
+        }
+        defer { stuck.cancel() }
+        try #require(await eventually { lookups.arrived == 1 })
+        let queued = Recorded {
+            await SafeFetcher.resolve(
+                "a.example.com", using: resolver, timeout: .seconds(3600), slots: slots,
+                slotExpiry: { try await queuedExpiry.wait() }, lookupExpiry: { try await never.wait() })
+        }
+        defer { queued.cancel() }
+        try #require(await eventually { slots.waiterCount == 1 })
+        queuedExpiry.open()
+        #expect(await queued.settled()?.isTimedOut == true)
+        #expect(slots.waiterCount == 0)
+        #expect(calls.count == 1)
+        lookups.open()
+        #expect(await stuck.settled()?.isAddresses == true)
+        #expect(await eventually { await slots.available == 1 })
+        #expect(calls.count == 1)
+    }
+
+    @Test(.timeLimit(.minutes(2))) func aCancelledWaiterNeverStartsItsLookup() async throws {
+        let slots = MemoryBudget(capacity: 1)
+        let held = try await slots.reserve(1)
+        defer { held.release() }
+        let calls = Counter()
         let resolver: SafeFetcher.Resolver = { _ in
-            calls.add(1, ordering: .acquiringAndReleasing)
+            calls.bump()
             return [[93, 184, 216, 34]]
         }
-        let waiter = Task {
-            await SafeFetcher.resolve("a.example.com", using: resolver, timeout: .seconds(5), slots: slots)
+        let never = Gate()
+        let waiter = Recorded {
+            await SafeFetcher.resolve(
+                "a.example.com", using: resolver, timeout: .seconds(3600), slots: slots,
+                slotExpiry: { try await never.wait() }, lookupExpiry: { try await never.wait() })
         }
-        try? await Task.sleep(for: .milliseconds(50))
+        defer { waiter.cancel() }
+        try #require(await eventually { slots.waiterCount == 1 })
         waiter.cancel()
-        held?.release()
-        guard case .cancelled = await waiter.value else {
-            Issue.record("expected cancelled")
-            return
-        }
-        #expect(calls.load(ordering: .acquiring) == 0)
+        #expect(await waiter.settled()?.isCancelled == true)
+        #expect(slots.waiterCount == 0)
+        held.release()
+        #expect(await slots.available == 1)
+        #expect(calls.count == 0)
     }
 
     @Test func resolutionFailureIsOffline() async {
@@ -280,77 +444,65 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
         #expect(FetchStubProtocol.seen.withLock { $0.filter { $0.url?.path == "/sf/hop-final" }.isEmpty })
     }
 
-    @Test func deadlineCancelsASilentServer() async {
-        let slow = SafeFetcher(
-            allowedHosts: Self.hosts, protocolClasses: [HangingProtocol.self], resolver: nil,
-            deadline: .milliseconds(200))
-        await #expect(throws: TransportError.timedOut) {
-            try await slow.fetch(url("https://media.example.com/sf/hang"))
-        }
+    @Test(.timeLimit(.minutes(2))) func deadlineCancelsASilentServer() async throws {
+        let deadline = Gate()
+        let slow = gated(
+            protocolClass: HangingProtocol.self, resolver: nil, slots: MemoryBudget(capacity: 1), fetch: deadline)
+        let fetch = outcome(of: slow, url("https://media.example.com/sf/hang-deadline"))
+        defer { fetch.cancel() }
+        try #require(await eventually { HangingProtocol.started.withLock { $0["/sf/hang-deadline"] != nil } })
+        #expect(HangingProtocol.started.withLock { $0["/sf/hang-deadline"] } == 3600)
+        deadline.open()
+        #expect(await fetch.settled() == .some(.timedOut))
     }
 
-    @Test func callerCancellationStopsTheFetch() async {
-        let slow = SafeFetcher(
-            allowedHosts: Self.hosts, protocolClasses: [HangingProtocol.self], resolver: nil, deadline: .seconds(30))
-        let task = Task { () -> TransportError? in
-            do throws(TransportError) {
-                _ = try await slow.fetch(url("https://media.example.com/sf/hang"))
-                return nil
-            } catch {
-                return error
-            }
-        }
-        try? await Task.sleep(for: .milliseconds(100))
-        task.cancel()
-        #expect(await task.value == .cancelled)
+    @Test(.timeLimit(.minutes(2))) func callerCancellationStopsTheFetch() async throws {
+        let slow = gated(protocolClass: HangingProtocol.self, resolver: nil, slots: MemoryBudget(capacity: 1))
+        let fetch = outcome(of: slow, url("https://media.example.com/sf/hang-cancel"))
+        defer { fetch.cancel() }
+        try #require(await eventually { HangingProtocol.started.withLock { $0["/sf/hang-cancel"] != nil } })
+        fetch.cancel()
+        #expect(await fetch.settled() == .some(.cancelled))
     }
 
-    @Test func aStalledResolverIsAbandonedAtTheDeadline() async {
-        let stall: SafeFetcher.Resolver = { _ in
-            Thread.sleep(forTimeInterval: 3)
-            return [[93, 184, 216, 34]]
-        }
-        let slow = SafeFetcher(
-            allowedHosts: Self.hosts, protocolClasses: [FetchStubProtocol.self], resolver: stall,
-            deadline: .milliseconds(200))
-        let clock = ContinuousClock()
-        let start = clock.now
-        await #expect(throws: TransportError.timedOut) {
-            try await slow.fetch(url("https://media.example.com/sf/dns-stall"))
-        }
-        #expect(clock.now - start < .seconds(1.5))
+    @Test(.timeLimit(.minutes(2))) func aStalledResolverIsAbandonedAtTheDeadline() async throws {
+        let slots = MemoryBudget(capacity: 1)
+        let lookups = ThreadGate()
+        defer { lookups.open() }
+        let deadline = Gate()
+        let slow = gated(resolver: held(by: lookups), slots: slots, fetch: deadline)
+        let fetch = outcome(of: slow, url("https://media.example.com/sf/dns-stall"))
+        defer { fetch.cancel() }
+        try #require(await eventually { lookups.arrived == 1 })
+        deadline.open()
+        #expect(await fetch.settled() == .some(.timedOut))
+        #expect(await slots.available == 0)
+        lookups.open()
+        #expect(await eventually { await slots.available == 1 })
+        #expect(requestCount(path: "/sf/dns-stall") == 0)
     }
 
-    @Test func cancellingDuringResolutionReturnsPromptly() async {
-        let stall: SafeFetcher.Resolver = { _ in
-            Thread.sleep(forTimeInterval: 3)
-            return [[93, 184, 216, 34]]
-        }
-        let slow = SafeFetcher(
-            allowedHosts: Self.hosts, protocolClasses: [FetchStubProtocol.self], resolver: stall, deadline: .seconds(30)
-        )
-        let target = url("https://media.example.com/sf/dns-stall")
-        let task = Task { () -> TransportError? in
-            do throws(TransportError) {
-                _ = try await slow.fetch(target)
-                return nil
-            } catch {
-                return error
-            }
-        }
-        try? await Task.sleep(for: .milliseconds(100))
-        let clock = ContinuousClock()
-        let start = clock.now
-        task.cancel()
-        #expect(await task.value == .cancelled)
-        #expect(clock.now - start < .seconds(1.5))
+    @Test(.timeLimit(.minutes(2))) func cancellingDuringResolutionReturnsWhileTheLookupIsStuck() async throws {
+        let slots = MemoryBudget(capacity: 1)
+        let lookups = ThreadGate()
+        defer { lookups.open() }
+        let slow = gated(resolver: held(by: lookups), slots: slots)
+        let fetch = outcome(of: slow, url("https://media.example.com/sf/dns-cancel"))
+        defer { fetch.cancel() }
+        try #require(await eventually { lookups.arrived == 1 })
+        fetch.cancel()
+        #expect(await fetch.settled() == .some(.cancelled))
+        #expect(await slots.available == 0)
+        lookups.open()
+        #expect(await eventually { await slots.available == 1 })
+        #expect(requestCount(path: "/sf/dns-cancel") == 0)
     }
 
     @Test func aCancelledFetchNeverConnects() async {
         FetchStubProtocol.routes.withLock { $0["/sf/never"] = .init(status: 200, body: Data("x".utf8)) }
         let resolver: SafeFetcher.Resolver = { _ in [[93, 184, 216, 34]] }
         let target = url("https://media.example.com/sf/never")
-        let task = Task { () -> TransportError? in
+        let fetch = Recorded { () -> TransportError? in
             withUnsafeCurrentTask { $0?.cancel() }
             do throws(TransportError) {
                 _ = try await fetcher(resolver: resolver).fetch(target)
@@ -359,7 +511,7 @@ final class HangingProtocol: URLProtocol, @unchecked Sendable {
                 return error
             }
         }
-        #expect(await task.value == .cancelled)
+        #expect(await fetch.settled() == .some(.cancelled))
         #expect(FetchStubProtocol.seen.withLock { $0.filter { $0.url?.path == "/sf/never" }.isEmpty })
     }
 

@@ -31,63 +31,164 @@ public struct ExportDirectory: Sendable {
     static let maxFilenameBytes = 255
     static let fallbackFilename = "attachment"
 
-    /// Held, through `locked`, for every step that creates, hands out or removes copies: an export claiming its
-    /// folder and publishing its file, pruning's decision and removal of each entry, and a wipe. Every account's tree
-    /// is under one root, so it's process-wide. Writing a copy's contents happens outside it: a temporary being
-    /// written is told apart from an abandoned one by its own file lock, which conflicts within this process just as
-    /// it does between processes.
-    private static let tree = Mutex(())
-
-    /// Callers in this process waiting for `tree`. A sweep pauses between entries while there are any, so a long one
-    /// can't keep an export or a wipe out until its wait runs out.
-    private static let waitingForTree = Atomic<Int>(0)
+    /// Every step that creates, hands out or removes copies runs through `locked`: an export claiming its folder and
+    /// publishing its file, pruning's decision and removal of each entry, and a wipe. Writing a copy's contents
+    /// happens outside it: a temporary being written is told apart from an abandoned one by its own file lock, which
+    /// conflicts within this process just as it does between processes.
+    ///
+    /// Within this process the steps at one root take turns in the order they asked, so a long sweep, which asks
+    /// again for each entry, lets an export or a wipe that is waiting in before its next entry. Roots don't wait for
+    /// each other. A root is its path, so steps keep taking turns even if the directory there is replaced.
+    private static let turns = TurnLines()
 
     /// The file other processes using the same container, such as a second copy of the app, take turns through. It
     /// sits beside `exports`, so no wipe or prune removes it.
     static let lockName = ".exports.lock"
 
-    /// How long a step waits for another process to let go of the shared lock before giving up, so a stalled second
-    /// copy of the app can't hold up logout.
+    /// How long a step waits for its turn and for another process to let go of the shared lock before giving up, so
+    /// neither a stalled step here nor a stalled second copy of the app can hold up logout.
     static let lockWait: Duration = .seconds(5)
 
-    /// Runs `body` holding `tree` and, against other processes, an exclusive lock on `lockName` under `root`, which
-    /// must exist. Without both nothing runs: a file at `lockName` that can't be opened as one (a symlink, say), or
-    /// either lock busy for all of `wait`, throws instead. Neither lock is waited on: both are tried, let go between
-    /// attempts, and `wait` bounds the whole call, whether this process or another is holding them: once it has run
-    /// out, `body` doesn't start even if both locks are free. `onBusy` runs each time an attempt finds one busy.
-    private static func locked<T: Sendable>(
-        _ root: URL, waiting wait: Duration, onBusy: () -> Void = {},
-        _ body: () throws(ExportError) -> T
+    /// The pause between two tries at a shared lock another process holds.
+    static let lockRetry: Duration = .milliseconds(10)
+
+    private static let clockStart = ContinuousClock.now
+
+    static func monotonicNow() -> Duration { ContinuousClock.now - clockStart }
+
+    /// One step's place in a root's line. Granted at most once.
+    final class LockTurn: Sendable {
+        private let granted = DispatchSemaphore(value: 0)
+        /// When the step gives up, on the clock its `Seams.now` reads. A turn nobody queues has none.
+        fileprivate let deadline: Duration
+
+        init(deadline: Duration = .zero) { self.deadline = deadline }
+
+        fileprivate func grant() { granted.signal() }
+
+        /// Returns once the turn is granted or `limit` has passed, whichever comes first.
+        func wait(upTo limit: Duration) {
+            let nanoseconds = Int(min(max(limit / .nanoseconds(1), 0), 1e18))
+            _ = granted.wait(timeout: .now() + .nanoseconds(nanoseconds))
+        }
+    }
+
+    /// The turns of this process's steps, one line per export root. A root has an entry only while a step holds its
+    /// slot.
+    private final class TurnLines: Sendable {
+        private struct Line {
+            var holder: LockTurn
+            /// False while the holder was handed the slot and its thread hasn't come back for it yet.
+            var taken: Bool
+            var waiting: [LockTurn] = []
+
+            /// Hands the slot to the first in line that hasn't given up by `now`, when there is one. `woken` gets
+            /// that step and the ones passed over, which wake to find their wait has run out.
+            mutating func handOn(_ now: Duration, waking woken: inout [LockTurn]) -> Bool {
+                woken += waiting.filter { $0.deadline <= now }
+                waiting.removeAll { $0.deadline <= now }
+                guard !waiting.isEmpty else { return false }
+                holder = waiting.removeFirst()
+                taken = false
+                woken.append(holder)
+                return true
+            }
+        }
+
+        private let lines = Mutex<[String: Line]>([:])
+
+        /// True when `turn` holds the root's slot: it was free, or the turn was handed it. Otherwise the turn is in
+        /// line, joining at the end if it wasn't already. A slot handed to a step that gave up before coming back for
+        /// it moves on, so a stalled thread can't keep the root reserved.
+        func take(_ turn: LockTurn, at root: String, now: Duration) -> Bool {
+            var woken: [LockTurn] = []
+            let holds = lines.withLock { lines -> Bool in
+                guard var line = lines[root] else {
+                    lines[root] = Line(holder: turn, taken: true)
+                    return true
+                }
+                defer { lines[root] = line }
+                if line.holder === turn {
+                    line.taken = true
+                    return true
+                }
+                if !line.waiting.contains(where: { $0 === turn }) { line.waiting.append(turn) }
+                guard !line.taken, line.holder.deadline <= now else { return false }
+                if !line.handOn(now, waking: &woken) {
+                    // Everyone in line has given up, this step included; it takes the slot and finds that out.
+                    line.holder = turn
+                }
+                line.taken = line.holder === turn
+                return line.taken
+            }
+            for other in woken where other !== turn { other.grant() }
+            return holds
+        }
+
+        /// Gives the turn up. Holding the slot, it hands it to the first in line; waiting, it leaves the line.
+        func leave(_ turn: LockTurn, at root: String, now: Duration) {
+            var woken: [LockTurn] = []
+            lines.withLock { lines in
+                guard var line = lines[root] else { return }
+                guard line.holder === turn else {
+                    line.waiting.removeAll { $0 === turn }
+                    lines[root] = line
+                    return
+                }
+                lines[root] = line.handOn(now, waking: &woken) ? line : nil
+            }
+            for other in woken { other.grant() }
+        }
+    }
+
+    /// Runs `body` holding the slot of `root`, which must exist, in this process and, against other processes, an
+    /// exclusive lock on `lockName` under it. Without both nothing runs: a file at `lockName` that can't be opened
+    /// as one (a symlink, say) throws, and so does `seams.lockWait` running out, which bounds the whole call,
+    /// whether it is waiting in line here or for another process: once it has run out, `body` doesn't start even if
+    /// both are free. The shared lock is never waited on while holding the slot: it is tried, and when another
+    /// process has it the slot goes to the next in line before the pause and this step rejoins at the end.
+    private static func locked<T>(
+        _ root: URL, seams: Seams, site: LockSite, _ body: () throws(ExportError) -> T
     ) throws(ExportError) -> T {
+        let deadline = seams.now() + seams.lockWait
+        let line = root.standardizedFileURL.path
         let path = root.appendingPathComponent(lockName).path
-        let deadline = ContinuousClock.now + wait
-        var counted = false
-        defer { if counted { waitingForTree.subtract(1, ordering: .relaxed) } }
         while true {
-            // Nil when `tree` is busy; nil inside when the shared lock is.
-            let attempt = tree.withLockIfAvailable { _ -> Result<T, ExportError>? in
-                let fd = Darwin.open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_EXLOCK | O_NONBLOCK, 0o600)
-                guard fd >= 0 else {
-                    let code = errno
-                    return code == EWOULDBLOCK ? nil : .failure(.io(code: Int(code)))
+            let turn = LockTurn(deadline: deadline)
+            var queued = false
+            while !turns.take(turn, at: line, now: seams.now()) {
+                if !queued {
+                    queued = true
+                    seams.onLockBusy(site)
                 }
-                defer { Darwin.close(fd) }
-                // A retry can come round after the wait ran out; it holds the locks, but nothing starts.
-                guard ContinuousClock.now < deadline else { return .failure(.io(code: Int(ETIMEDOUT))) }
-                do throws(ExportError) {
-                    return .success(try body())
-                } catch {
-                    return .failure(error)
+                let left = deadline - seams.now()
+                guard left > .zero else {
+                    // Handed the slot at this very moment, it goes on to the next in line.
+                    turns.leave(turn, at: line, now: seams.now())
+                    throw .io(code: Int(ETIMEDOUT))
                 }
+                seams.wait(turn, left)
             }
-            if let attempt = attempt ?? nil { return try attempt.get() }
-            if attempt == nil, !counted {
-                counted = true
-                waitingForTree.add(1, ordering: .relaxed)
+            let fd = Darwin.open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_EXLOCK | O_NONBLOCK, 0o600)
+            guard fd >= 0 else {
+                let code = errno
+                turns.leave(turn, at: line, now: seams.now())
+                guard code == EWOULDBLOCK else { throw .io(code: Int(code)) }
+                seams.onLockBusy(site)
+                let left = deadline - seams.now()
+                guard left > .zero else { throw .io(code: Int(ETIMEDOUT)) }
+                seams.wait(LockTurn(), min(left, lockRetry))
+                continue
             }
-            onBusy()
-            guard ContinuousClock.now < deadline else { throw .io(code: Int(ETIMEDOUT)) }
-            usleep(10_000)
+            defer {
+                // The shared lock goes first, so whoever is handed the slot finds it free.
+                Darwin.close(fd)
+                turns.leave(turn, at: line, now: seams.now())
+            }
+            // A turn can come after the wait ran out; it holds both, but nothing starts.
+            guard seams.now() < deadline else { throw .io(code: Int(ETIMEDOUT)) }
+            seams.onLockAdmitted(site)
+            return try body()
         }
     }
 
@@ -104,6 +205,11 @@ public struct ExportDirectory: Sendable {
         return true
     }
 
+    /// The step a `locked` call is for.
+    enum LockSite: Sendable, Equatable {
+        case claim, publish, cleanup, wipe, prune
+    }
+
     /// Test seams; the defaults are the production behaviour.
     struct Seams: Sendable {
         var setQuarantineProperties: @Sendable (URL) throws -> Void = ExportDirectory.setQuarantineProperties
@@ -116,8 +222,18 @@ public struct ExportDirectory: Sendable {
         /// Runs after a stored copy is opened and checked, before its path is matched against it and it's handed out.
         var beforeHandingOutStored: @Sendable (URL) -> Void = { _ in }
         var lockWait: Duration = ExportDirectory.lockWait
-        /// Runs each time an export's claim finds the process-wide or the shared lock busy.
-        var onLockBusy: @Sendable () -> Void = {}
+        /// Monotonic time, as the time since a fixed moment; `lockWait` is counted on it.
+        var now: @Sendable () -> Duration = ExportDirectory.monotonicNow
+        /// Blocks until the turn is granted or the time given has passed. Every wait for the lock goes through it:
+        /// for a turn in line, and, with a turn nobody grants, the pause before trying the shared lock again.
+        var wait: @Sendable (LockTurn, Duration) -> Void = { $0.wait(upTo: $1) }
+        /// Runs each time a step finds the lock busy: once it has joined its root's line, and at each try that finds
+        /// another process holding the shared lock.
+        var onLockBusy: @Sendable (LockSite) -> Void = { _ in }
+        /// Runs holding the lock, right before the step's work starts, so calls come in the order turns are taken.
+        var onLockAdmitted: @Sendable (LockSite) -> Void = { _ in }
+        /// Runs as pruning is about to take the lock for an entry.
+        var onPruneEntryAttempt: @Sendable (String) -> Void = { _ in }
         /// Marks a stored copy's folder as just used; returns 0, or the error code.
         var markUsed: @Sendable (Int32) -> Int32 = { futimens($0, nil) == 0 ? 0 : errno }
     }
@@ -174,7 +290,7 @@ public struct ExportDirectory: Sendable {
         let temporary = ".\(UUID().uuidString).partial"
         // The shared lock lives in the root, so even the very first export takes it before creating anything below.
         Darwin.close(try Self.openRoot(directory.root))
-        let claimed = try Self.locked(directory.root, waiting: seams.lockWait, onBusy: seams.onLockBusy) {
+        let claimed = try Self.locked(directory.root, seams: seams, site: .claim) {
             () throws(ExportError) -> Claim in
             // Asked again under the lock, which logout's wipe holds: a session that ended meanwhile creates
             // nothing, not even the account's folder.
@@ -220,13 +336,15 @@ public struct ExportDirectory: Sendable {
             let staged = folder.appendingPathComponent(temporary, isDirectory: false)
             seams.beforeQuarantine(staged)
             try quarantine(staged, fd: fd)
-            return try Self.locked(directory.root, waiting: seams.lockWait) { () throws(ExportError) -> URL in
+            return try Self.locked(directory.root, seams: seams, site: .publish) {
+                () throws(ExportError) -> URL in
                 try publish(fd, from: temporary, as: name, in: folderFD, folder: folder, shouldHandOut: shouldHandOut)
             }
         } catch {
             // Without the lock nothing is removed here: the temporary is left for a later cleanup, which takes it
             // once this export closes it and so lets go of its file lock.
-            try? Self.locked(directory.root, waiting: seams.lockWait) { () throws(ExportError) in
+            try? Self.locked(directory.root, seams: seams, site: .cleanup) {
+                () throws(ExportError) in
                 // Only what this export made goes: its temporary file, and the folder if that leaves it empty.
                 // Whatever is at the copy's name, even something planted there, is left for the wipe.
                 unlinkat(folderFD, temporary, 0)
@@ -432,7 +550,8 @@ public struct ExportDirectory: Sendable {
     /// target is left alone. Holds the lock throughout, so it never interleaves with pruning or an export's steps.
     public func wipe() throws(ExportError) {
         guard try Self.rootExists(directory.root) else { return }
-        try Self.locked(directory.root, waiting: seams.lockWait) { () throws(ExportError) in
+        try Self.locked(directory.root, seams: seams, site: .wipe) {
+            () throws(ExportError) in
             let rootFD = Darwin.open(directory.root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
             guard rootFD >= 0 else {
                 if errno == ENOENT { return }
@@ -454,7 +573,7 @@ public struct ExportDirectory: Sendable {
     /// Removes the exports of every account, never following a symlink.
     public static func wipeAll(root: URL) throws(ExportError) {
         guard try rootExists(root) else { return }
-        try locked(root, waiting: lockWait) { () throws(ExportError) in
+        try locked(root, seams: Seams(), site: .wipe) { () throws(ExportError) in
             let rootFD = Darwin.open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
             guard rootFD >= 0 else {
                 if errno == ENOENT { return }
@@ -480,9 +599,7 @@ public struct ExportDirectory: Sendable {
             return
         }
         defer { Darwin.close(accountFD) }
-        let failed = try Self.removeChildren(
-            of: accountFD, changedBefore: cutoff, root: directory.root, waiting: seams.lockWait,
-            beforeRemoval: seams.beforePruneRemoval)
+        let failed = try Self.removeChildren(of: accountFD, changedBefore: cutoff, root: directory.root, seams: seams)
         guard failed == 0 else { throw .wipeIncomplete(failed: failed) }
     }
 
@@ -506,10 +623,10 @@ public struct ExportDirectory: Sendable {
                 // Gone, or swapped for a symlink, since it was listed.
                 guard let accountFD else { continue }
                 defer { Darwin.close(accountFD) }
-                failed += try removeChildren(of: accountFD, changedBefore: cutoff, root: root, waiting: lockWait)
+                failed += try removeChildren(of: accountFD, changedBefore: cutoff, root: root, seams: Seams())
             } else {
                 failed += try removeChildren(
-                    named: [name], in: exportsFD, changedBefore: cutoff, root: root, waiting: lockWait)
+                    named: [name], in: exportsFD, changedBefore: cutoff, root: root, seams: Seams())
             }
         }
         guard failed == 0 else { throw .wipeIncomplete(failed: failed) }
@@ -538,27 +655,26 @@ public struct ExportDirectory: Sendable {
     /// Removes the children of `directoryFD` that haven't changed since `cutoff`; returns how many it couldn't.
     /// Throws, having stopped, when the shared lock can't be had.
     private static func removeChildren(
-        of directoryFD: Int32, changedBefore cutoff: Date, root: URL, waiting wait: Duration,
-        beforeRemoval: (String) -> Void = { _ in }
+        of directoryFD: Int32, changedBefore cutoff: Date, root: URL, seams: Seams
     ) throws(ExportError) -> Int {
         guard let names = childNames(of: directoryFD) else { return 1 }
-        return try removeChildren(
-            named: names, in: directoryFD, changedBefore: cutoff, root: root, waiting: wait,
-            beforeRemoval: beforeRemoval)
+        return try removeChildren(named: names, in: directoryFD, changedBefore: cutoff, root: root, seams: seams)
     }
 
     private static func removeChildren(
-        named names: [String], in parent: Int32, changedBefore cutoff: Date, root: URL, waiting wait: Duration,
-        beforeRemoval: (String) -> Void = { _ in }
+        named names: [String], in parent: Int32, changedBefore cutoff: Date, root: URL, seams: Seams
     ) throws(ExportError) -> Int {
         var failed = 0
         for name in names {
             // Judged and removed in one step under the lock: an export claims, reuses or publishes into a folder
             // only while holding it, so a folder can't be refreshed by one between the check and its removal.
-            // Without the shared lock the sweep stops: another process has held it for all of `wait` already, so
-            // waiting again for each remaining entry would only hold up the sweep.
+            // The lock is asked for again for each entry, behind whoever is already waiting for it. Without it the
+            // sweep stops: it has been busy for all of the wait already, so waiting again for each remaining entry
+            // would only hold up the sweep.
+            seams.onPruneEntryAttempt(name)
             let removed =
-                try locked(root, waiting: wait) { () throws(ExportError) -> Bool in
+                try locked(root, seams: seams, site: .prune) {
+                    () throws(ExportError) -> Bool in
                     guard let changed = lastChange(of: name, in: parent) else { return errno == ENOENT }
                     let folderFD = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                     defer { if folderFD >= 0 { Darwin.close(folderFD) } }
@@ -571,13 +687,10 @@ public struct ExportDirectory: Sendable {
                         if folderFD >= 0 { reapAbandoned(in: folderFD) }
                         return true
                     }
-                    beforeRemoval(name)
+                    seams.beforePruneRemoval(name)
                     return removeEntry(name, in: parent)
                 }
             if !removed { failed += 1 }
-            // Anyone else in this process waiting for the lock gets a turn before the next entry: they try every
-            // 10 ms, so this pause always spans one of their attempts.
-            if waitingForTree.load(ordering: .relaxed) > 0 { usleep(20_000) }
         }
         return failed
     }

@@ -4,16 +4,6 @@ import Testing
 
 @testable import ChatNet
 
-/// Polls `condition` until it holds or `timeout` passes; the timeout only guards against hangs.
-func waitUntil(timeout: Duration = .seconds(10), _ condition: @Sendable () -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now.advanced(by: timeout)
-    while !condition() {
-        guard ContinuousClock.now < deadline else { return false }
-        try? await Task.sleep(for: .milliseconds(1))
-    }
-    return true
-}
-
 @Suite struct MemoryBudgetTests {
     @Test func reservesAndReleases() async throws {
         let budget = MemoryBudget(capacity: 100)
@@ -75,56 +65,66 @@ func waitUntil(timeout: Duration = .seconds(10), _ condition: @Sendable () -> Bo
         #expect(await budget.available == 100)
     }
 
+    /// Each waiter keeps its 60 bytes until the test opens its turn, so only one can hold the budget at a time.
     @Test func waitersAreServedInArrivalOrder() async throws {
         let budget = MemoryBudget(capacity: 100)
         let full = try await budget.reserve(100)
         let order = Mutex<[Int]>([])
-        let held = Mutex<[Reservation]>([])
-        var tasks: [Task<Void, any Error>] = []
+        let turns = (0..<5).map { _ in Gate() }
+        defer { for turn in turns { turn.open() } }
+        var holders: [Recorded<Result<Void, any Error>>] = []
         for index in 0..<5 {
-            tasks.append(
-                Task {
+            holders.append(
+                Recorded(catching: {
                     let reservation = try await budget.reserve(60)
                     order.withLock { $0.append(index) }
-                    held.withLock { $0.append(reservation) }
-                    try await Task.sleep(for: .milliseconds(5))
+                    try await turns[index].wait()
                     reservation.release()
-                })
-            try #require(await waitUntil { budget.waiterCount == index + 1 })
+                }))
+            try #require(await eventually { budget.waiterCount == index + 1 })
         }
         full.release()
-        for task in tasks { try await task.value }
-        #expect(order.withLock { $0 } == [0, 1, 2, 3, 4])
+        for index in 0..<5 {
+            try #require(await eventually { order.withLock { $0.count } == index + 1 })
+            #expect(order.withLock { $0 } == Array(0...index))
+            #expect(budget.waiterCount == 4 - index)
+            turns[index].open()
+        }
+        for holder in holders { try #require(await holder.settled()).get() }
         #expect(await budget.available == 100)
     }
 
     @Test func aLargeHeadWaiterIsNotStarvedBySmallerOnes() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(60)
-        let big = Task { try await budget.reserve(80) }
-        try #require(await waitUntil { budget.waiterCount == 1 })
+        let big = Recorded(catching: { try await budget.reserve(80) })
+        defer { big.cancel() }
+        try #require(await eventually { budget.waiterCount == 1 })
         #expect(await budget.tryReserve(10) == nil)
-        let small = Task { try await budget.reserve(10) }
-        try #require(await waitUntil { budget.waiterCount == 2 })
+        let small = Recorded(catching: { try await budget.reserve(10) })
+        defer { small.cancel() }
+        try #require(await eventually { budget.waiterCount == 2 })
         held.release()
-        let bigReservation = try await big.value
+        let bigReservation = try #require(await big.settled()).get()
         #expect(bigReservation.bytes == 80)
         bigReservation.release()
-        let smallReservation = try await small.value
+        let smallReservation = try #require(await small.settled()).get()
         #expect(smallReservation.bytes == 10)
     }
 
     @Test func cancellationLeavesTheQueueAndUnblocksOthers() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(90)
-        let blocked = Task { try await budget.reserve(50) }
-        try #require(await waitUntil { budget.waiterCount == 1 })
-        let behind = Task { try await budget.reserve(5) }
-        try #require(await waitUntil { budget.waiterCount == 2 })
+        let blocked = Recorded(catching: { try await budget.reserve(50) })
+        try #require(await eventually { budget.waiterCount == 1 })
+        let behind = Recorded(catching: { try await budget.reserve(5) })
+        defer { behind.cancel() }
+        try #require(await eventually { budget.waiterCount == 2 })
         blocked.cancel()
-        await #expect(throws: CancellationError.self) { _ = try await blocked.value }
-        try #require(await waitUntil { budget.waiterCount == 0 })
-        let granted = try await behind.value
+        let refused = try #require(await blocked.settled())
+        #expect(throws: CancellationError.self) { _ = try refused.get() }
+        try #require(await eventually { budget.waiterCount == 0 })
+        let granted = try #require(await behind.settled()).get()
         #expect(granted.bytes == 5)
         granted.release()
         held.release()
@@ -134,11 +134,12 @@ func waitUntil(timeout: Duration = .seconds(10), _ condition: @Sendable () -> Bo
     @Test func alreadyCancelledTaskNeverEnqueues() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(100)
-        let task = Task {
+        let attempt = Recorded(catching: {
             withUnsafeCurrentTask { $0?.cancel() }
             return try await budget.reserve(1)
-        }
-        await #expect(throws: CancellationError.self) { _ = try await task.value }
+        })
+        let refused = try #require(await attempt.settled())
+        #expect(throws: CancellationError.self) { _ = try refused.get() }
         held.release()
         #expect(await budget.available == 100)
     }
@@ -148,23 +149,27 @@ func waitUntil(timeout: Duration = .seconds(10), _ condition: @Sendable () -> Bo
         let budget = MemoryBudget(capacity: capacity)
         let inUse = Mutex(0)
         let peak = Mutex(0)
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for index in 0..<1000 {
-                group.addTask {
-                    let size = 1 + (index * 37) % 400
-                    let reservation = try await budget.reserve(size)
-                    let now = inUse.withLock { value -> Int in
-                        value += size
-                        return value
+        let storm = Recorded(catching: {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for index in 0..<1000 {
+                    group.addTask {
+                        let size = 1 + (index * 37) % 400
+                        let reservation = try await budget.reserve(size)
+                        let now = inUse.withLock { value -> Int in
+                            value += size
+                            return value
+                        }
+                        peak.withLock { $0 = max($0, now) }
+                        await Task.yield()
+                        inUse.withLock { $0 -= size }
+                        reservation.release()
                     }
-                    peak.withLock { $0 = max($0, now) }
-                    await Task.yield()
-                    inUse.withLock { $0 -= size }
-                    reservation.release()
                 }
+                try await group.waitForAll()
             }
-            try await group.waitForAll()
-        }
+        })
+        defer { storm.cancel() }
+        try #require(await storm.settled()).get()
         #expect(peak.withLock { $0 } <= capacity)
         #expect(await budget.available == capacity)
     }
@@ -172,15 +177,20 @@ func waitUntil(timeout: Duration = .seconds(10), _ condition: @Sendable () -> Bo
     @Test func cancelledStormLeavesTheBudgetWhole() async throws {
         let budget = MemoryBudget(capacity: 50)
         let held = try await budget.reserve(50)
-        let tasks = (0..<200).map { _ in Task { try await budget.reserve(10).release() } }
-        try #require(await waitUntil { budget.waiterCount == 200 })
-        for task in tasks.prefix(150) { task.cancel() }
+        let attempts = (0..<200).map { _ in Recorded(catching: { try await budget.reserve(10).release() }) }
+        try #require(await eventually { budget.waiterCount == 200 })
+        for attempt in attempts.prefix(150) { attempt.cancel() }
         held.release()
         var granted = 0
-        for task in tasks where (try? await task.value) != nil {
-            granted += 1
+        var refused = 0
+        for attempt in attempts {
+            switch try #require(await attempt.settled()) {
+            case .success: granted += 1
+            case .failure: refused += 1
+            }
         }
-        #expect(granted >= 50)
+        #expect(granted == 50)
+        #expect(refused == 150)
         #expect(await budget.available == 50)
     }
 }

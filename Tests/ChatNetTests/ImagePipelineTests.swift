@@ -161,11 +161,12 @@ extension MemorySensitive {
             }
         }
 
-        @Test func cancellationWhileWaitingForBudget() async throws {
+        @Test(.timeLimit(.minutes(2))) func cancellationWhileWaitingForBudget() async throws {
             let (pipeline, budget) = pipeline(capacity: 2_000_000)
             let hold = try await budget.reserve(2_000_000)
+            defer { hold.release() }
             let data = Fixtures.png(200, 200)
-            let task = Task { () -> ImageError? in
+            let decode = Recorded { () -> ImageError? in
                 do throws(ImageError) {
                     _ = try await pipeline.thumbnail(from: data, maxPixelSize: 200)
                     return nil
@@ -173,9 +174,11 @@ extension MemorySensitive {
                     return error
                 }
             }
-            try await Task.sleep(for: .milliseconds(50))
-            task.cancel()
-            #expect(await task.value == .cancelled)
+            defer { decode.cancel() }
+            try #require(await eventually { budget.waiterCount == 1 })
+            decode.cancel()
+            #expect(await decode.settled() == .some(.cancelled))
+            #expect(budget.waiterCount == 0)
             hold.release()
             #expect(await budget.available == 2_000_000)
         }
@@ -232,12 +235,16 @@ extension MemorySensitive {
             let before = physFootprint()
             let peak = Mutex(0)
             let sampler = Task {
-                while sampling.load(ordering: .acquiring) {
+                while sampling.load(ordering: .acquiring), !Task.isCancelled {
                     let available = await budget.available
                     if available < 0 || available > capacity { violations.add(1, ordering: .relaxed) }
                     peak.withLock { $0 = max($0, physFootprint()) }
                     await Task.yield()
                 }
+            }
+            defer {
+                sampling.store(false, ordering: .releasing)
+                sampler.cancel()
             }
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for index in 0..<100 {

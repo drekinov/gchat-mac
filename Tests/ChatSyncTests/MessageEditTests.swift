@@ -7,32 +7,31 @@ import Testing
 
 @testable import ChatSync
 
-private struct EditRig {
-    let server = FakeChatServer()
+/// One account whose session is never started: the only tasks are the ones an edit or a delete starts.
+private struct EditRig: Sendable {
+    let world: SimWorld
+    let server: FakeChatServer
     let alice: FakeAccount
     let bob: FakeAccount
     let store = InMemoryAccountStore()
     let session: AccountSession
     let team: SpaceName
-    let scratch = ScratchDirectory()
 
-    init(timing: SessionTiming = EditRig.timing) async throws {
+    init(_ world: SimWorld, followUpPolls: [Duration] = []) {
+        self.world = world
+        server = world.server
         alice = server.addAccount(displayName: "Alice")
         bob = server.addAccount(displayName: "Bob")
         team = server.addSpace(.space, displayName: "Team", members: [alice, bob])
-        session = AccountSession(
-            account: AccountID(), me: alice.user.name,
-            api: GoogleChatClient(transport: server.makeTransport(), tokens: StaticTokens(token: alice.token)),
-            store: store, clock: SteppingClock(server: server),
-            logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: scratch.url)),
-            timing: timing)
+        var timing = SessionTiming.syncParked
+        timing.deleteReconcileDelays = followUpPolls
+        session = world.syncSession(alice, store: store, timing: timing)
     }
 
-    /// No follow-up polls, so each test decides when Google's tombstones arrive.
-    static var timing: SessionTiming {
-        var timing = SessionTiming.fast
-        timing.deleteReconcileDelays = []
-        return timing
+    static func run(
+        followUpPolls: [Duration] = [], _ body: @escaping @Sendable (EditRig) async throws -> Void
+    ) async throws {
+        try await SimWorld.run { world in try await body(EditRig(world, followUpPolls: followUpPolls)) }
     }
 
     var generation: Generation { session.gate.current! }
@@ -48,169 +47,205 @@ private struct EditRig {
         try await session.engine.syncMessages(team, generation)
     }
 
+    /// Runs the delete to its end, letting time pass when it has to wait out the write spacing.
+    func delete(_ name: MessageName, force: Bool = false) async throws {
+        let session = session
+        try await world.syncAttempt { () async throws(MessageEditError) in
+            try await session.deleteMessage(name, force: force)
+        }.get()
+    }
+
+    func edit(_ name: MessageName, text: String, basedOn: Timestamp) async throws -> Message {
+        let session = session
+        return try await world.syncAttempt { () async throws(MessageEditError) in
+            try await session.editMessage(name, text: text, basedOn: basedOn)
+        }.get()
+    }
+
     func stored(_ name: MessageName) throws -> Message? { try store.message(name) }
 
     func requests(_ method: String) -> [RecordedRequest] {
         server.requests.filter { $0.method == method && $0.account == alice }
     }
+
+    var eventPolls: [RecordedRequest] { requests("GET").filter { $0.path.hasSuffix("/spaceEvents") } }
 }
 
 struct MessageEditTests {
     @Test func anEditIsSentWithItsMentionAndStored() async throws {
-        let rig = try await EditRig()
-        let mine = rig.post("helo", from: rig.alice)
-        try await rig.sync()
-        let copy = try await rig.session.editableCopy(of: mine.name)
-        #expect(!copy.losesFormatting)
+        try await EditRig.run { rig in
+            let mine = rig.post("helo", from: rig.alice)
+            try await rig.sync()
+            let copy = try await rig.session.editableCopy(of: mine.name)
+            #expect(!copy.losesFormatting)
 
-        let wire = "hello <\(rig.bob.user.name.rawValue)>"
-        let updated = try await rig.session.editMessage(mine.name, text: wire, basedOn: copy.message.version)
-        #expect(updated.text == "hello @Bob")
-        #expect(updated.lastUpdateTime != nil)
-        #expect(updated.annotations.contains { $0.kind == .userMention(rig.bob.user.name) })
-        #expect(try rig.stored(mine.name)?.text == "hello @Bob")
-        #expect(rig.requests("PATCH").first?.value(for: "updateMask") == "text")
+            let wire = "hello <\(rig.bob.user.name.rawValue)>"
+            let updated = try await rig.edit(mine.name, text: wire, basedOn: copy.message.version)
+            #expect(updated.text == "hello @Bob")
+            #expect(updated.lastUpdateTime != nil)
+            #expect(updated.annotations.contains { $0.kind == .userMention(rig.bob.user.name) })
+            #expect(try rig.stored(mine.name)?.text == "hello @Bob")
+            #expect(rig.requests("PATCH").first?.value(for: "updateMask") == "text")
+        }
     }
 
     @Test func anEditMadeElsewhereAfterEditingStartedIsNotOverwritten() async throws {
-        let rig = try await EditRig()
-        let mine = rig.post("first", from: rig.alice)
-        try await rig.sync()
-        let copy = try await rig.session.editableCopy(of: mine.name)
-        rig.server.edit(mine.name, text: "changed on the web")
-        rig.server.advance(.seconds(5))
+        try await EditRig.run { rig in
+            let mine = rig.post("first", from: rig.alice)
+            try await rig.sync()
+            let copy = try await rig.session.editableCopy(of: mine.name)
+            rig.server.edit(mine.name, text: "changed on the web")
+            rig.server.advance(.seconds(5))
 
-        await #expect(throws: MessageEditError.self) {
-            try await rig.session.editMessage(mine.name, text: "mine", basedOn: copy.message.version)
+            await #expect(throws: MessageEditError.self) {
+                try await rig.edit(mine.name, text: "mine", basedOn: copy.message.version)
+            }
+            #expect(rig.requests("PATCH").isEmpty)
         }
-        #expect(rig.requests("PATCH").isEmpty)
     }
 
     @Test func anOlderStoredCopyNeverBeatsANewerSyncedEdit() async throws {
-        let rig = try await EditRig()
-        let mine = rig.post("first", from: rig.alice)
-        try await rig.sync()
-        var newer = try #require(try rig.stored(mine.name))
-        newer.text = "newer"
-        newer.lastUpdateTime = rig.server.now.adding(.seconds(60))
-        try rig.store.write(gate: rig.session.gate, generation: rig.generation) {
-            $0.append(.upsertMessages([newer]))
-        }
-        do {
-            _ = try await rig.session.editMessage(mine.name, text: "stale", basedOn: mine.version)
-            Issue.record("expected changedElsewhere")
-        } catch .changedElsewhere(let latest) {
-            #expect(latest.text == "newer")
-        } catch {
-            Issue.record("unexpected \(error)")
+        try await EditRig.run { rig in
+            let mine = rig.post("first", from: rig.alice)
+            try await rig.sync()
+            var newer = try #require(try rig.stored(mine.name))
+            newer.text = "newer"
+            newer.lastUpdateTime = rig.server.now.adding(.seconds(60))
+            let edited = newer
+            try rig.store.write(gate: rig.session.gate, generation: rig.generation) {
+                $0.append(.upsertMessages([edited]))
+            }
+            do {
+                _ = try await rig.edit(mine.name, text: "stale", basedOn: mine.version)
+                Issue.record("expected changedElsewhere")
+            } catch MessageEditError.changedElsewhere(let latest) {
+                #expect(latest.text == "newer")
+            } catch {
+                Issue.record("unexpected \(error)")
+            }
         }
     }
 
     @Test func deletingOwnMessageLeavesATombstoneThatGooglesReplaces() async throws {
-        let rig = try await EditRig()
-        let root = rig.post("root", from: rig.bob)
-        let reply = rig.post("my reply", from: rig.alice, thread: root.thread)
-        try await rig.sync()
+        try await EditRig.run { rig in
+            let root = rig.post("root", from: rig.bob)
+            let reply = rig.post("my reply", from: rig.alice, thread: root.thread)
+            try await rig.sync()
 
-        try await rig.session.deleteMessage(reply.name, force: false)
-        let local = try #require(try rig.stored(reply.name))
-        #expect(local.isDeleted && local.text.isEmpty)
+            try await rig.delete(reply.name)
+            let local = try #require(try rig.stored(reply.name))
+            #expect(local.isDeleted && local.text.isEmpty)
 
-        rig.server.advance(.seconds(5))
-        try await rig.session.engine.syncEvents(rig.team, rig.generation)
-        let synced = try #require(try rig.stored(reply.name))
-        #expect(synced.isDeleted)
-        #expect(synced.thread == root.thread)
-        #expect(synced.isThreadReply)
-        #expect(synced.version > local.version)
+            rig.server.advance(.seconds(5))
+            try await rig.session.engine.syncEvents(rig.team, rig.generation)
+            let synced = try #require(try rig.stored(reply.name))
+            #expect(synced.isDeleted)
+            #expect(synced.thread == root.thread)
+            #expect(synced.isThreadReply)
+            #expect(synced.version > local.version)
+        }
     }
 
     @Test func aManagerDeletesSomeoneElsesMessageAndAMemberIsRefused() async throws {
-        let rig = try await EditRig()
-        let theirs = rig.post("bob's", from: rig.bob)
-        try await rig.sync()
+        try await EditRig.run { rig in
+            let theirs = rig.post("bob's", from: rig.bob)
+            try await rig.sync()
 
-        do {
-            try await rig.session.deleteMessage(theirs.name, force: false)
-            Issue.record("a member shouldn't delete others' messages")
-        } catch .denied {
-        } catch {
-            Issue.record("unexpected \(error)")
+            await #expect(throws: MessageEditError.denied, "a member can't delete others' messages") {
+                try await rig.delete(theirs.name)
+            }
+            #expect(try rig.stored(theirs.name)?.isDeleted == false)
+
+            rig.server.setRole(.assistantManager, of: rig.alice, in: rig.team)
+            try await rig.delete(theirs.name)
+            #expect(try rig.stored(theirs.name)?.isDeleted == true)
         }
-        #expect(try rig.stored(theirs.name)?.isDeleted == false)
-
-        rig.server.setRole(.assistantManager, of: rig.alice, in: rig.team)
-        try await rig.session.deleteMessage(theirs.name, force: false)
-        #expect(try rig.stored(theirs.name)?.isDeleted == true)
     }
 
     @Test func aManagerRefusedByGoogleKeepsTheMessage() async throws {
-        let rig = try await EditRig()
-        let theirs = rig.post("bob's", from: rig.bob)
-        try await rig.sync()
-        rig.server.setRole(.manager, of: rig.alice, in: rig.team)
-        rig.server.fail(
-            FailureRule(
-                route: .deleteMessage, response: .http(status: 403, googleStatus: "PERMISSION_DENIED")))
-        await #expect(throws: MessageEditError.denied) {
-            try await rig.session.deleteMessage(theirs.name, force: false)
+        try await EditRig.run { rig in
+            let theirs = rig.post("bob's", from: rig.bob)
+            try await rig.sync()
+            rig.server.setRole(.manager, of: rig.alice, in: rig.team)
+            rig.server.fail(
+                FailureRule(
+                    route: .deleteMessage, response: .http(status: 403, googleStatus: "PERMISSION_DENIED")))
+            await #expect(throws: MessageEditError.denied) {
+                try await rig.delete(theirs.name)
+            }
+            #expect(try rig.stored(theirs.name)?.isDeleted == false)
         }
-        #expect(try rig.stored(theirs.name)?.isDeleted == false)
     }
 
     @Test func aThreadStarterWithRepliesNeedsForceAndTakesItsRepliesAlong() async throws {
-        let rig = try await EditRig()
-        let root = rig.post("my root", from: rig.alice)
-        let reply = rig.post("reply", from: rig.bob, thread: root.thread)
-        try await rig.sync()
+        try await EditRig.run { rig in
+            let root = rig.post("my root", from: rig.alice)
+            let reply = rig.post("reply", from: rig.bob, thread: root.thread)
+            try await rig.sync()
 
-        await #expect(throws: MessageEditError.hasReplies) {
-            try await rig.session.deleteMessage(root.name, force: false)
+            await #expect(throws: MessageEditError.hasReplies) {
+                try await rig.delete(root.name)
+            }
+            #expect(try rig.stored(root.name)?.isDeleted == false)
+
+            try await rig.delete(root.name, force: true)
+            #expect(try rig.stored(root.name)?.isDeleted == true)
+            #expect(try rig.stored(reply.name)?.isDeleted == true)
+            #expect(rig.requests("DELETE").last?.value(for: "force") == "true")
         }
-        #expect(try rig.stored(root.name)?.isDeleted == false)
-
-        try await rig.session.deleteMessage(root.name, force: true)
-        #expect(try rig.stored(root.name)?.isDeleted == true)
-        #expect(try rig.stored(reply.name)?.isDeleted == true)
-        #expect(rig.requests("DELETE").last?.value(for: "force") == "true")
     }
 
     @Test func aLateLiveCopyDoesNotBringADeletedMessageBack() async throws {
-        let rig = try await EditRig()
-        let mine = rig.post("gone soon", from: rig.alice)
-        try await rig.sync()
-        let before = try #require(try rig.stored(mine.name))
-        try await rig.session.deleteMessage(mine.name, force: false)
-        var late = before
-        late.text = "late edit"
-        late.lastUpdateTime = rig.server.now.adding(.seconds(30))
-        try rig.store.write(gate: rig.session.gate, generation: rig.generation) { $0.append(.upsertMessages([late])) }
-        #expect(try rig.stored(mine.name)?.isDeleted == true)
+        try await EditRig.run { rig in
+            let mine = rig.post("gone soon", from: rig.alice)
+            try await rig.sync()
+            let before = try #require(try rig.stored(mine.name))
+            try await rig.delete(mine.name)
+            var late = before
+            late.text = "late edit"
+            late.lastUpdateTime = rig.server.now.adding(.seconds(30))
+            let copy = late
+            try rig.store.write(gate: rig.session.gate, generation: rig.generation) {
+                $0.append(.upsertMessages([copy]))
+            }
+            #expect(try rig.stored(mine.name)?.isDeleted == true)
+        }
     }
 
     @Test func nothingIsRequestedWhileTheAccountIsPaused() async throws {
-        let rig = try await EditRig()
-        let mine = rig.post("x", from: rig.alice)
-        try await rig.sync()
-        await rig.session.setPaused(true)
-        let before = rig.server.requests.count
-        await #expect(throws: MessageEditError.notAdmitted) {
-            try await rig.session.deleteMessage(mine.name, force: false)
+        try await EditRig.run { rig in
+            let mine = rig.post("x", from: rig.alice)
+            try await rig.sync()
+            await rig.session.setPaused(true)
+            let before = rig.server.requests.count
+            await #expect(throws: MessageEditError.notAdmitted) {
+                try await rig.delete(mine.name)
+            }
+            await #expect(throws: MessageEditError.notAdmitted) {
+                _ = try await rig.edit(mine.name, text: "y", basedOn: mine.version)
+            }
+            await rig.world.settle()
+            #expect(rig.server.requests.count == before)
+            #expect(try rig.stored(mine.name)?.text == "x")
         }
-        await #expect(throws: MessageEditError.notAdmitted) {
-            try await rig.session.editMessage(mine.name, text: "y", basedOn: mine.version)
-        }
-        #expect(rig.server.requests.count == before)
     }
 
     @Test func aDeleteThatSucceededIsReportedEvenIfTheFollowUpPollFails() async throws {
-        let rig = try await EditRig()
-        let mine = rig.post("x", from: rig.alice)
-        try await rig.sync()
-        rig.server.fail(
-            FailureRule(route: .listSpaceEvents, times: nil, response: .http(status: 500, googleStatus: "INTERNAL")))
-        try await rig.session.deleteMessage(mine.name, force: false)
-        #expect(try rig.stored(mine.name)?.isDeleted == true)
+        try await EditRig.run(followUpPolls: [.seconds(3)]) { rig in
+            let mine = rig.post("x", from: rig.alice)
+            try await rig.sync()
+            rig.server.fail(
+                FailureRule(
+                    route: .listSpaceEvents, times: nil, response: .http(status: 500, googleStatus: "INTERNAL")))
+            try await rig.delete(mine.name)
+            #expect(try rig.stored(mine.name)?.isDeleted == true)
+            #expect(rig.eventPolls.isEmpty)
+
+            await rig.world.pass(.seconds(3))
+            #expect(rig.eventPolls.map(\.status) == [500], "the follow-up poll ran and failed")
+            #expect(try rig.stored(mine.name)?.isDeleted == true)
+            #expect(await rig.session.retryUntil == nil, "a failed follow-up poll doesn't back the account off")
+        }
     }
 
     @Test func formattingOnlyGoogleHoldsIsDetected() {
@@ -226,38 +261,51 @@ struct MessageEditTests {
     }
 
     @Test func aRetriedFollowUpPollBringsGooglesTombstone() async throws {
-        var timing = EditRig.timing
-        timing.deleteReconcileDelays = [.seconds(3), .seconds(10)]
-        let rig = try await EditRig(timing: timing)
-        let mine = rig.post("x", from: rig.alice)
-        try await rig.sync()
-        rig.server.fail(
-            FailureRule(route: .listSpaceEvents, times: 1, response: .http(status: 500, googleStatus: "INTERNAL")))
-        try await rig.session.deleteMessage(mine.name, force: false)
-        let local = try #require(try rig.stored(mine.name))
-        for _ in 0..<200 where try rig.stored(mine.name)?.version == local.version {
-            try await Task.sleep(for: .milliseconds(5))
+        try await EditRig.run(followUpPolls: [.seconds(3), .seconds(10), .seconds(30)]) { rig in
+            let mine = rig.post("x", from: rig.alice)
+            try await rig.sync()
+            rig.server.fail(
+                FailureRule(route: .listSpaceEvents, times: 1, response: .http(status: 500, googleStatus: "INTERNAL")))
+            try await rig.delete(mine.name)
+            let local = try #require(try rig.stored(mine.name))
+            #expect(rig.eventPolls.isEmpty, "the first follow-up poll waits")
+
+            await rig.world.pass(.seconds(3))
+            #expect(rig.eventPolls.map(\.status) == [500])
+            #expect(try rig.stored(mine.name)?.version == local.version, "the failed poll changed nothing")
+
+            await rig.world.pass(.seconds(10))
+            #expect(rig.eventPolls.map(\.status) == [500, 200])
+            #expect(try #require(try rig.stored(mine.name)).version > local.version)
+            #expect(rig.world.sleeperDeadlines.isEmpty, "a poll that ran ends the follow-ups")
         }
-        #expect(try rig.stored(mine.name).map { $0.version > local.version } == true)
     }
 
     @Test func pausingDuringPacingStopsTheWrite() async throws {
-        let rig = try await EditRig()
-        let mine = rig.post("x", from: rig.alice)
-        let other = rig.post("y", from: rig.alice)
-        try await rig.sync()
-        try await rig.session.deleteMessage(mine.name, force: false)
-        let session = rig.session
-        let second = Task { () async -> MessageEditError? in
-            do {
+        try await EditRig.run { rig in
+            let world = rig.world
+            let mine = rig.post("x", from: rig.alice)
+            let other = rig.post("y", from: rig.alice)
+            try await rig.sync()
+            try await rig.delete(mine.name)
+            let session = rig.session
+            let second = world.syncStart { () async throws(MessageEditError) in
                 try await session.deleteMessage(other.name, force: false)
-                return nil
-            } catch {
-                return error as? MessageEditError
             }
+            await world.settle()
+            #expect(!second.isFinished)
+            // Nothing else sleeps here: the session loop isn't running and no follow-up polls are set.
+            let sleepers = world.sleeperDeadlines
+            try #require(sleepers.count == 1, "the second delete waits out the spacing")
+            let paced = sleepers[0]
+            #expect(paced > world.now && paced <= world.now.adding(SendQueue.spacing))
+
+            await rig.session.setPaused(true)
+            await world.jump(to: paced)
+            try #require(second.isFinished)
+            await #expect(throws: MessageEditError.notAdmitted) { try await second.value.get() }
+            #expect(rig.requests("DELETE").count == 1)
+            #expect(try rig.stored(other.name)?.isDeleted == false)
         }
-        await rig.session.setPaused(true)
-        #expect(await second.value == MessageEditError.notAdmitted)
-        #expect(rig.requests("DELETE").count == 1)
     }
 }

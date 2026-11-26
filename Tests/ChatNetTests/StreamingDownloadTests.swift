@@ -91,9 +91,9 @@ import Testing
         }
     }
 
-    @Test func cancellingTheCallerCancelsTheTransfer() async {
+    @Test func cancellingTheCallerCancelsTheTransfer() async throws {
         route("/dl/cancel", .init(status: 200, body: Data(count: 10)))
-        let task = Task { () -> TransportError? in
+        let transfer = Recorded { () -> TransportError? in
             do throws(TransportError) {
                 _ = try await transport.stream(request("/dl/cancel")) { _ in }
                 return nil
@@ -101,8 +101,8 @@ import Testing
                 return error
             }
         }
-        task.cancel()
-        let outcome = await task.value
+        transfer.cancel()
+        let outcome = try #require(await transfer.settled(), "the transfer never completed after cancel")
         #expect(outcome == nil || outcome == .cancelled)
     }
 }

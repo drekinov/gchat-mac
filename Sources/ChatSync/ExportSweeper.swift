@@ -4,11 +4,18 @@ import Foundation
 /// afterwards, however many arrive, so a burst of requests costs at most two runs.
 public actor ExportSweeper {
     private let sweep: @Sendable () -> Void
+    private let sleep: @Sendable (Duration) async throws -> Void
     private var running = false
     private var again = false
 
     public init(_ sweep: @escaping @Sendable () -> Void) {
+        self.init(sleep: { try await Task.sleep(for: $0) }, sweep: sweep)
+    }
+
+    /// `sleep` waits between repeated runs and throws when its task is cancelled.
+    init(sleep: @escaping @Sendable (Duration) async throws -> Void, sweep: @escaping @Sendable () -> Void) {
         self.sweep = sweep
+        self.sleep = sleep
     }
 
     /// Runs the cleanup now, or once more after the run in progress.
@@ -29,7 +36,7 @@ public actor ExportSweeper {
     /// so the first run after waking comes promptly.
     public func repeating(every interval: Duration) async {
         while !Task.isCancelled {
-            do { try await Task.sleep(for: interval) } catch { return }
+            do { try await sleep(interval) } catch { return }
             await request()
         }
     }

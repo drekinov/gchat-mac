@@ -48,7 +48,7 @@ public final class MediaLoader: Sendable {
     private let inflight = Mutex<[String: Download]>([:])
     private let exportHook = Mutex<(@Sendable () -> Void)?>(nil)
     private let returnHook = Mutex<(@Sendable () -> Void)?>(nil)
-    private let exportsInFlight = ExportGuard()
+    private let exportsInFlight: ExportGuard
 
     /// A download one caller started and others may wait on, with the size limit it was started with.
     private struct Download: Sendable {
@@ -73,11 +73,20 @@ public final class MediaLoader: Sendable {
 
     private let beforeHook = Mutex<(@Sendable () -> Void)?>(nil)
     private let waitHook = Mutex<(@Sendable () async -> Void)?>(nil)
+    private let sweptHook = Mutex<(@Sendable () -> Void)?>(nil)
+    private let settledHook = Mutex<(@Sendable (Int) -> Void)?>(nil)
 
     /// Test seam: runs, and is awaited, when a caller starts waiting on a download that another caller started.
     var onWaitForDownload: (@Sendable () async -> Void)? {
         get { waitHook.withLock { $0 } }
         set { waitHook.withLock { $0 = newValue } }
+    }
+
+    /// Test seam: runs with a download's size limit once it has finished and left the table, or handed its place
+    /// in it to a larger attempt.
+    var afterDownloadSettles: (@Sendable (Int) -> Void)? {
+        get { settledHook.withLock { $0 } }
+        set { settledHook.withLock { $0 = newValue } }
     }
 
     /// Test seam: the size limit of the download running for `resource`, if there is one.
@@ -94,6 +103,18 @@ public final class MediaLoader: Sendable {
     /// Test seam: how many `close` calls are waiting for running exports to finish.
     var exportCloseWaiters: Int { exportsInFlight.waiterCount }
 
+    /// Test seam: how many exports are between registering and ending.
+    var exportsRunning: Int { exportsInFlight.activeCount }
+
+    /// Test seam: runs when the cleanup asked for after an export has been through the sweeper.
+    var afterSweepRequest: (@Sendable () -> Void)? {
+        get { sweptHook.withLock { $0 } }
+        set { sweptHook.withLock { $0 = newValue } }
+    }
+
+    /// Test seam: why the latest `close` stopped waiting for exports.
+    var exportCloseOutcome: ExportGuard.CloseOutcome? { exportsInFlight.closeOutcome }
+
     /// Test seam: runs after the export is registered and its reader opened, before any file is created.
     var beforeExportWrite: (@Sendable () -> Void)? {
         get { beforeHook.withLock { $0 } }
@@ -106,10 +127,21 @@ public final class MediaLoader: Sendable {
         set { exportHook.withLock { $0 = newValue } }
     }
 
-    public init(
+    public convenience init(
         media: any ChatMediaAPI, cache: MediaCache, exports: ExportDirectory, pipeline: ImagePipeline,
         fetcher: SafeFetcher, gate: SessionGate
     ) {
+        self.init(
+            media: media, cache: cache, exports: exports, pipeline: pipeline, fetcher: fetcher, gate: gate,
+            closeSleep: { try await Task.sleep(for: $0) })
+    }
+
+    /// `closeSleep` is how `close` waits out its timeout; it throws when its task is cancelled.
+    init(
+        media: any ChatMediaAPI, cache: MediaCache, exports: ExportDirectory, pipeline: ImagePipeline,
+        fetcher: SafeFetcher, gate: SessionGate, closeSleep: @escaping @Sendable (Duration) async throws -> Void
+    ) {
+        exportsInFlight = ExportGuard(sleep: closeSleep)
         self.media = media
         self.cache = cache
         self.exports = exports
@@ -202,7 +234,10 @@ public final class MediaLoader: Sendable {
         // logout's wipe rather than opened.
         beforeExportReturns?()
         guard gate.isCurrent(generation) else { throw .retired }
-        Task { await sweeper.request() }
+        Task {
+            await sweeper.request()
+            afterSweepRequest?()
+        }
         return url
     }
 
@@ -347,6 +382,7 @@ public final class MediaLoader: Sendable {
                     running[key] = nil
                 }
             }
+            afterDownloadSettles?(maxBytes)
             if let failure { throw failure }
         }
         return Download(maxBytes: maxBytes, task: task, link: link)
@@ -398,13 +434,33 @@ public final class MediaLoader: Sendable {
 }
 
 final class ExportGuard: Sendable {
+    enum CloseOutcome: Sendable, Equatable {
+        /// No export was running, or the last one ended.
+        case exportsEnded
+        case timedOut
+    }
+
+    /// A `closeAndWait` call that is waiting, and the timer that ends its wait.
+    private struct Waiter {
+        let continuation: CheckedContinuation<CloseOutcome, Never>
+        let timer: Task<Void, Never>
+    }
+
     private struct State {
         var active = 0
         var closed = false
-        var waiters: [@Sendable () -> Void] = []
+        var lastWaiter = 0
+        var waiters: [Int: Waiter] = [:]
+        var closeOutcome: CloseOutcome?
     }
 
     private let state = Mutex(State())
+    private let sleep: @Sendable (Duration) async throws -> Void
+
+    /// `sleep` is how a close waits out its timeout; it throws when its task is cancelled.
+    init(sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
+        self.sleep = sleep
+    }
 
     /// `isCurrent` is evaluated under the lock, so a closed guard or retired session never admits a new export.
     func begin(isCurrent: () -> Bool) -> Bool {
@@ -416,32 +472,56 @@ final class ExportGuard: Sendable {
     }
 
     func end() {
-        let waiters = state.withLock { state -> [@Sendable () -> Void] in
+        let waiters = state.withLock { state -> [Waiter] in
             state.active -= 1
-            guard state.active == 0 else { return [] }
-            defer { state.waiters = [] }
-            return state.waiters
+            guard state.active == 0, !state.waiters.isEmpty else { return [] }
+            state.closeOutcome = .exportsEnded
+            defer { state.waiters = [:] }
+            return Array(state.waiters.values)
         }
-        for waiter in waiters { waiter() }
+        for waiter in waiters {
+            waiter.timer.cancel()
+            waiter.continuation.resume(returning: .exportsEnded)
+        }
     }
 
+    var activeCount: Int { state.withLock { $0.active } }
     var waiterCount: Int { state.withLock { $0.waiters.count } }
+    var closeOutcome: CloseOutcome? { state.withLock { $0.closeOutcome } }
 
-    func closeAndWait(timeout: Duration) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let once = Once()
-            let resume: @Sendable () -> Void = { if once.claim() { continuation.resume() } }
+    /// Refuses new exports and waits until the running ones have ended or `timeout` has passed, whichever comes
+    /// first. Each call waits on its own: the last export ending answers every waiting call, a timeout only its own.
+    @discardableResult
+    func closeAndWait(timeout: Duration) async -> CloseOutcome {
+        await withCheckedContinuation { (continuation: CheckedContinuation<CloseOutcome, Never>) in
             let idle = state.withLock { state -> Bool in
                 state.closed = true
-                guard state.active > 0 else { return true }
-                state.waiters.append(resume)
+                guard state.active > 0 else {
+                    state.closeOutcome = .exportsEnded
+                    return true
+                }
+                state.lastWaiter += 1
+                let id = state.lastWaiter
+                // Started under the lock that registers the waiter, so whoever claims the waiter has its timer too.
+                // The guard is held only weakly: neither a waiter nor its timer keeps it alive.
+                let timer = Task { [weak self, sleep] in
+                    do { try await sleep(timeout) } catch { return }
+                    let expired = self?.expire(id)
+                    expired?.resume(returning: .timedOut)
+                }
+                state.waiters[id] = Waiter(continuation: continuation, timer: timer)
                 return false
             }
-            if idle { return resume() }
-            Task {
-                try? await Task.sleep(for: timeout)
-                resume()
-            }
+            if idle { continuation.resume(returning: .exportsEnded) }
+        }
+    }
+
+    /// Takes the waiter out when its timeout comes first; nil when the exports ended before it.
+    private func expire(_ id: Int) -> CheckedContinuation<CloseOutcome, Never>? {
+        state.withLock { state in
+            guard let waiter = state.waiters.removeValue(forKey: id) else { return nil }
+            state.closeOutcome = .timedOut
+            return waiter.continuation
         }
     }
 }

@@ -94,33 +94,31 @@ extension Fixtures {
 }
 
 @Suite struct TimedReserveTests {
-    @Test func aTimerFiringBeforeTheWaiterIsQueuedStillTimesOut() async throws {
+    @Test(.timeLimit(.minutes(2))) func theExpiryLaunchesOnlyAfterTheWaiterIsQueued() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(100)
-        let queuedWhenFired = Mutex<Int?>(nil)
-        let outcome = await withTaskGroup(of: String.self) { group in
-            group.addTask {
-                do {
-                    _ = try await budget.reserve(50, timeout: .milliseconds(1)) {
-                        queuedWhenFired.withLock { $0 = budget.waiterCount }
-                    }
-                    return "granted"
-                } catch MemoryBudgetError.timedOut {
-                    return "timedOut"
-                } catch {
-                    return "other"
-                }
+        defer { held.release() }
+        let queuedAtLaunch = Mutex<Bool?>(nil)
+        let expiry = Gate()
+        let waiter = Recorded { () -> MemoryBudgetError? in
+            do {
+                _ = try await budget.reserve(
+                    50, timeout: .seconds(3600), expiry: { try await expiry.wait() },
+                    onExpiryLaunch: { queued in queuedAtLaunch.withLock { $0 = queued } })
+                return nil
+            } catch let error as MemoryBudgetError {
+                return error
+            } catch {
+                return .invalidSize
             }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(10))
-                return "hung"
-            }
-            let first = await group.next()!
-            group.cancelAll()
-            return first
         }
-        #expect(outcome == "timedOut")
-        #expect(queuedWhenFired.withLock { $0 } == 1)
+        defer { waiter.cancel() }
+        try #require(await eventually { queuedAtLaunch.withLock { $0 } != nil && expiry.waiting == 1 })
+        #expect(queuedAtLaunch.withLock { $0 } == true)
+        #expect(budget.waiterCount == 1)
+        expiry.open()
+        #expect(await waiter.settled() == .some(.timedOut))
+        #expect(budget.waiterCount == 0)
         held.release()
         #expect(await budget.available == 100)
     }
@@ -129,7 +127,9 @@ extension Fixtures {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(100)
         for _ in 0..<200 {
-            await #expect(throws: MemoryBudgetError.timedOut) { _ = try await budget.reserve(10, timeout: .zero) }
+            let attempt = Recorded(catching: { try await budget.reserve(10, timeout: .zero) })
+            let refused = try #require(await attempt.settled(), "a wait with no time left never ended")
+            #expect(throws: MemoryBudgetError.timedOut) { _ = try refused.get() }
         }
         held.release()
         #expect(await budget.available == 100)
@@ -138,20 +138,20 @@ extension Fixtures {
     @Test func aTimeoutDoesNotDisturbTheQueueBehindIt() async throws {
         let budget = MemoryBudget(capacity: 100)
         let held = try await budget.reserve(90)
-        let (expiry, fire) = AsyncStream<Void>.makeStream()
-        defer { fire.finish() }
-        let head = Task {
-            try await budget.reserve(50, timeout: .milliseconds(1)) {
-                for await _ in expiry {}
-            }
-        }
-        try #require(await waitUntil { budget.waiterCount == 1 })
-        let behind = Task { try await budget.reserve(5) }
-        try #require(await waitUntil { budget.waiterCount == 2 })
-        fire.finish()
-        await #expect(throws: MemoryBudgetError.timedOut) { _ = try await head.value }
-        try #require(await waitUntil { budget.waiterCount == 0 })
-        let granted = try await behind.value
+        let expiry = Gate()
+        let head = Recorded(catching: {
+            try await budget.reserve(50, timeout: .seconds(3600), expiry: { try await expiry.wait() })
+        })
+        defer { head.cancel() }
+        try #require(await eventually { budget.waiterCount == 1 })
+        let behind = Recorded(catching: { try await budget.reserve(5) })
+        defer { behind.cancel() }
+        try #require(await eventually { budget.waiterCount == 2 })
+        expiry.open()
+        let refused = try #require(await head.settled())
+        #expect(throws: MemoryBudgetError.timedOut) { _ = try refused.get() }
+        try #require(await eventually { budget.waiterCount == 0 })
+        let granted = try #require(await behind.settled()).get()
         #expect(granted.bytes == 5)
         #expect(held.bytes == 90)
         #expect(await budget.available == 5)

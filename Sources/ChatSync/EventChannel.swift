@@ -239,7 +239,8 @@ public actor EventChannel {
                     guard isCurrent(cycle, generation) else { return }
                     guard usable else {
                         await publishStatus()
-                        await clock.sleep(until: nextHealth ?? clock.now().adding(Self.healthInterval))
+                        let deadline = nextHealth ?? clock.now().adding(Self.healthInterval)
+                        await clock.sleep(until: deadline)
                         continue
                     }
                 }
@@ -256,9 +257,9 @@ public actor EventChannel {
                 if processFailures < Self.degradedAfter { pullDegraded = nil }
                 await publishStatus()
                 if !received.isEmpty {
-                    try? await clock.sleep(for: Self.busyFloor)
+                    await park(for: Self.busyFloor)
                 } else if held < Self.heldPull {
-                    try? await clock.sleep(for: Self.emptyFloor)
+                    await park(for: Self.emptyFloor)
                 }
             } catch {
                 guard isCurrent(cycle, generation) else { return }
@@ -270,9 +271,13 @@ public actor EventChannel {
                 let streak = max(failures, processFailures)
                 if streak >= Self.degradedAfter { pullDegraded = Self.reason(for: error) }
                 await publishStatus()
-                try? await clock.sleep(for: Self.backoff(streak))
+                await park(for: Self.backoff(streak))
             }
         }
+    }
+
+    func park(for duration: Duration) async {
+        try? await clock.sleep(for: duration)
     }
 
     static func backoff(_ failures: Int) -> Duration {

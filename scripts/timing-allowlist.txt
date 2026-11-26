@@ -1,0 +1,17 @@
+# Files exempt from scripts/check_test_timing.py. One path per line.
+
+[real-time]
+# The simulation's watchdog is the one deliberate real-time bound in a simulated-world test.
+Tests/ChatSyncTests/SimWorld.swift
+# The one hang guard of each target that runs on real threads.
+Tests/ChatAuthTests/Eventually.swift
+Tests/ChatNetTests/Eventually.swift
+Tests/ChatSyncTests/Eventually.swift
+
+[session-task]
+# The registry's task helper: every session task is created here, on the session's executor.
+Sources/ChatSync/Support.swift
+# Run no session time; their work is owned by the UI or the media cache.
+Sources/ChatSync/AvatarLoads.swift
+Sources/ChatSync/ComposerDrafts.swift
+Sources/ChatSync/MediaLoader.swift

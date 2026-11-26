@@ -39,41 +39,6 @@ final class ManualClock: SyncClock {
     var sleeps: [Duration] { state.withLock { $0.sleeps } }
 }
 
-/// Server time plus virtual time that runs ahead by every sleep, so polling loops tick fast. While held, only
-/// `advance` moves it, and sleeps still return.
-final class SteppingClock: SyncClock {
-    private struct State {
-        var drift = Duration.zero
-        var held = false
-        var sleepsBegun = 0
-    }
-
-    let server: FakeChatServer
-    private let state = Mutex(State())
-
-    init(server: FakeChatServer) { self.server = server }
-
-    func now() -> Timestamp { server.now.adding(state.withLock { $0.drift }) }
-
-    func sleep(for duration: Duration) async throws {
-        state.withLock { $0.sleepsBegun += 1 }
-        try await Task.sleep(for: .milliseconds(1))
-        state.withLock { if !$0.held { $0.drift += duration } }
-    }
-
-    var sleepsBegun: Int { state.withLock { $0.sleepsBegun } }
-    func hold() { state.withLock { $0.held = true } }
-    func release() { state.withLock { $0.held = false } }
-    func advance(_ duration: Duration) { state.withLock { $0.drift += duration } }
-}
-
-/// Server time, with sleeps that really wait.
-struct RealSleepClock: SyncClock {
-    let server: FakeChatServer
-    func now() -> Timestamp { server.now }
-    func sleep(for duration: Duration) async throws { try await Task.sleep(for: duration) }
-}
-
 extension Timestamp {
     func offset(from other: Timestamp) -> Duration {
         .seconds(seconds - other.seconds) + .nanoseconds(Int64(nanos) - Int64(other.nanos))
@@ -104,15 +69,6 @@ final class Recorder<Element: Sendable>: Sendable {
 
 func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
 
-func poll(timeout: Duration = .seconds(5), _ condition: @Sendable () -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now.advanced(by: timeout)
-    while ContinuousClock.now < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(2))
-    }
-    return condition()
-}
-
 // MARK: Barrier and instrumented API
 
 /// Parks calls that reach `pass()` while armed, so a test can act between a network await and the commit.
@@ -124,6 +80,9 @@ final class Barrier: Sendable {
     }
 
     private let state = Mutex(State())
+    private let onPass: @Sendable () -> Void
+
+    init(onPass: @escaping @Sendable () -> Void = {}) { self.onPass = onPass }
 
     func arm() {
         state.withLock { state in
@@ -133,6 +92,7 @@ final class Barrier: Sendable {
     }
 
     func pass() async {
+        onPass()
         if state.withLock({ !$0.armed }) { return }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let resumeNow = state.withLock { state -> Bool in
@@ -147,8 +107,9 @@ final class Barrier: Sendable {
 
     var arrivals: Int { state.withLock { $0.arrivals } }
 
-    func waitForArrival(_ count: Int = 1, timeout: Duration = .seconds(5)) async -> Bool {
-        await poll(timeout: timeout) { self.arrivals >= count }
+    /// For tests on real threads: a call parked here stays parked until `release()`.
+    func waitForArrival(_ count: Int = 1) async -> Bool {
+        await eventually { self.arrivals >= count }
     }
 
     /// Wakes every parked call; later calls pass straight through until `arm()`.
@@ -463,10 +424,14 @@ final class SnapshotRecorder: Sendable {
     private let storage: Storage
     private let task: Task<Void, Never>
 
-    init(_ stream: AsyncStream<AccountSnapshot>) {
+    /// `spawn` decides where the consumer runs.
+    init(
+        _ stream: AsyncStream<AccountSnapshot>,
+        spawn: (@escaping @Sendable () async -> Void) -> Task<Void, Never>
+    ) {
         let storage = Storage()
         self.storage = storage
-        task = Task {
+        task = spawn {
             for await snapshot in stream { storage.history.withLock { $0.append(snapshot) } }
             storage.finished.withLock { $0 = true }
         }
@@ -477,18 +442,6 @@ final class SnapshotRecorder: Sendable {
     var isFinished: Bool { storage.finished.withLock { $0 } }
 
     func cancel() { task.cancel() }
-
-    /// The first snapshot at or after position `since` in the history that satisfies `predicate`.
-    func wait(
-        since: Int = 0, timeout: Duration = .seconds(5), where predicate: @escaping @Sendable (AccountSnapshot) -> Bool
-    ) async -> AccountSnapshot? {
-        let found = await poll(timeout: timeout) { self.history.dropFirst(since).contains(where: predicate) }
-        return found ? history.dropFirst(since).first(where: predicate) : nil
-    }
-
-    func waitForFinish(timeout: Duration = .seconds(5)) async -> Bool {
-        await poll(timeout: timeout) { self.isFinished }
-    }
 }
 
 // MARK: Logout doubles
@@ -603,40 +556,6 @@ final class RecordingRevoker: TokenRevoker {
     func revoke(_ token: String) async {
         tokens.append(token)
         eraser.observe("revoke")
-    }
-}
-
-/// A wait that ignores cancellation until `release()` (or a 60 s safety net).
-final class UncancellableWait: Sendable {
-    private struct State {
-        var released = false
-        var waiter: CheckedContinuation<Void, Never>?
-    }
-
-    private let state = Mutex(State())
-
-    init() {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 60) { [self] in release() }
-    }
-
-    func wait() async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let resumeNow = state.withLock { state -> Bool in
-                if state.released { return true }
-                state.waiter = continuation
-                return false
-            }
-            if resumeNow { continuation.resume() }
-        }
-    }
-
-    func release() {
-        let waiter = state.withLock { state -> CheckedContinuation<Void, Never>? in
-            state.released = true
-            defer { state.waiter = nil }
-            return state.waiter
-        }
-        waiter?.resume()
     }
 }
 

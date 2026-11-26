@@ -16,22 +16,7 @@ final class TransferSession: Sendable {
         session.invalidateAndCancel()
     }
 
-    static func map(_ error: URLError) -> TransportError {
-        switch error.code {
-        case .timedOut: .timedOut
-        case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff, .cannotFindHost, .dnsLookupFailed,
-            .cannotConnectToHost:
-            .offline
-        case .networkConnectionLost: .connectionLost
-        case .cancelled: .cancelled
-        case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate,
-            .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid, .clientCertificateRejected,
-            .clientCertificateRequired, .appTransportSecurityRequiresSecureConnection:
-            .tls
-        case .dataLengthExceedsMaximum: .responseTooLarge
-        default: .other(code: error.code.rawValue)
-        }
-    }
+    static func map(_ error: URLError) -> TransportError { TransportError(error) }
 
     func run(
         _ urlRequest: URLRequest, mode: Transfer.Mode, maxBytes: Int, fileSource: Transfer.FileSource? = nil,
