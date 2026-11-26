@@ -37,13 +37,13 @@ extension OAuthNetworkTests {
             fake.holdTokens()
             defer { fake.releaseTokens() }
             let provider = try provider()
-            let a = Task { await fetchToken(provider) }
-            let b = Task { await fetchToken(provider) }
+            let a = Recorded { await fetchToken(provider) }
+            let b = Recorded { await fetchToken(provider) }
             try #require(await eventually { await provider.refreshWaiters == 2 })
             try #require(await eventually { fake.parkedTokenResponses == 1 })
             fake.releaseTokens()
-            let first = try await a.value.get()
-            #expect(try await b.value.get() == first)
+            let first = try #require(await a.settled()).get()
+            #expect(try #require(await b.settled()).get() == first)
             #expect(fake.tokenRequests().count == 1)
 
             await provider.invalidate(first)
