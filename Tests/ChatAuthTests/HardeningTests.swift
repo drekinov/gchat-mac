@@ -152,6 +152,24 @@ extension OAuthNetworkTests {
         #expect(await race.transport.cancelled.opened())
     }
 
+    /// A second task waiting to hear that the deadline passed would give a late response one more chance to win.
+    @Test func theDeadlineIsClaimedByTheTaskThatWaitedForIt() async throws {
+        let transport = GatedTransport()
+        defer { transport.release.open() }
+        let slept = Mutex<Int?>(nil)
+        let claimed = Mutex<Int?>(nil)
+        var endpoints = OAuthEndpoints(
+            transport: transport, client: OAuthClientConfig(clientID: "id", clientSecret: "secret"))
+        endpoints.sleep = { _ in slept.withLock { $0 = withUnsafeCurrentTask { $0?.hashValue } } }
+        endpoints.onRevokeOutcome = { outcome in
+            if outcome == .deadline { claimed.withLock { $0 = withUnsafeCurrentTask { $0?.hashValue } } }
+        }
+        let revoke = Recorded { [endpoints] in await endpoints.revoke("rt-seed") }
+        try #require(await revoke.settled() != nil)
+        let sleeper = try #require(slept.withLock { $0 })
+        #expect(claimed.withLock { $0 } == sleeper)
+    }
+
     @Test func revokeReturnsWithTheResponseAndStopsWaitingForTheDeadline() async throws {
         let race = Race()
         defer { race.releaseAll() }

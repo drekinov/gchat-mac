@@ -38,7 +38,7 @@ public struct ExportDirectory: Sendable {
     ///
     /// Within this process the steps at one root take turns in the order they asked, so a long sweep, which asks
     /// again for each entry, lets an export or a wipe that is waiting in before its next entry. Roots don't wait for
-    /// each other.
+    /// each other. A root is its path, so steps keep taking turns even if the directory there is replaced.
     private static let turns = TurnLines()
 
     /// The file other processes using the same container, such as a second copy of the app, take turns through. It
@@ -59,6 +59,10 @@ public struct ExportDirectory: Sendable {
     /// One step's place in a root's line. Granted at most once.
     final class LockTurn: Sendable {
         private let granted = DispatchSemaphore(value: 0)
+        /// When the step gives up, on the clock its `Seams.now` reads. A turn nobody queues has none.
+        fileprivate let deadline: Duration
+
+        init(deadline: Duration = .zero) { self.deadline = deadline }
 
         fileprivate func grant() { granted.signal() }
 
@@ -72,53 +76,68 @@ public struct ExportDirectory: Sendable {
     /// The turns of this process's steps, one line per export root. A root has an entry only while a step holds its
     /// slot.
     private final class TurnLines: Sendable {
-        struct Root: Hashable {
-            let device: dev_t
-            let inode: ino_t
-        }
-
         private struct Line {
             var holder: LockTurn
+            /// False while the holder was handed the slot and its thread hasn't come back for it yet.
+            var taken: Bool
             var waiting: [LockTurn] = []
+
+            /// Hands the slot to the first in line that hasn't given up by `now`, when there is one. `woken` gets
+            /// that step and the ones passed over, which wake to find their wait has run out.
+            mutating func handOn(_ now: Duration, waking woken: inout [LockTurn]) -> Bool {
+                woken += waiting.filter { $0.deadline <= now }
+                waiting.removeAll { $0.deadline <= now }
+                guard !waiting.isEmpty else { return false }
+                holder = waiting.removeFirst()
+                taken = false
+                woken.append(holder)
+                return true
+            }
         }
 
-        private let lines = Mutex<[Root: Line]>([:])
+        private let lines = Mutex<[String: Line]>([:])
 
         /// True when `turn` holds the root's slot: it was free, or the turn was handed it. Otherwise the turn is in
-        /// line, joining at the end if it wasn't already.
-        func take(_ turn: LockTurn, at root: Root) -> Bool {
-            lines.withLock { lines in
+        /// line, joining at the end if it wasn't already. A slot handed to a step that gave up before coming back for
+        /// it moves on, so a stalled thread can't keep the root reserved.
+        func take(_ turn: LockTurn, at root: String, now: Duration) -> Bool {
+            var woken: [LockTurn] = []
+            let holds = lines.withLock { lines -> Bool in
                 guard var line = lines[root] else {
-                    lines[root] = Line(holder: turn)
+                    lines[root] = Line(holder: turn, taken: true)
                     return true
                 }
-                if line.holder === turn { return true }
-                if !line.waiting.contains(where: { $0 === turn }) {
-                    line.waiting.append(turn)
-                    lines[root] = line
+                defer { lines[root] = line }
+                if line.holder === turn {
+                    line.taken = true
+                    return true
                 }
-                return false
+                if !line.waiting.contains(where: { $0 === turn }) { line.waiting.append(turn) }
+                guard !line.taken, line.holder.deadline <= now else { return false }
+                if !line.handOn(now, waking: &woken) {
+                    // Everyone in line has given up, this step included; it takes the slot and finds that out.
+                    line.holder = turn
+                }
+                line.taken = line.holder === turn
+                return line.taken
             }
+            for other in woken where other !== turn { other.grant() }
+            return holds
         }
 
         /// Gives the turn up. Holding the slot, it hands it to the first in line; waiting, it leaves the line.
-        func leave(_ turn: LockTurn, at root: Root) {
-            let next = lines.withLock { lines -> LockTurn? in
-                guard var line = lines[root] else { return nil }
+        func leave(_ turn: LockTurn, at root: String, now: Duration) {
+            var woken: [LockTurn] = []
+            lines.withLock { lines in
+                guard var line = lines[root] else { return }
                 guard line.holder === turn else {
                     line.waiting.removeAll { $0 === turn }
                     lines[root] = line
-                    return nil
+                    return
                 }
-                guard !line.waiting.isEmpty else {
-                    lines[root] = nil
-                    return nil
-                }
-                line.holder = line.waiting.removeFirst()
-                lines[root] = line
-                return line.holder
+                lines[root] = line.handOn(now, waking: &woken) ? line : nil
             }
-            next?.grant()
+            for other in woken { other.grant() }
         }
     }
 
@@ -132,14 +151,12 @@ public struct ExportDirectory: Sendable {
         _ root: URL, seams: Seams, site: LockSite, _ body: () throws(ExportError) -> T
     ) throws(ExportError) -> T {
         let deadline = seams.now() + seams.lockWait
-        var info = stat()
-        guard stat(root.path, &info) == 0 else { throw .io(code: Int(errno)) }
-        let line = TurnLines.Root(device: info.st_dev, inode: info.st_ino)
+        let line = root.standardizedFileURL.path
         let path = root.appendingPathComponent(lockName).path
         while true {
-            let turn = LockTurn()
+            let turn = LockTurn(deadline: deadline)
             var queued = false
-            while !turns.take(turn, at: line) {
+            while !turns.take(turn, at: line, now: seams.now()) {
                 if !queued {
                     queued = true
                     seams.onLockBusy(site)
@@ -147,7 +164,7 @@ public struct ExportDirectory: Sendable {
                 let left = deadline - seams.now()
                 guard left > .zero else {
                     // Handed the slot at this very moment, it goes on to the next in line.
-                    turns.leave(turn, at: line)
+                    turns.leave(turn, at: line, now: seams.now())
                     throw .io(code: Int(ETIMEDOUT))
                 }
                 seams.wait(turn, left)
@@ -155,7 +172,7 @@ public struct ExportDirectory: Sendable {
             let fd = Darwin.open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_EXLOCK | O_NONBLOCK, 0o600)
             guard fd >= 0 else {
                 let code = errno
-                turns.leave(turn, at: line)
+                turns.leave(turn, at: line, now: seams.now())
                 guard code == EWOULDBLOCK else { throw .io(code: Int(code)) }
                 seams.onLockBusy(site)
                 let left = deadline - seams.now()
@@ -166,7 +183,7 @@ public struct ExportDirectory: Sendable {
             defer {
                 // The shared lock goes first, so whoever is handed the slot finds it free.
                 Darwin.close(fd)
-                turns.leave(turn, at: line)
+                turns.leave(turn, at: line, now: seams.now())
             }
             // A turn can come after the wait ran out; it holds both, but nothing starts.
             guard seams.now() < deadline else { throw .io(code: Int(ETIMEDOUT)) }

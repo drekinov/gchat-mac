@@ -257,9 +257,9 @@ extension ExportLockSuites {
 
         /// A sweep of `directory` that stops at the first old entry, holding the lock, until `.resume` is recorded.
         private func stalledSweep(
-            of directory: AccountDirectory, _ steps: Events<Step>
+            of directory: AccountDirectory, _ steps: Events<Step>, seams: ExportDirectory.Seams = .patient
         ) async throws -> Background<Result<Void, any Error>> {
-            var stalling = ExportDirectory.Seams.patient
+            var stalling = seams
             stalling.beforePruneRemoval = { _ in
                 steps.record(.holding)
                 _ = steps.block { $0.contains(.resume) }
@@ -418,6 +418,78 @@ extension ExportLockSuites {
             #expect(waits.all == [ExportDirectory.lockWait] + Array(repeating: ExportDirectory.lockRetry, count: 200))
             #expect(other.current != nil)
             try await sweep.value.get()
+        }
+
+        @Test func aSlotHandedToAStepThatGaveUpBeforeComingBackForItMovesOn() async throws {
+            enum Seen: Sendable, Equatable { case stalledQueued, stalledWaiting, wake, laterQueued, laterAdmitted }
+            let (f, plain, _, reader) = try exportFixture(pattern(10))
+            defer { withExtendedLifetime(f) {} }
+            try makeOld(try plain.export(from: reader, filename: "old.bin", placement: .unique))
+            let directory = f.directory
+            let steps = Events<Step>()
+            let seen = Events<Seen>()
+            defer { for log in [steps.close, seen.close] { log() } }
+            // One clock for every step, moved only by the test.
+            let clock = Locked(Duration.zero)
+            var timed = ExportDirectory.Seams.patient
+            timed.now = { clock.current }
+            let sweep = try await stalledSweep(of: directory, steps, seams: timed)
+
+            // This wipe's thread stays away however its turn is granted, until the test wakes it.
+            var stalled = timed
+            stalled.lockWait = .seconds(5)
+            stalled.onLockBusy = { _ in seen.record(.stalledQueued) }
+            stalled.wait = { _, _ in
+                seen.record(.stalledWaiting)
+                _ = seen.block { $0.contains(.wake) }
+            }
+            let gaveUp = onThread { [stalled] in try ExportDirectory(directory: directory, seams: stalled).wipe() }
+            try await seen.wait(for: .stalledWaiting)
+            steps.record(.resume)
+            try await sweep.value.get()
+
+            // The slot is the stalled wipe's now. Its wait runs out before its thread is back.
+            clock.update { $0 = .seconds(5) }
+            var later = timed
+            later.onLockBusy = { _ in seen.record(.laterQueued) }
+            later.onLockAdmitted = { _ in seen.record(.laterAdmitted) }
+            let wipe = onThread { [later] in try ExportDirectory(directory: directory, seams: later).wipe() }
+            try await seen.wait { $0.contains(.laterQueued) || $0.contains(.laterAdmitted) }
+            #expect(!seen.all.contains(.laterQueued), "the root stayed reserved for a step that had given up")
+            seen.record(.wake)
+            let stalledResult = try await gaveUp.value
+            #expect(throws: timedOut) { try stalledResult.get() }
+            try await wipe.value.get()
+            #expect(seen.count(of: .laterAdmitted) == 1)
+        }
+
+        @Test func stepsKeepTakingTurnsAtARootWhoseDirectoryIsReplaced() async throws {
+            enum Seen: Sendable, Equatable { case queued, admitted }
+            let (f, plain, _, reader) = try exportFixture(pattern(10))
+            defer { withExtendedLifetime(f) {} }
+            try makeOld(try plain.export(from: reader, filename: "old.bin", placement: .unique))
+            let directory = f.directory
+            let steps = Events<Step>()
+            let seen = Events<Seen>()
+            defer { for log in [steps.close, seen.close] { log() } }
+            let sweep = try await stalledSweep(of: directory, steps)
+
+            let replaced = directory.root.deletingLastPathComponent()
+                .appendingPathComponent(directory.root.lastPathComponent + "-replaced")
+            defer { try? FileManager.default.removeItem(at: replaced) }
+            try FileManager.default.moveItem(at: directory.root, to: replaced)
+            try directory.createExports()
+
+            var seams = ExportDirectory.Seams.patient
+            seams.onLockBusy = { _ in seen.record(.queued) }
+            seams.onLockAdmitted = { _ in seen.record(.admitted) }
+            let wipe = onThread { [seams] in try ExportDirectory(directory: directory, seams: seams).wipe() }
+            try await seen.wait { !$0.isEmpty }
+            #expect(seen.all == [.queued], "a step started beside the one still running at this path")
+            steps.record(.resume)
+            _ = try await sweep.value
+            try await wipe.value.get()
+            #expect(seen.all == [.queued, .admitted])
         }
 
         @Test func stepsWaitingAtARootTakeTheirTurnsInTheOrderTheyAsked() async throws {

@@ -108,26 +108,25 @@ public struct OAuthEndpoints: Sendable {
         let report = onRevokeOutcome
         // Unstructured, so a transport that ignores cancellation can't hold revoke past the deadline.
         let send = Task { _ = try? await transport.send(request) }
-        let timer = Task { try? await sleep(deadline) }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let once = RevokeOnce()
-            Task {
-                await send.value
-                if once.claim() {
-                    report(.response)
-                    continuation.resume()
-                }
-            }
-            Task {
-                await timer.value
+            // The timer claims the race the moment its sleep ends, with no hop in which a late response could win.
+            let timer = Task {
+                do { try await sleep(deadline) } catch { return }
                 if once.claim() {
                     report(.deadline)
                     continuation.resume()
                 }
             }
+            Task {
+                await send.value
+                guard once.claim() else { return }
+                timer.cancel()
+                report(.response)
+                continuation.resume()
+            }
         }
         send.cancel()
-        timer.cancel()
     }
 
     public func userinfo(accessToken: String) async throws(AuthError) -> UserIdentity {
