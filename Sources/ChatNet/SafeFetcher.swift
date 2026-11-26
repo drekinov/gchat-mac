@@ -17,6 +17,7 @@ public final class SafeFetcher: Sendable {
     ]
     public static let maxRedirects = 3
     public static let deadline: Duration = .seconds(20)
+    static let requestTimeout: TimeInterval = 20
     static let maxResolverThreads = 8
     static let lookupSlots = MemoryBudget(capacity: maxResolverThreads)
 
@@ -40,6 +41,7 @@ public final class SafeFetcher: Sendable {
     private let session: TransferSession
     private let resolver: Resolver?
     private let deadline: Duration
+    private let requestTimeout: TimeInterval
     private let slots: MemoryBudget
     private let expiries: Expiries
 
@@ -53,12 +55,13 @@ public final class SafeFetcher: Sendable {
 
     init(
         allowedHosts: Set<String>, protocolClasses: [AnyClass]?, resolver: Resolver?,
-        deadline: Duration = SafeFetcher.deadline, slots: MemoryBudget = SafeFetcher.lookupSlots,
-        expiries: Expiries = Expiries()
+        deadline: Duration = SafeFetcher.deadline, requestTimeout: TimeInterval = SafeFetcher.requestTimeout,
+        slots: MemoryBudget = SafeFetcher.lookupSlots, expiries: Expiries = Expiries()
     ) {
         self.allowedHosts = Set(allowedHosts.map { $0.lowercased() })
         self.resolver = resolver
         self.deadline = deadline
+        self.requestTimeout = requestTimeout
         self.slots = slots
         self.expiries = expiries
         let configuration = URLSessionConfiguration.ephemeral
@@ -71,7 +74,7 @@ public final class SafeFetcher: Sendable {
         configuration.waitsForConnectivity = false
         configuration.httpMaximumConnectionsPerHost = 4
         configuration.tlsMinimumSupportedProtocolVersion = .TLSv12
-        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForRequest = requestTimeout
         if let protocolClasses { configuration.protocolClasses = protocolClasses }
         session = TransferSession(configuration: configuration)
     }
@@ -126,7 +129,7 @@ public final class SafeFetcher: Sendable {
                 var request = URLRequest(url: url)
                 request.httpMethod = "GET"
                 request.httpShouldHandleCookies = false
-                request.timeoutInterval = 20
+                request.timeoutInterval = requestTimeout
                 let buffer = Mutex(Data())
                 let head = try await session.run(request, mode: .buffered, maxBytes: maxBytes) { chunk in
                     buffer.withLock { $0.append(chunk) }

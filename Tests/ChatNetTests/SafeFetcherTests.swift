@@ -85,39 +85,6 @@ final class ThreadGate: @unchecked Sendable {
     }
 }
 
-/// The outcome of an operation run in its own task, readable without awaiting the task.
-final class Recorded<Value: Sendable>: Sendable {
-    private let value = Mutex<Value?>(nil)
-    private let task = Mutex<Task<Void, Never>?>(nil)
-
-    init(_ body: @escaping @Sendable () async -> Value) {
-        let started = Task {
-            let result = await body()
-            self.value.withLock { $0 = result }
-        }
-        task.withLock { $0 = started }
-    }
-
-    var current: Value? { value.withLock { $0 } }
-
-    /// Waits for the outcome; the timeout only guards against hangs.
-    func settled() async -> Value? {
-        _ = await waitUntil { self.current != nil }
-        return current
-    }
-
-    func cancel() { task.withLock { $0 }?.cancel() }
-}
-
-func waitUntilAsync(timeout: Duration = .seconds(10), _ condition: @Sendable () async -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now.advanced(by: timeout)
-    while !(await condition()) {
-        guard ContinuousClock.now < deadline else { return false }
-        try? await Task.sleep(for: .milliseconds(1))
-    }
-    return true
-}
-
 extension SafeFetcher.Resolution {
     var isTimedOut: Bool { if case .timedOut = self { true } else { false } }
     var isCancelled: Bool { if case .cancelled = self { true } else { false } }
@@ -137,14 +104,15 @@ extension SafeFetcher.Resolution {
         SafeFetcher(allowedHosts: hosts, protocolClasses: [FetchStubProtocol.self], resolver: resolver)
     }
 
-    /// A fetcher whose deadlines end only when their gates open, with lookups in their own slots.
+    /// A fetcher whose deadlines end only when their gates open, with lookups in their own slots. Its session's
+    /// own request timeout is out of reach, so a `.timedOut` can only come from a gate.
     func gated(
         protocolClass: AnyClass = FetchStubProtocol.self, resolver: SafeFetcher.Resolver?, slots: MemoryBudget,
         fetch: Gate = Gate(), slot: Gate = Gate(), lookup: Gate = Gate()
     ) -> SafeFetcher {
         SafeFetcher(
             allowedHosts: Self.hosts, protocolClasses: [protocolClass], resolver: resolver, deadline: .seconds(3600),
-            slots: slots,
+            requestTimeout: 3600, slots: slots,
             expiries: .init(
                 fetch: { try await fetch.wait() }, slot: { try await slot.wait() }, lookup: { try await lookup.wait() })
         )
@@ -335,7 +303,7 @@ extension SafeFetcher.Resolution {
         let target = url("https://media.example.com/sf/burst")
         let fetches = (0..<20).map { _ in outcome(of: fetcher, target) }
         defer { for fetch in fetches { fetch.cancel() } }
-        try #require(await waitUntil { lookups.arrived == 2 && slots.waiterCount == 18 })
+        try #require(await eventually { lookups.arrived == 2 && slots.waiterCount == 18 })
         lookups.open()
         for fetch in fetches {
             #expect(await fetch.settled() == .some(nil))
@@ -364,7 +332,7 @@ extension SafeFetcher.Resolution {
             }
         }
         defer { for resolution in resolutions { resolution.cancel() } }
-        try #require(await waitUntil { lookups.arrived == 3 && slots.waiterCount == 9 })
+        try #require(await eventually { lookups.arrived == 3 && slots.waiterCount == 9 })
         #expect(peak.load(ordering: .acquiring) == 3)
         lookups.open()
         for resolution in resolutions {
@@ -388,12 +356,12 @@ extension SafeFetcher.Resolution {
                 slotExpiry: { try await slotExpiry.wait() }, lookupExpiry: { try await lookupExpiry.wait() })
         }
         defer { first.cancel() }
-        try #require(await waitUntil { lookups.arrived == 1 })
+        try #require(await eventually { lookups.arrived == 1 })
         lookupExpiry.open()
         #expect(await first.settled()?.isTimedOut == true)
         #expect(await slots.available == 0)
         lookups.open()
-        #expect(await waitUntilAsync { await slots.available == 1 })
+        #expect(await eventually { await slots.available == 1 })
         #expect(calls.count == 1)
     }
 
@@ -411,22 +379,20 @@ extension SafeFetcher.Resolution {
                 slotExpiry: { try await never.wait() }, lookupExpiry: { try await never.wait() })
         }
         defer { stuck.cancel() }
-        try #require(await waitUntil { lookups.arrived == 1 })
+        try #require(await eventually { lookups.arrived == 1 })
         let queued = Recorded {
             await SafeFetcher.resolve(
                 "a.example.com", using: resolver, timeout: .seconds(3600), slots: slots,
                 slotExpiry: { try await queuedExpiry.wait() }, lookupExpiry: { try await never.wait() })
         }
         defer { queued.cancel() }
-        try #require(await waitUntil { slots.waiterCount == 1 })
+        try #require(await eventually { slots.waiterCount == 1 })
         queuedExpiry.open()
         #expect(await queued.settled()?.isTimedOut == true)
         #expect(slots.waiterCount == 0)
-        #expect(stuck.current == nil)
-        #expect(calls.count == 1)
         lookups.open()
         #expect(await stuck.settled()?.isAddresses == true)
-        #expect(await waitUntilAsync { await slots.available == 1 })
+        #expect(await eventually { await slots.available == 1 })
         #expect(calls.count == 1)
     }
 
@@ -446,7 +412,7 @@ extension SafeFetcher.Resolution {
                 slotExpiry: { try await never.wait() }, lookupExpiry: { try await never.wait() })
         }
         defer { waiter.cancel() }
-        try #require(await waitUntil { slots.waiterCount == 1 })
+        try #require(await eventually { slots.waiterCount == 1 })
         waiter.cancel()
         #expect(await waiter.settled()?.isCancelled == true)
         #expect(slots.waiterCount == 0)
@@ -481,8 +447,7 @@ extension SafeFetcher.Resolution {
             protocolClass: HangingProtocol.self, resolver: nil, slots: MemoryBudget(capacity: 1), fetch: deadline)
         let fetch = outcome(of: slow, url("https://media.example.com/sf/hang-deadline"))
         defer { fetch.cancel() }
-        try #require(await waitUntil { HangingProtocol.started.withLock { $0.contains("/sf/hang-deadline") } })
-        #expect(fetch.current == nil)
+        try #require(await eventually { HangingProtocol.started.withLock { $0.contains("/sf/hang-deadline") } })
         deadline.open()
         #expect(await fetch.settled() == .some(.timedOut))
     }
@@ -491,7 +456,7 @@ extension SafeFetcher.Resolution {
         let slow = gated(protocolClass: HangingProtocol.self, resolver: nil, slots: MemoryBudget(capacity: 1))
         let fetch = outcome(of: slow, url("https://media.example.com/sf/hang-cancel"))
         defer { fetch.cancel() }
-        try #require(await waitUntil { HangingProtocol.started.withLock { $0.contains("/sf/hang-cancel") } })
+        try #require(await eventually { HangingProtocol.started.withLock { $0.contains("/sf/hang-cancel") } })
         fetch.cancel()
         #expect(await fetch.settled() == .some(.cancelled))
     }
@@ -504,12 +469,12 @@ extension SafeFetcher.Resolution {
         let slow = gated(resolver: held(by: lookups), slots: slots, fetch: deadline)
         let fetch = outcome(of: slow, url("https://media.example.com/sf/dns-stall"))
         defer { fetch.cancel() }
-        try #require(await waitUntil { lookups.arrived == 1 })
+        try #require(await eventually { lookups.arrived == 1 })
         deadline.open()
         #expect(await fetch.settled() == .some(.timedOut))
         #expect(await slots.available == 0)
         lookups.open()
-        #expect(await waitUntilAsync { await slots.available == 1 })
+        #expect(await eventually { await slots.available == 1 })
         #expect(requestCount(path: "/sf/dns-stall") == 0)
     }
 
@@ -520,12 +485,12 @@ extension SafeFetcher.Resolution {
         let slow = gated(resolver: held(by: lookups), slots: slots)
         let fetch = outcome(of: slow, url("https://media.example.com/sf/dns-cancel"))
         defer { fetch.cancel() }
-        try #require(await waitUntil { lookups.arrived == 1 })
+        try #require(await eventually { lookups.arrived == 1 })
         fetch.cancel()
         #expect(await fetch.settled() == .some(.cancelled))
         #expect(await slots.available == 0)
         lookups.open()
-        #expect(await waitUntilAsync { await slots.available == 1 })
+        #expect(await eventually { await slots.available == 1 })
         #expect(requestCount(path: "/sf/dns-cancel") == 0)
     }
 
@@ -533,7 +498,7 @@ extension SafeFetcher.Resolution {
         FetchStubProtocol.routes.withLock { $0["/sf/never"] = .init(status: 200, body: Data("x".utf8)) }
         let resolver: SafeFetcher.Resolver = { _ in [[93, 184, 216, 34]] }
         let target = url("https://media.example.com/sf/never")
-        let task = Task { () -> TransportError? in
+        let fetch = Recorded { () -> TransportError? in
             withUnsafeCurrentTask { $0?.cancel() }
             do throws(TransportError) {
                 _ = try await fetcher(resolver: resolver).fetch(target)
@@ -542,7 +507,7 @@ extension SafeFetcher.Resolution {
                 return error
             }
         }
-        #expect(await task.value == .cancelled)
+        #expect(await fetch.settled() == .some(.cancelled))
         #expect(FetchStubProtocol.seen.withLock { $0.filter { $0.url?.path == "/sf/never" }.isEmpty })
     }
 

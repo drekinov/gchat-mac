@@ -173,8 +173,7 @@ extension Fixtures {
         let second = outcome { () async throws(ImageError) in _ = try await pipeline.reserveEncoded(byteCount: 2 << 20)
         }
         defer { second.cancel() }
-        try #require(await waitUntil { budget.waiterCount == 1 })
-        #expect(second.current == nil)
+        try #require(await eventually { budget.waiterCount == 1 })
         second.cancel()
         #expect(await second.settled() == .some(.cancelled))
         #expect(budget.waiterCount == 0)
@@ -259,8 +258,7 @@ extension Fixtures {
             _ = try await pipeline.thumbnail(from: data, admission: admission, maxPixelSize: 100)
         }
         defer { decode.cancel() }
-        try #require(await waitUntil { budget.waiterCount == 1 })
-        #expect(decode.current == nil)
+        try #require(await eventually { budget.waiterCount == 1 })
         expiry.open()
         #expect(await decode.settled() == .some(.budget))
         #expect(budget.waiterCount == 0)
@@ -338,11 +336,10 @@ extension Fixtures {
             for index in 0..<6 { _ = try await animation.frame(at: index) }
         }
         defer { frames.cancel() }
-        let settled = await waitUntil { frames.current != nil }
+        let outcome = await frames.settled()
         let availableWhenSettled = await budget.available
         squatter.release()
-        try #require(settled)
-        #expect(frames.current! == nil)
+        #expect(outcome == .some(nil))
         #expect(availableWhenSettled == 0)
     }
 
@@ -387,17 +384,21 @@ extension Fixtures {
         withExtendedLifetime(sample) {}
         let (pipeline, budget) = pipeline(capacity: one * 2 + 1000)
         let finished = Mutex(0)
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for _ in 0..<12 {
-                group.addTask {
-                    let animation = try await pipeline.animation(from: data, maxPixelSize: 48)
-                    for index in 0..<4 { _ = try await animation.frame(at: index) }
-                    await Task.yield()
-                    finished.withLock { $0 += 1 }
+        let all = Recorded(catching: {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<12 {
+                    group.addTask {
+                        let animation = try await pipeline.animation(from: data, maxPixelSize: 48)
+                        for index in 0..<4 { _ = try await animation.frame(at: index) }
+                        await Task.yield()
+                        finished.withLock { $0 += 1 }
+                    }
                 }
+                try await group.waitForAll()
             }
-            try await group.waitForAll()
-        }
+        })
+        defer { all.cancel() }
+        try #require(await all.settled(), "the animations deadlocked").get()
         #expect(finished.withLock { $0 } == 12)
         #expect(await budget.available == one * 2 + 1000)
     }

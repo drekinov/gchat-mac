@@ -175,7 +175,7 @@ extension MemorySensitive {
                 }
             }
             defer { decode.cancel() }
-            try #require(await waitUntil { budget.waiterCount == 1 })
+            try #require(await eventually { budget.waiterCount == 1 })
             decode.cancel()
             #expect(await decode.settled() == .some(.cancelled))
             #expect(budget.waiterCount == 0)
