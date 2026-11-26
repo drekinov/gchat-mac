@@ -74,7 +74,7 @@ struct CrashRig: Sendable {
                     store: InMemoryAccountStore(), clock: world.clock(),
                     logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: tombstones), timing: .lifecycle,
                     executor: world.executor)
-                world.lifecycleRetireAtTeardown(session)
+                world.lifecycleRetireAtTeardown(session, keeping: scratch)
                 return session
             })
     }

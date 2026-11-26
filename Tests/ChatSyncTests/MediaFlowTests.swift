@@ -186,6 +186,7 @@ private func finished<Value: Sendable>(_ task: Task<Value, Never>) async throws 
 
     @Test func missingFileFailsTheSendAndRestoresTheDraft() async throws {
         let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
         let attachment = PendingAttachment(
             bookmark: PathFileAccess.bookmark(for: URL(fileURLWithPath: "/nonexistent/gone.pdf")),
             filename: "gone.pdf", contentType: "application/pdf", byteCount: 1)

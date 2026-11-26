@@ -208,7 +208,9 @@ struct Mac: Sendable {
             timing: timing, notifications: poster, events: services, executor: sim.executor)
         self.session = session
         recorder = SnapshotRecorder(session.snapshots.values, in: sim)
-        sim.onTeardown {
+        sim.onTeardown { [scratch] in
+            // Logout writes its tombstone here, so the directory has to outlive the test body.
+            _ = scratch
             guard await !session.closing else { return }
             _ = try? await sim.perform { await session.logout(refreshToken: nil) }
         }

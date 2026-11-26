@@ -8,7 +8,8 @@ import Testing
 
 @testable import ChatAuth
 
-@Suite(.serialized) enum OAuthNetworkTests {}
+/// The time limit ends a test whose listener or request never answers; it sits above the hang guard.
+@Suite(.serialized, .timeLimit(.minutes(2))) enum OAuthNetworkTests {}
 
 final class TestClock: Sendable {
     static let start = Timestamp(seconds: 1_800_000_000)

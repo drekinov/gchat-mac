@@ -61,7 +61,7 @@ struct LogoutRig: Sendable {
             logoutRunner: LogoutRunner(eraser: eraser, tombstones: tombstones), revoker: revoker, gate: gate,
             timing: timing, executor: world.executor)
         recorder = SnapshotRecorder(session.snapshots.values, in: world)
-        world.lifecycleRetireAtTeardown(session)
+        world.lifecycleRetireAtTeardown(session, keeping: scratch)
     }
 
     var storeKeyID: SecretID { StoreKeyLifecycle.secretID(for: account) }

@@ -201,7 +201,7 @@ final class HeaderDeadlines: Sendable {
 }
 
 /// A4: idle connections are capped, time out, and are all closed when the flow ends.
-struct LoopbackConnectionTests {
+@Suite(.timeLimit(.minutes(2))) struct LoopbackConnectionTests {
     func connect(to listener: LoopbackListener) throws -> NWConnection {
         let port = try #require(listener.redirectURI.port.flatMap { NWEndpoint.Port(rawValue: UInt16($0)) })
         let connection = NWConnection(host: .ipv4(.loopback), port: port, using: .tcp)

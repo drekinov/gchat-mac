@@ -51,7 +51,7 @@ struct SimWorldTests {
         }
     }
 
-    @Test func callersQueuedBehindABusyActorStayOnTheThread() async throws {
+    @Test func callersOfAnActorRunInOrderWhileAnEarlierCallerIsParked() async throws {
         try await SimWorld.run { world in
             let journal = Journal(world)
             let gate = world.barrier()
@@ -68,6 +68,46 @@ struct SimWorldTests {
             await first.value
             #expect(await journal.offThread == 0)
         }
+    }
+
+    @Test func aFinishedWorldLetsGoOfItselfAndWhatTheTestRegistered() async throws {
+        final class Fixture: Sendable {}
+        final class Seen: Sendable {
+            private struct Weak {
+                weak var world: SimWorld?
+                weak var fixture: Fixture?
+            }
+            private let state = Mutex(Weak())
+            func keep(_ world: SimWorld, _ fixture: Fixture) {
+                state.withLock {
+                    $0.world = world
+                    $0.fixture = fixture
+                }
+            }
+            var worldIsGone: Bool { state.withLock { $0.world == nil } }
+            var fixtureIsGone: Bool { state.withLock { $0.fixture == nil } }
+        }
+        let seen = Seen()
+        try await SimWorld.run { world in
+            let fixture = Fixture()
+            seen.keep(world, fixture)
+            let clock = world.clock()
+            let gate = world.barrier()
+            gate.arm()
+            // A registered closure that reaches the world through its clock, as a session does.
+            world.onTeardown { _ = (fixture, clock) }
+            world.start {
+                _ = fixture
+                await gate.pass()
+            }
+            world.start {
+                _ = fixture
+                try? await clock.sleep(for: .seconds(3600))
+            }
+            await world.settle()
+        }
+        #expect(seen.worldIsGone)
+        #expect(seen.fixtureIsGone)
     }
 
     // MARK: Settling
