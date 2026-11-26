@@ -380,11 +380,29 @@ extension EventWorld {
         let world = EventWorld()
         let mac = Mac(world)
         #expect(await mac.startLive())
-        let pulls = mac.pullRequests
-        #expect(await world.run(step: .milliseconds(50)) { mac.pullRequests > pulls })
+        // Server time moves only to the deadline each step's worker is parked at.
+        let afterPull = try #require(await mac.parked(after: 0))
         let sent = world.server.now
         let message = world.post("right after")
-        #expect(await world.run(step: .milliseconds(100)) { mac.poster.posted.all.count == 1 })
+        world.server.advance(afterPull.deadline.interval(since: sent))
+        #expect(world.clock.tick() > 0)
+        let session = mac.session
+        let server = world.server
+        let clock = world.clock
+        let poster = mac.poster
+        // Either the post is out, or the owed sync waits for its settle time.
+        #expect(
+            await pollAsync {
+                if poster.posted.all.count == 1 { return true }
+                guard let owed = await session.owedDeadline, owed > server.now else { return false }
+                return clock.hasSleeper(until: owed)
+            })
+        if mac.poster.posted.all.isEmpty {
+            let owed = try #require(await mac.session.owedDeadline)
+            world.server.advance(owed.interval(since: world.server.now))
+            #expect(world.clock.tick() > 0)
+        }
+        #expect(await poll { mac.poster.posted.all.count == 1 })
         #expect(mac.hasMessage(message))
         let latency = world.server.now.interval(since: sent)
         #expect(latency <= .seconds(6), "took \(latency)")
@@ -395,10 +413,26 @@ extension EventWorld {
         let world = EventWorld()
         let held = Mac(world, device: "held", hold: .seconds(6))
         #expect(await held.startLive())
-        #expect(await world.run { held.pulls.times("start").count >= 3 })
-        let starts = held.pulls.times("start")
-        let ends = held.pulls.times("end")
-        #expect(starts[2].interval(since: ends[1]) < .milliseconds(300))
+        // Ends each held pull at its own deadline; the next pull must start without server time moving.
+        let pulls = held.pulls
+        let clock = world.clock
+        let inFlight: @Sendable () -> Timestamp? = {
+            guard pulls.count("start") == pulls.count("end") + 1, let start = pulls.times("start").last,
+                clock.hasSleeper(until: start.adding(.seconds(6)))
+            else { return nil }
+            return start.adding(.seconds(6))
+        }
+        for _ in 0..<2 {
+            #expect(await poll { inFlight() != nil })
+            let end = try #require(inFlight())
+            let ended = pulls.count("end")
+            world.server.advance(end.interval(since: world.server.now))
+            #expect(world.clock.tick() > 0)
+            #expect(await poll { pulls.count("end") > ended && pulls.count("start") == pulls.count("end") + 1 })
+            let starts = pulls.times("start")
+            let ends = pulls.times("end")
+            #expect(starts[starts.count - 1].interval(since: ends[ends.count - 1]) < .milliseconds(300))
+        }
 
         let quick = Mac(world, device: "quick")
         #expect(await quick.startLive())
