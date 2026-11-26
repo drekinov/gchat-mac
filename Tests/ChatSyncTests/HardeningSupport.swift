@@ -69,15 +69,6 @@ final class Recorder<Element: Sendable>: Sendable {
 
 func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
 
-func poll(timeout: Duration = .seconds(5), _ condition: @Sendable () -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now.advanced(by: timeout)
-    while ContinuousClock.now < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(2))
-    }
-    return condition()
-}
-
 // MARK: Barrier and instrumented API
 
 /// Parks calls that reach `pass()` while armed, so a test can act between a network await and the commit.
@@ -116,8 +107,9 @@ final class Barrier: Sendable {
 
     var arrivals: Int { state.withLock { $0.arrivals } }
 
-    func waitForArrival(_ count: Int = 1, timeout: Duration = .seconds(5)) async -> Bool {
-        await poll(timeout: timeout) { self.arrivals >= count }
+    /// For tests on real threads: a call parked here stays parked until `release()`.
+    func waitForArrival(_ count: Int = 1) async -> Bool {
+        await eventually { self.arrivals >= count }
     }
 
     /// Wakes every parked call; later calls pass straight through until `arm()`.
@@ -432,15 +424,6 @@ final class SnapshotRecorder: Sendable {
     private let storage: Storage
     private let task: Task<Void, Never>
 
-    init(_ stream: AsyncStream<AccountSnapshot>) {
-        let storage = Storage()
-        self.storage = storage
-        task = Task {
-            for await snapshot in stream { storage.history.withLock { $0.append(snapshot) } }
-            storage.finished.withLock { $0 = true }
-        }
-    }
-
     /// `spawn` decides where the consumer runs.
     init(
         _ stream: AsyncStream<AccountSnapshot>,
@@ -459,18 +442,6 @@ final class SnapshotRecorder: Sendable {
     var isFinished: Bool { storage.finished.withLock { $0 } }
 
     func cancel() { task.cancel() }
-
-    /// The first snapshot at or after position `since` in the history that satisfies `predicate`.
-    func wait(
-        since: Int = 0, timeout: Duration = .seconds(5), where predicate: @escaping @Sendable (AccountSnapshot) -> Bool
-    ) async -> AccountSnapshot? {
-        let found = await poll(timeout: timeout) { self.history.dropFirst(since).contains(where: predicate) }
-        return found ? history.dropFirst(since).first(where: predicate) : nil
-    }
-
-    func waitForFinish(timeout: Duration = .seconds(5)) async -> Bool {
-        await poll(timeout: timeout) { self.isFinished }
-    }
 }
 
 // MARK: Logout doubles
@@ -585,40 +556,6 @@ final class RecordingRevoker: TokenRevoker {
     func revoke(_ token: String) async {
         tokens.append(token)
         eraser.observe("revoke")
-    }
-}
-
-/// A wait that ignores cancellation until `release()` (or a 60 s safety net).
-final class UncancellableWait: Sendable {
-    private struct State {
-        var released = false
-        var waiter: CheckedContinuation<Void, Never>?
-    }
-
-    private let state = Mutex(State())
-
-    init() {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 60) { [self] in release() }
-    }
-
-    func wait() async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let resumeNow = state.withLock { state -> Bool in
-                if state.released { return true }
-                state.waiter = continuation
-                return false
-            }
-            if resumeNow { continuation.resume() }
-        }
-    }
-
-    func release() {
-        let waiter = state.withLock { state -> CheckedContinuation<Void, Never>? in
-            state.released = true
-            defer { state.waiter = nil }
-            return state.waiter
-        }
-        waiter?.resume()
     }
 }
 

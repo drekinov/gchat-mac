@@ -8,11 +8,14 @@ import Testing
 
 @testable import ChatSync
 
-/// The client's clock follows the fake server's, as a real clock follows real time.
+/// The fake server's time, for tests that run no session. A sleep gives way once and returns; time doesn't move.
 struct ServerClock: SyncClock {
     let server: FakeChatServer
     func now() -> Timestamp { server.now }
-    func sleep(for duration: Duration) async throws { try await Task.sleep(for: .milliseconds(1)) }
+    func sleep(for duration: Duration) async throws {
+        try Task.checkCancellation()
+        await Task.yield()
+    }
 }
 
 struct StaticTokens: TokenProvider {

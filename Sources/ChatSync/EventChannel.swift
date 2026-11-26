@@ -118,9 +118,6 @@ public actor EventChannel {
     var reactivateAttempts = 0
     var nextReactivate: Timestamp?
     var reportedLive = false
-    /// Test seam: how many times `run` has parked, and the deadline of its latest park.
-    var parks: UInt64 = 0
-    var parkDeadline: Timestamp?
 
     init(services: EventServices, store: any AccountStore, gate: SessionGate, clock: any SyncClock, me: UserName) {
         self.services = services
@@ -243,7 +240,6 @@ public actor EventChannel {
                     guard usable else {
                         await publishStatus()
                         let deadline = nextHealth ?? clock.now().adding(Self.healthInterval)
-                        noteParked(until: deadline)
                         await clock.sleep(until: deadline)
                         continue
                     }
@@ -281,13 +277,7 @@ public actor EventChannel {
     }
 
     func park(for duration: Duration) async {
-        noteParked(until: clock.now().adding(duration))
         try? await clock.sleep(for: duration)
-    }
-
-    func noteParked(until deadline: Timestamp) {
-        parks &+= 1
-        parkDeadline = deadline
     }
 
     static func backoff(_ failures: Int) -> Duration {

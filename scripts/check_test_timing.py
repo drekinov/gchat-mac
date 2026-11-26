@@ -30,7 +30,7 @@ REAL_TIME = re.compile(
 TASK = re.compile(r"(?<![\w.])Task\s*(<[^{}()\n]*>)?\s*(\{|\(|\.detached\b|\.init\b|\.immediate\b)")
 SIM_BANNED = re.compile(
     r"\bpoll\s*[({]|\bpollAsync\b|\bwaitForArrival\b|\bwaitForFinish\b|\bmakeTransport\s*\(\)|\bBarrier\s*\(\)"
-    r"|\bUncancellableWait\b|\bRealSleepClock\b|\bSteppingClock\b|\bServerTimeClock\b|\bServerClock\s*\("
+    r"|\bServerClock\s*\(|\beventually\s*[({]|\bhangGuard\b|\bRunning\s*[<({]"
 )
 SIM_KERNEL = {"Tests/ChatSyncTests/SimWorld.swift", "Tests/ChatSyncTests/SimWorldTests.swift"}
 
@@ -111,7 +111,8 @@ def self_test():
     not_real = ["try await clock.sleep(for: .seconds(1))", "await world.settle()", "semaphore.wait()"]
     banned = [
         "await poll { done }", "await poll(timeout: .seconds(1)) { done }", "await pollAsync { true }",
-        "barrier.waitForArrival()", "server.makeTransport()", "let b = Barrier()", "RealSleepClock(server: s)",
+        "barrier.waitForArrival()", "server.makeTransport()", "let b = Barrier()", "ServerClock(server: s)",
+        "await eventually { done }", "Running { await work() }",
     ]
     failures = []
     failures += [f"task not caught: {s}" for s in caught if not list(task_sites(s))]

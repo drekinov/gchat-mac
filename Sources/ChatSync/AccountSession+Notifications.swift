@@ -32,7 +32,6 @@ extension AccountSession {
             notifyForced = false
             let context = NotifierContext(focusedSpace: focused, appIsActive: appActive)
             let pass = await notifier.process(spaces: batch, generation: generation, context: context)
-            notifyPasses &+= 1
             retry = pass.retry
             if pass.more, pass.settled { notifyForced = true }
         }
@@ -53,7 +52,6 @@ extension AccountSession {
         let delay = delays[min(notifyRetryAttempts, delays.count - 1)]
         notifyRetryAttempts += 1
         let due = clock.now().adding(delay)
-        notifyRetryDue = due
         let spawned = work.spawn { [weak self, clock] in
             await clock.sleep(until: due)
             await self?.notificationRetryFired(generation)
@@ -61,28 +59,11 @@ extension AccountSession {
         if !spawned { notifyRetryArmed = false }
     }
 
-    /// Test seam: the drain's progress, read in one step.
-    func notifierState() -> NotifierState {
-        NotifierState(
-            passes: notifyPasses, running: notifyRunning, pendingEmpty: notifyPending.isEmpty && !notifyForced,
-            retryArmed: notifyRetryArmed, retryDue: notifyRetryArmed ? notifyRetryDue : nil)
-    }
-
     func notificationRetryFired(_ generation: Generation) {
         notifyRetryArmed = false
         guard !Task.isCancelled, gate.isCurrent(generation) else { return }
         scheduleNotifications([], generation, force: true)
     }
-}
-
-struct NotifierState: Sendable, Equatable {
-    var passes: UInt64
-    var running: Bool
-    var pendingEmpty: Bool
-    var retryArmed: Bool
-    var retryDue: Timestamp?
-
-    var idle: Bool { !running && pendingEmpty }
 }
 
 extension SyncClock {

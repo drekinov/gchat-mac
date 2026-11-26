@@ -1,26 +1,12 @@
 # Files exempt from scripts/check_test_timing.py. One path per line.
 
 [real-time]
-# The simulation's watchdog is the one deliberate real-time bound in a SimWorld test.
+# The simulation's watchdog is the one deliberate real-time bound in a simulated-world test.
 Tests/ChatSyncTests/SimWorld.swift
-
-# Not migrated yet. This block must be empty before the branch merges.
-Tests/ChatAuthTests/FakeGoogleOAuth.swift
-Tests/ChatAuthTests/HardeningTests.swift
-Tests/ChatNetTests/MemoryBudgetTests.swift
-Tests/ChatNetTests/SafeFetcherTests.swift
-Tests/ChatNetTests/TransferCancellationTests.swift
-Tests/ChatStoreTests/ExportPruneTests.swift
-Tests/ChatSyncTests/AvatarLoadsTests.swift
-Tests/ChatSyncTests/ConnectivityTests.swift
-Tests/ChatSyncTests/DraftSessionTests.swift
-Tests/ChatSyncTests/EndToEndTests.swift
-Tests/ChatSyncTests/HardeningSupport.swift
-Tests/ChatSyncTests/IsolationTests.swift
-Tests/ChatSyncTests/LegacyClocks.swift
-Tests/ChatSyncTests/MediaFlowTests.swift
-Tests/ChatSyncTests/MessageEditTests.swift
-Tests/ChatSyncTests/NotifierTests.swift
+# The one hang guard of each target that runs on real threads.
+Tests/ChatAuthTests/Eventually.swift
+Tests/ChatNetTests/Eventually.swift
+Tests/ChatSyncTests/Eventually.swift
 
 [session-task]
 # The registry's task helper: every session task is created here, on the session's executor.
