@@ -37,8 +37,12 @@ public final class InMemoryAccountStore: AccountStore {
     }
 
     private let state = Mutex(State())
+    /// The time `HistoryRetention` is applied at.
+    private let now: @Sendable () -> Timestamp
 
-    public init() {}
+    public init(now: @escaping @Sendable () -> Timestamp = { Timestamp(Date()) }) {
+        self.now = now
+    }
 
     // MARK: Reads
 
@@ -130,7 +134,17 @@ public final class InMemoryAccountStore: AccountStore {
             return try gate.commit(generation) { () throws(StoreError) -> StoreWriteResult in
                 state.withLock { state in
                     var result = StoreWriteResult()
-                    for operation in batch.operations { Self.apply(operation, &state, &result) }
+                    let now = self.now()
+                    var touched: [SpaceName] = []
+                    for operation in batch.operations {
+                        if let space = operation.dropsMessages { Self.expire(space, now, &state) }
+                        if Self.apply(operation, now, &state, &result) {
+                            for space in operation.writtenSpaces where !touched.contains(space) {
+                                touched.append(space)
+                            }
+                        }
+                    }
+                    for space in touched { Self.expire(space, now, &state) }
                     return result
                 }
             }
@@ -139,20 +153,69 @@ public final class InMemoryAccountStore: AccountStore {
         }
     }
 
-    private static func apply(_ operation: StoreWrite.Operation, _ state: inout State, _ result: inout StoreWriteResult)
-    {
+    private static func expire(_ space: SpaceName, _ now: Timestamp, _ state: inout State) {
+        let historyOn = state.spaces[space]?.space.historyOn
+        // Captured by reference through the closures below; the store is single-threaded under its lock.
+        var rows = state
+        let retention = RetentionRows(
+            expire: { (space, window, cutoff) in
+                let doomed = rows.messages.values.filter {
+                    $0.space == space && $0.createTime < cutoff && window.contains($0.createTime)
+                }
+                for message in doomed { rows.messages[message.name] = nil }
+                return doomed.sorted { ($0.createTime, $0.name) < ($1.createTime, $1.name) }
+            },
+            expireOutbox: { (space, window, cutoff) in
+                rows.outbox = rows.outbox.filter { _, item in
+                    guard item.space == space, item.created < cutoff, window.contains(item.created),
+                        case .committed = item.state
+                    else { return true }
+                    return false
+                }
+            },
+            oldest: { (space, window) in
+                rows.messages.values.lazy.filter { $0.space == space && window.contains($0.createTime) }
+                    .map(\.createTime).min()
+            })
+        try? Bookkeeping.expire(
+            space, historyOn: historyOn, now: now, rows: retention, get: { rows.meta[$0] }, set: { rows.meta[$0] = $1 })
+        state = rows
+    }
+
+    private static func candidates(_ state: State) -> [SpaceName] {
+        var names = state.spaces.values.filter { $0.space.historyOn == false }.map(\.space.name).sorted()
+        for key in state.meta.keys.sorted() where key.hasPrefix(HistoryRetention.keyPrefix) {
+            if let name = SpaceName(String(key.dropFirst(HistoryRetention.keyPrefix.count))), !names.contains(name) {
+                names.append(name)
+            }
+        }
+        return names
+    }
+
+    /// Returns whether the batch must apply retention to `operation.writtenSpaces` at its end.
+    private static func apply(
+        _ operation: StoreWrite.Operation, _ now: Timestamp, _ state: inout State, _ result: inout StoreWriteResult
+    ) -> Bool {
         let handled = try? Bookkeeping.apply(
             operation, get: { state.meta[$0] }, set: { state.meta[$0] = $1 },
             hasMessage: { state.messages[$0] != nil }, isNotified: { state.notified[$0] != nil }, result: &result)
-        if handled == true { return }
+        if handled == true { return false }
         switch operation {
-        case .mergeSpace(let space):
-            if state.spaces[space.name] != nil {
+        case .mergeSpace(var space):
+            if let stored = state.spaces[space.name] {
+                let previous = stored.space.historyOn
+                space.historyOn = space.historyOn ?? previous
                 state.spaces[space.name]?.space = space
+                guard let historyOn = space.historyOn, previous != historyOn else { return false }
+                guard let previous else { return true }
+                try? Bookkeeping.observeHistory(
+                    space.name, historyOn: historyOn, previous: previous, at: now,
+                    margin: HistoryRetention.observationMargin, get: { state.meta[$0] }, set: { state.meta[$0] = $1 })
             } else {
                 let members = state.members[space.name]
                 state.spaces[space.name] = SpaceRecord(
                     space: space, memberTitle: members?.title, memberTitleFetched: members?.fetched)
+                return false
             }
         case .setSpaceHidden(let name, let hidden):
             state.spaces[name]?.isHidden = hidden
@@ -166,6 +229,7 @@ public final class InMemoryAccountStore: AccountStore {
             state.checkpoints = state.checkpoints.filter { $0.key.space != name }
             state.notified = state.notified.filter { $0.key.space != name }
             state.meta[NotifyRecord.key(name)] = nil
+            state.meta[HistoryRetention.key(name)] = nil
         case .upsertMessages(let messages):
             for message in messages {
                 guard let kept = Message.merge(message, over: state.messages[message.name]) else { continue }
@@ -215,8 +279,18 @@ public final class InMemoryAccountStore: AccountStore {
             let ordered = state.messages.values.filter { $0.space == space }.sorted(by: newerFirst)
             for message in ordered.dropFirst(max(0, keep)) { state.messages[message.name] = nil }
         case .mergeOwed, .resolveOwed, .deferOwed, .owedOmitted, .clearOwed, .bumpRelist, .resolveRelist,
-            .addNotifyCandidates, .flagNotifyGap, .removeNotifyPending:
+            .addNotifyCandidates, .flagNotifyGap, .removeNotifyPending, .clearExpiredCleanup:
             break
+        case .observeHistory(let space, let historyOn, let at):
+            guard let stored = state.spaces[space] else { return false }
+            try? Bookkeeping.observeHistory(
+                space, historyOn: historyOn, previous: stored.space.historyOn, at: at, margin: .zero,
+                get: { state.meta[$0] },
+                set: { state.meta[$0] = $1 })
+            state.spaces[space]?.space.historyOn = historyOn
+        case .expireHistoryOff(let spaces):
+            for space in spaces ?? candidates(state) { expire(space, now, &state) }
         }
+        return true
     }
 }

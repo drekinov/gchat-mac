@@ -27,6 +27,8 @@ public struct SpaceSummary: Hashable, Sendable, Identifiable {
     public var isThreaded: Bool = true
     public var isBotDM: Bool = false
     public var historyOn: Bool? = nil
+    /// When the space had history off; messages it says Google has deleted must not be shown, wherever they came from.
+    public var retention: HistoryRetention? = nil
     /// When the member cache was last filled; the open conversation rereads its members when this changes.
     public var membersFetched: Timestamp? = nil
 

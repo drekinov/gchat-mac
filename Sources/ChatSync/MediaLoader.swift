@@ -288,6 +288,27 @@ public final class MediaLoader: Sendable {
         }
     }
 
+    /// Removes the cached and shared exported copies of `mediaIDs`, off the caller's actor. False when some couldn't be
+    /// removed now, so the caller keeps them for a later attempt.
+    public func forget(_ mediaIDs: [String]) async -> Bool {
+        guard !mediaIDs.isEmpty else { return true }
+        return await Self.forget(mediaIDs, cache: cache, exports: exports)
+    }
+
+    @concurrent
+    private static func forget(_ mediaIDs: [String], cache: MediaCache, exports: ExportDirectory) async -> Bool {
+        var complete = true
+        for id in mediaIDs {
+            do throws(MediaCacheError) { try cache.remove(mediaID: id) } catch { complete = false }
+        }
+        do throws(ExportError) {
+            try exports.remove(folders: mediaIDs.map { cache.keyedName(mediaID: $0) })
+        } catch {
+            complete = false
+        }
+        return complete
+    }
+
     /// Refuses new exports, waits (bounded) for running ones, then closes the cache. Logout calls this before it
     /// wipes exports; an export still running after the timeout deletes its own file when it sees the retired session.
     public func close(waitingUpTo timeout: Duration = .seconds(10)) async {

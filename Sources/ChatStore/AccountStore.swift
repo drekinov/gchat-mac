@@ -84,6 +84,14 @@ public struct StoreWrite: Sendable {
         /// Removes posted or suppressed IDs, from the overflow for those folded into it since; subtracts `overflow`
         /// and, if `gap`, clears the gap flag.
         case removeNotifyPending(SpaceName, messages: [MessageName], overflow: Int, gap: Bool)
+        /// A history state change Google timestamped (`space.updated`); sets the stored state and records the toggle
+        /// at `at`. Ignored for a space that isn't stored.
+        case observeHistory(SpaceName, historyOn: Bool, at: Timestamp)
+        /// Applies `HistoryRetention` now to `spaces`, or to every space that is off or has windows. Every batch also
+        /// applies it to the spaces whose messages it writes, before replacing or pruning them and at its end.
+        case expireHistoryOff([SpaceName]?)
+        /// Drops entries the caller has finished cleaning up from `ExpiredCleanup`.
+        case clearExpiredCleanup(ExpiredCleanup)
     }
 
     public private(set) var operations: [Operation] = []
@@ -92,6 +100,29 @@ public struct StoreWrite: Sendable {
 
     public mutating func append(_ operation: Operation) { operations.append(operation) }
     public var isEmpty: Bool { operations.isEmpty }
+}
+
+extension StoreWrite.Operation {
+    /// The space whose cached rows this deletes without reporting them; expiry runs first so its cleanup is queued.
+    var dropsMessages: SpaceName? {
+        switch self {
+        case .replaceMessages(let space, _, _), .pruneMessages(let space, _): space
+        default: nil
+        }
+    }
+
+    /// Spaces whose rows or history state this may change, so expiry must run for them at the end of the batch.
+    var writtenSpaces: [SpaceName] {
+        switch self {
+        case .upsertMessages(let messages):
+            messages.reduce(into: []) { spaces, message in
+                if !spaces.contains(message.space) { spaces.append(message.space) }
+            }
+        case .replaceMessages(let space, _, _), .observeHistory(let space, _, _): [space]
+        case .mergeSpace(let space): [space.name]
+        default: []
+        }
+    }
 }
 
 /// The per-account cache. Reads are synchronous and safe from any thread. Writes go through `write`, which applies
@@ -139,6 +170,14 @@ extension AccountStore {
 
     public func notifyRecords() throws(StoreError) -> [SpaceName: NotifyRecord] {
         try records(NotifyRecord.keyPrefix, as: NotifyRecord.self)
+    }
+
+    public func retentionRecords() throws(StoreError) -> [SpaceName: HistoryRetention] {
+        try records(HistoryRetention.keyPrefix, as: HistoryRetention.self)
+    }
+
+    public func expiredCleanup() throws(StoreError) -> ExpiredCleanup? {
+        Bookkeeping.decode(try meta(ExpiredCleanup.key), as: ExpiredCleanup.self)
     }
 
     public func relist() throws(StoreError) -> RelistRecord {

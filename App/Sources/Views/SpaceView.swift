@@ -331,7 +331,7 @@ struct MessageList: View {
         let openThread = threaded ? model.openThread : nil
         return ScrollViewReader { proxy in
             List {
-                if !rows.isEmpty {
+                if !rows.isEmpty || model.pagesEmptyHistory {
                     takesDrops(historyHeader.frame(maxWidth: .infinity), id: "history")
                         .listRowSeparator(.hidden)
                 }

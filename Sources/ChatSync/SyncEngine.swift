@@ -290,6 +290,7 @@ public struct SyncEngine: Sendable {
             var created: [Message] = []
             var reacted: [MessageName] = []
             var spaceUpdate: Space?
+            var historyChanges: [(Bool, Timestamp)] = []
             for timed in events {
                 switch timed.event {
                 case .messageCreated(let message):
@@ -301,6 +302,7 @@ public struct SyncEngine: Sendable {
                     if !reacted.contains(name) { reacted.append(name) }
                 case .spaceUpdated(let space):
                     spaceUpdate = space
+                    if let on = space.historyOn { historyChanges.append((on, timed.time)) }
                 case .membershipsChanged:
                     break
                 }
@@ -328,6 +330,8 @@ public struct SyncEngine: Sendable {
             let candidates = try notifyCandidates(space, try undecided(created, in: space))
             try commit(generation) { batch in
                 if !candidates.isEmpty { batch.append(.addNotifyCandidates(space, candidates)) }
+                // Every toggle in order, at its own time; the merge then finds the state already set.
+                for (on, time) in historyChanges { batch.append(.observeHistory(space, historyOn: on, at: time)) }
                 if let spaceUpdate { batch.append(.mergeSpace(spaceUpdate)) }
                 if !messages.isEmpty { batch.append(.upsertMessages(messages)) }
                 for (name, summary) in reactions { batch.append(.updateReactions(name, summary)) }
@@ -526,6 +530,7 @@ public struct SyncEngine: Sendable {
         changed: Set<SpaceName>?, digests: inout [SpaceName: SpaceDigest]
     ) throws(SyncError) -> [SpaceSummary] {
         let spaces = try read { () throws(StoreError) in try store.spaces() }
+        let retention = try read { () throws(StoreError) in try store.retentionRecords() }
         var summaries: [SpaceSummary] = []
         var live: Set<SpaceName> = []
         for stored in spaces where !stored.isHidden {
@@ -540,13 +545,14 @@ public struct SyncEngine: Sendable {
                 digests[name] = digest
             }
             guard let digest else { continue }
+            let windows = (retention[name] ?? HistoryRetention()).effective(historyOn: stored.space.historyOn)
             summaries.append(
                 SpaceSummary(
                     name: name, type: stored.space.type, title: Self.title(of: stored),
                     lastActiveTime: stored.space.lastActiveTime, unreadCount: digest.unreadCount, isMuted: muted,
                     lastMessagePreview: digest.preview, isThreaded: stored.space.isThreaded,
                     isBotDM: stored.space.isSingleUserBotDM, historyOn: stored.space.historyOn,
-                    membersFetched: stored.memberTitleFetched))
+                    retention: windows.windows.isEmpty ? nil : windows, membersFetched: stored.memberTitleFetched))
         }
         digests = digests.filter { live.contains($0.key) }
         return summaries.sorted { ($0.lastActiveTime ?? .init(seconds: 0)) > ($1.lastActiveTime ?? .init(seconds: 0)) }

@@ -132,6 +132,10 @@ public actor AccountSession {
     /// Cached unread/preview per space, so a commit re-decrypts only the spaces it touched.
     var digests: [SpaceName: SyncEngine.SpaceDigest] = [:]
     var digestsPrimed = false
+    /// The one timer that applies `HistoryRetention` when the earliest cached history-off message expires.
+    var expiryDue: Timestamp?
+    var expiryTimer: Task<Void, Never>?
+    var cleaningExpired = false
 
     public init(
         account: AccountID, me: UserName, api: any ChatAPI, store: any AccountStore, clock: any SyncClock,
@@ -159,6 +163,10 @@ public actor AccountSession {
             Notifier(account: account, store: store, gate: gate, me: me, poster: $0, clock: clock)
         }
         eventChannel = events.map { EventChannel(services: $0, store: store, gate: gate, clock: clock, me: me) }
+        // Before anything can read or publish the cache: what Google deleted while the app wasn't running goes first.
+        if let generation = gate.current {
+            _ = try? store.write(gate: gate, generation: generation) { $0.append(.expireHistoryOff(nil)) }
+        }
     }
 
     // MARK: Reads for the UI (synchronous store reads; call off the main actor)
@@ -1018,6 +1026,7 @@ public actor AccountSession {
                 changedSpaces: changedSinceSnapshot, discoveringSpaces: discoveringSpace.map { [$0] } ?? [],
                 draftRevision: draftRevision))
         changedSinceSnapshot = []
+        scheduleRetention(generation)
     }
 
     // MARK: Logout

@@ -144,6 +144,55 @@ public struct RelistRecord: Codable, Sendable, Equatable {
     public var isPending: Bool { requested > resolved }
 }
 
+/// What expiry removed and still has to be cleaned up outside the store: delivered notifications of the messages and
+/// cached or exported copies of their uploaded attachments. Stored under `expiredCleanup` in the same transaction as
+/// the deletion, so a crash before the cleanup only delays it.
+public struct ExpiredCleanup: Codable, Sendable, Equatable {
+    public static let key = "expiredCleanup"
+    /// Notification removal is best effort; past this many the oldest names are dropped.
+    public static let maxMessages = 1000
+
+    public var messages: [MessageName]
+    /// Media resource names of uploaded attachments.
+    public var media: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case messages = "m"
+        case media = "a"
+    }
+
+    public init(messages: [MessageName] = [], media: [String] = []) {
+        self.messages = messages
+        self.media = media
+    }
+
+    public var isEmpty: Bool { messages.isEmpty && media.isEmpty }
+
+    mutating func add(_ expired: [Message]) {
+        var names = Set(messages)
+        var known = Set(media)
+        for message in expired {
+            if names.insert(message.name).inserted { messages.append(message.name) }
+            for attachment in message.attachments {
+                if case .uploaded(let resource) = attachment.source, known.insert(resource.rawValue).inserted {
+                    media.append(resource.rawValue)
+                }
+            }
+        }
+        if messages.count > Self.maxMessages { messages.removeFirst(messages.count - Self.maxMessages) }
+    }
+}
+
+/// The row work expiry needs from a store, inside its write transaction.
+struct RetentionRows {
+    /// Deletes the space's messages created inside `window` and before `cutoff`, returning them.
+    var expire: (SpaceName, HistoryOffWindow, Timestamp) throws(StoreError) -> [Message]
+    /// Deletes the space's committed outbox items created inside `window` and before `cutoff`.
+    var expireOutbox: (SpaceName, HistoryOffWindow, Timestamp) throws(StoreError) -> Void
+    /// The oldest create time among the space's messages inside `window`.
+    var oldest: (SpaceName, HistoryOffWindow) throws(StoreError) -> Timestamp?
+}
+
 /// What a write reports back about conditional operations.
 public struct StoreWriteResult: Sendable, Equatable {
     /// Message IDs `.mergeOwed` couldn't keep because the space's row was full; the caller must not ack them.
@@ -301,9 +350,77 @@ enum Bookkeeping {
             record.overflow = max(0, record.overflow - overflow - folded)
             if gap { record.gap = false }
             try putNotify(space, record)
+        case .clearExpiredCleanup(let done):
+            guard var record = decode(try get(ExpiredCleanup.key), as: ExpiredCleanup.self) else { return true }
+            let messages = Set(done.messages)
+            let media = Set(done.media)
+            record.messages.removeAll { messages.contains($0) }
+            record.media.removeAll { media.contains($0) }
+            try set(ExpiredCleanup.key, record.isEmpty ? nil : try encode(record))
         default:
             return false
         }
         return true
+    }
+
+    static func retention(
+        _ space: SpaceName, get: (String) throws(StoreError) -> String?
+    ) throws(StoreError) -> HistoryRetention? {
+        decode(try get(HistoryRetention.key(space)), as: HistoryRetention.self)
+    }
+
+    /// Records a history state change of a stored space from `previous` to `historyOn`, seen at `at`. An exact time
+    /// (`margin` zero) for the state already stored refines the edge a listing recorded for it.
+    static func observeHistory(
+        _ space: SpaceName, historyOn: Bool, previous: Bool?, at: Timestamp, margin: Duration,
+        get: (String) throws(StoreError) -> String?, set: (String, String?) throws(StoreError) -> Void
+    ) throws(StoreError) {
+        guard previous != historyOn || margin == .zero else { return }
+        var record = try retention(space, get: get) ?? HistoryRetention()
+        let changed =
+            previous == historyOn
+            ? record.refine(historyOn: historyOn, at: at)
+            : record.observe(historyOn: historyOn, previous: previous, at: at, margin: margin)
+        guard changed else { return }
+        try set(HistoryRetention.key(space), try encode(record))
+    }
+
+    /// Deletes what `HistoryRetention` says Google has deleted by `now` in a space whose current state is
+    /// `historyOn`, queues its cleanup, and refreshes the record's `due`.
+    static func expire(
+        _ space: SpaceName, historyOn: Bool?, now: Timestamp, rows: RetentionRows,
+        get: (String) throws(StoreError) -> String?, set: (String, String?) throws(StoreError) -> Void
+    ) throws(StoreError) {
+        let stored = try retention(space, get: get)
+        guard stored != nil || historyOn == false else { return }
+        var record = stored ?? HistoryRetention()
+        record.forgetExpired(now: now)
+        let windows = record.effective(historyOn: historyOn).windows
+        let cutoff = HistoryRetention.cutoff(at: now)
+        var expired: [Message] = []
+        var due: Timestamp?
+        for window in windows {
+            expired += try rows.expire(space, window, cutoff)
+            try rows.expireOutbox(space, window, cutoff)
+            if let oldest = try rows.oldest(space, window) {
+                let expires = oldest.adding(HistoryRetention.lifetime)
+                due = min(due ?? expires, expires)
+            }
+        }
+        record.due = due
+        if record.windows.isEmpty, due == nil {
+            if stored != nil { try set(HistoryRetention.key(space), nil) }
+        } else if record != stored {
+            try set(HistoryRetention.key(space), try encode(record))
+        }
+        guard !expired.isEmpty else { return }
+        if var notify = decode(try get(NotifyRecord.key(space)), as: NotifyRecord.self) {
+            let gone = Set(expired.map { id(of: $0.name) })
+            notify.ids.removeAll { gone.contains($0) }
+            try set(NotifyRecord.key(space), notify.isEmpty ? nil : try encode(notify))
+        }
+        var cleanup = decode(try get(ExpiredCleanup.key), as: ExpiredCleanup.self) ?? ExpiredCleanup()
+        cleanup.add(expired)
+        try set(ExpiredCleanup.key, try encode(cleanup))
     }
 }

@@ -65,6 +65,7 @@ extension State {
     private mutating func dispatch(_ endpoint: Endpoint?, _ incoming: IncomingRequest, _ account: FakeAccount) -> Reply
     {
         guard let endpoint else { return WireError.notFound("Method not found.").reply }
+        purgeExpired()
         do {
             return try handle(endpoint, incoming, account)
         } catch {

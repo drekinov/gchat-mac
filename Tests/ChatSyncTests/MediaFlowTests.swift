@@ -429,6 +429,58 @@ private func finished<Value: Sendable>(_ task: Task<Value, Never>) async throws 
         #expect(size > 0)
     }
 
+    @Test func forgettingExpiredMediaRemovesTheCachedAndExportedCopies() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let media = rig.h.server.addMedia(Data("gone soon".utf8), contentType: "application/pdf", filename: "g.pdf")
+        let message = rig.h.server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let attachment = try #require(message.attachments.first)
+        guard case .uploaded(let resource) = attachment.source else { return #expect(Bool(false)) }
+        let loader = try rig.loader()
+        let url = try await loader.export(attachment)
+        #expect(loader.cache.contains(mediaID: resource.rawValue))
+
+        #expect(await loader.forget([resource.rawValue]))
+        #expect(!loader.cache.contains(mediaID: resource.rawValue))
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+        #expect(!FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path))
+        #expect(await loader.forget([resource.rawValue]), "forgetting what is gone already succeeds")
+    }
+
+    @Test func aSessionRemovesTheMediaOfExpiredHistoryOffMessages() async throws {
+        let rig = Rig()
+        defer { try? FileManager.default.removeItem(at: rig.root) }
+        let server = rig.h.server
+        let media = server.addMedia(Data("one day only".utf8), contentType: "application/pdf", filename: "d.pdf")
+        let message = server.postMedia([media], in: rig.team, from: .account(rig.h.bob))
+        let attachment = try #require(message.attachments.first)
+        let clock = ServerClock(server: server)
+        let store = InMemoryAccountStore(now: { clock.now() })
+        let gate = rig.h.gate
+        var team = try #require(server.space(rig.team))
+        team.historyOn = false
+        try store.write(gate: gate, generation: try #require(gate.current)) { batch in
+            batch.append(.mergeSpace(team))
+            batch.append(.upsertMessages([message]))
+        }
+        let loader = try rig.loader()
+        let url = try await loader.export(attachment)
+        #expect(loader.cache.contains(mediaID: media.rawValue))
+
+        server.advance(.seconds(25 * 3600))
+        let session = AccountSession(
+            account: AccountID(), me: rig.h.alice.user.name, api: rig.client, store: store, clock: clock,
+            logoutRunner: LogoutRunner(eraser: NoopEraser(), tombstones: LogoutTombstones(root: rig.root)),
+            gate: gate, mediaLoader: loader)
+        #expect(try store.message(message.name) == nil)
+        #expect(try store.expiredCleanup()?.media == [media.rawValue])
+
+        await session.cleanUpExpired(try #require(gate.current))
+        #expect(!loader.cache.contains(mediaID: media.rawValue))
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+        #expect(try store.expiredCleanup() == nil)
+    }
+
     @Test func openingAnAttachmentAgainReusesItsPath() async throws {
         let rig = Rig()
         defer { try? FileManager.default.removeItem(at: rig.root) }

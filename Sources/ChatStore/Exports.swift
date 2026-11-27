@@ -603,6 +603,23 @@ public struct ExportDirectory: Sendable {
         guard failed == 0 else { throw .wipeIncomplete(failed: failed) }
     }
 
+    /// Removes the shared copies in `folders`, attachments' keyed cache names, whatever their age. A folder an export
+    /// is still writing into is left for pruning.
+    public func remove(folders: [String]) throws(ExportError) {
+        guard !folders.isEmpty, let rootFD = try Self.openExistingRoot(directory.root) else { return }
+        defer { Darwin.close(rootFD) }
+        guard let exportsFD = try Self.openExistingDirectory("exports", in: rootFD) else { return }
+        defer { Darwin.close(exportsFD) }
+        guard let accountFD = try Self.openExistingDirectory(directory.account.description, in: exportsFD) else {
+            return
+        }
+        defer { Darwin.close(accountFD) }
+        let names = folders.filter { !$0.isEmpty && !$0.contains("/") && $0 != "." && $0 != ".." }
+        let failed = try Self.removeChildren(
+            named: names, in: accountFD, changedBefore: .distantFuture, root: directory.root, seams: seams)
+        guard failed == 0 else { throw .wipeIncomplete(failed: failed) }
+    }
+
     /// `prune(changedBefore:)` for every account folder, including those of accounts no longer signed in. Anything
     /// else directly under `exports` that is old goes too, a symlink in place of an account folder included: it is
     /// unlinked itself, never followed.
