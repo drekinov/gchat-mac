@@ -80,6 +80,11 @@ let package = Package(
             swiftSettings: sharedSettings
         ),
         .testTarget(
+            name: "ChatTextTests",
+            dependencies: ["ChatText", "ChatModel"],
+            swiftSettings: sharedSettings
+        ),
+        .testTarget(
             name: "ChatNetTests",
             dependencies: ["ChatNet"],
             swiftSettings: sharedSettings
