@@ -373,6 +373,10 @@ enum FakeSeeder {
             markup(
                 "> Is staging in sync again?\nNot yet. Remaining:\n* Re-run the *backfill*\n* Verify counts\n"
                     + "    * users\n    * spaces\n* Ping <\(me)>", 1)
+            context.server.post(
+                markup:
+                    "On it. I'll run `make backfill` with *--dry-run* first, see <https://example.com/pull/7|the PR>.",
+                in: space, from: .account(context.account), at: next())
             markup("Run `make bench` *before* merging:\n```\nswift test --parallel\nmake footprint\n```", 2)
 
         default:
