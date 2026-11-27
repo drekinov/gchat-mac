@@ -102,6 +102,7 @@ extension State {
             out["deletionMetadata"] = ["deletionType": "CREATOR"] as JSON
         }
         if !message.text.isEmpty { out["text"] = message.text }
+        if let markup = message.formattedText { out["formattedText"] = markup }
         if let thread = message.thread { out["thread"] = ["name": thread.rawValue] as JSON }
         if message.isThreadReply { out["threadReply"] = true }
         if !message.annotations.isEmpty { out["annotations"] = message.annotations.map(wireAnnotation) }

@@ -251,8 +251,12 @@ extension State {
         guard incoming.value("updateMask") == "text" else { throw .invalidArgument("Unsupported updateMask") }
         guard let text = incoming.jsonBody?["text"] as? String else { throw .invalidArgument("Body needs text") }
         guard text.utf8.count <= 32_000 else { throw .invalidArgument("Message text exceeds 32000 bytes") }
-        let (storedText, mentions) = applyMentions(text)
-        return .json(wireMessage(edit(name, text: storedText, annotations: mentions, at: nil)))
+        let composed = try compose(text, syntax: incoming.jsonBody?["markupSyntax"] as? String)
+        return .json(
+            wireMessage(
+                edit(
+                    name, text: composed.text, formattedText: composed.formattedText,
+                    annotations: composed.annotations, at: nil)))
     }
 
     /// The sender, or a space manager, may delete. A thread starter with live replies needs `force`.
@@ -365,9 +369,10 @@ extension State {
             throw .invalidArgument("REPLY_MESSAGE_OR_FAIL requires thread.name")
         }
 
-        let (storedText, mentions) = applyMentions(text)
+        let composed = try compose(text, syntax: body["markupSyntax"] as? String)
         let message = post(
-            storedText, in: name, from: account.user, thread: thread, annotations: mentions, attachments: attachments,
+            composed.text, in: name, from: account.user, thread: thread, formattedText: composed.formattedText,
+            annotations: composed.annotations, attachments: attachments,
             clientMessageID: body["clientAssignedMessageId"] as? String, at: nil)
         if let requestKey { spaces[name]?.requestIDs[requestKey] = message.name }
         return .json(wireMessage(message))
