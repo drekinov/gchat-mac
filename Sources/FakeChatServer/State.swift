@@ -299,6 +299,7 @@ struct State: Sendable {
         let time = stamp(at)
         var tombstone = spaces[name.space]!.messages[index].message
         tombstone.text = ""
+        tombstone.formattedText = nil
         tombstone.annotations = []
         tombstone.attachments = []
         tombstone.gifURLs = []

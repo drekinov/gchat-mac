@@ -142,6 +142,7 @@ extension AccountSession {
             var tombstone = message
             tombstone.deleteTime = message.version
             tombstone.text = ""
+            tombstone.formattedText = nil
             tombstone.annotations = []
             tombstone.attachments = []
             tombstone.gifURLs = []

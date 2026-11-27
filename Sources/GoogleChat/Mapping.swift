@@ -155,10 +155,12 @@ extension Wire.MessageDTO {
                 snapshotSender: metadata.quotedMessageSnapshot?.sender.flatMap { UserName($0) },
                 snapshotText: metadata.quotedMessageSnapshot?.text)
         }
+        let deleted = Mapping.timestamp(deleteTime) ?? deletedAt
         return Message(
             name: name, sender: sender?.domain() ?? Mapping.unknownUser, createTime: createTime,
-            lastUpdateTime: Mapping.timestamp(lastUpdateTime), deleteTime: Mapping.timestamp(deleteTime) ?? deletedAt,
-            text: text, annotations: (annotations ?? []).compactMap { $0.value?.domain(textLength: textLength) },
+            lastUpdateTime: Mapping.timestamp(lastUpdateTime), deleteTime: deleted,
+            text: text, formattedText: deleted == nil ? formattedText : nil,
+            annotations: (annotations ?? []).compactMap { $0.value?.domain(textLength: textLength) },
             thread: thread?.name.flatMap { ThreadName($0) }, isThreadReply: threadReply ?? false,
             attachments: (attachment ?? []).compactMap { $0.value?.domain() },
             gifURLs: (attachedGifs ?? []).compactMap { Mapping.webURL($0.value?.uri, httpsOnly: true) },

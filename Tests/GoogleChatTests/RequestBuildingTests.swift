@@ -249,7 +249,9 @@ import Testing
             queryItems(request) == [
                 "requestId": "a1b2c3d4-0000-4000-8000-abcdef012345", "messageReplyOption": "REPLY_MESSAGE_OR_FAIL",
             ])
-        #expect(bodyString(request) == #"{"markupSyntax":"MARKUP_SYNTAX_CHAT","text":"re","thread":{"name":"spaces/AAAA/threads/THR1"}}"#)
+        #expect(
+            bodyString(request)
+                == #"{"markupSyntax":"MARKUP_SYNTAX_CHAT","text":"re","thread":{"name":"spaces/AAAA/threads/THR1"}}"#)
     }
 
     @Test func createMessageWithAttachments() async throws {
