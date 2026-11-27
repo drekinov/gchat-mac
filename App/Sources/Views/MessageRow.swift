@@ -642,6 +642,8 @@ private struct CardWidgetView: View {
 struct OutboxRow: View {
     let item: OutboxItem
     var context: MessageContext?
+    /// Names for the `<users/…>` tokens in the pending text.
+    var names: [UserName: String] = [:]
     var onRepost: (() -> Void)?
     var onDiscard: (() -> Void)?
 
@@ -651,12 +653,18 @@ struct OutboxRow: View {
             Spacer(minLength: 56)
             VStack(alignment: .trailing, spacing: 4) {
                 if !item.payload.text.isEmpty {
-                    Text(RemoteText.message(item.payload.text))
-                        .textSelection(.enabled)
-                        .foregroundStyle(Theme.onAccent)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(Theme.accent.opacity(isFailure ? 0.45 : 0.6), in: Bubble())
+                    Group {
+                        if let document = MessageMarkup.pending(item.payload.text, names: names) {
+                            FormattedMessageText(document: document, me: context?.me, onAccent: true)
+                        } else {
+                            Text(RemoteText.message(item.payload.text)).textSelection(.enabled)
+                        }
+                    }
+                    .tint(Theme.onAccent)
+                    .foregroundStyle(Theme.onAccent)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Theme.accent.opacity(isFailure ? 0.45 : 0.6), in: Bubble())
                 }
                 ForEach(item.payload.attachments) { attachment in
                     Label(

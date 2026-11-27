@@ -369,7 +369,7 @@ struct MessageList: View {
                 ForEach(outbox) { item in
                     takesDrops(
                         OutboxRow(
-                            item: item, context: context,
+                            item: item, context: context, names: model.openOutboxNames,
                             onRepost: { Task { await model.repostAsNewMessage(item, key: key) } },
                             onDiscard: { Task { await model.discard(item, key: key) } }
                         ),

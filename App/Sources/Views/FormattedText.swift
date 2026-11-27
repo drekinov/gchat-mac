@@ -12,37 +12,51 @@ enum MessageMarkup {
         let annotations: [Annotation]
     }
 
-    private static let capacity = 500
-    private static var cache: [Key: (document: ChatDocument?, used: UInt64)] = [:]
-    private static var clock: UInt64 = 0
+    private static var sent = BoundedCache<Key, ChatDocument?>(capacity: 500)
+    private static var pending = BoundedCache<String, ChatDocument?>(capacity: 50)
 
     static func document(for message: Message) -> ChatDocument? {
         guard let markup = message.formattedText, !markup.isEmpty, !message.text.isEmpty else { return nil }
-        let key = Key(markup: markup, text: message.text, annotations: message.annotations)
-        clock += 1
-        if let hit = cache[key] {
-            cache[key]?.used = clock
-            return hit.document
+        return sent.value(for: Key(markup: markup, text: message.text, annotations: message.annotations)) { key in
+            // Cleaning or truncation would shift the annotation offsets the markup is matched against.
+            guard RemoteText.message(key.markup) == key.markup, RemoteText.message(key.text) == key.text,
+                let document = ChatMarkup.resolve(markup: key.markup, text: key.text, annotations: key.annotations),
+                !document.isPlain
+            else { return nil }
+            return document
         }
-        let document = resolve(key)
-        if cache.count >= capacity { evictOldest() }
-        cache[key] = (document, clock)
-        return document
     }
 
-    private static func resolve(_ key: Key) -> ChatDocument? {
-        // Cleaning or truncation would shift the annotation offsets the markup is matched against.
-        guard RemoteText.message(key.markup) == key.markup, RemoteText.message(key.text) == key.text,
-            let document = ChatMarkup.resolve(markup: key.markup, text: key.text, annotations: key.annotations),
-            !document.isPlain
-        else { return nil }
-        return document
+    /// An outbox item's wire text with mentions named from `names`, or nil when cleaning would change the text.
+    static func pending(_ wire: String, names: [UserName: String]) -> ChatDocument? {
+        let parsed = pending.value(for: wire) { wire in
+            RemoteText.message(wire) == wire ? ChatMarkup.parse(wire) : nil
+        }
+        return parsed?.namingMentions(names)
     }
+}
 
-    private static func evictOldest() {
-        let keep = capacity * 4 / 5
-        let cutoff = cache.values.map(\.used).sorted(by: >)[keep - 1]
-        cache = cache.filter { $0.value.used >= cutoff }
+/// A dictionary that drops its least recently used fifth once full.
+struct BoundedCache<Key: Hashable, Value> {
+    let capacity: Int
+    private var entries: [Key: (value: Value, used: UInt64)] = [:]
+    private var clock: UInt64 = 0
+
+    init(capacity: Int) { self.capacity = capacity }
+
+    mutating func value(for key: Key, make: (Key) -> Value) -> Value {
+        clock += 1
+        if let hit = entries[key] {
+            entries[key]?.used = clock
+            return hit.value
+        }
+        let value = make(key)
+        if entries.count >= capacity {
+            let cutoff = entries.values.map(\.used).sorted(by: >)[capacity * 4 / 5 - 1]
+            entries = entries.filter { $0.value.used >= cutoff }
+        }
+        entries[key] = (value, clock)
+        return value
     }
 }
 

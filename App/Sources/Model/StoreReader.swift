@@ -8,6 +8,8 @@ enum StoreReader {
     struct Loaded: Sendable {
         var messages: [Message]
         var outbox: [OutboxItem]
+        /// Names for mentions in the outbox; empty when it has none.
+        var outboxNames: [UserName: String]
         var thread: [Message]
         var mine: [MessageName: [Emoji: ReactionName]]
     }
@@ -22,7 +24,9 @@ enum StoreReader {
             let own = session.reactions.mine(on: message.name)
             if !own.isEmpty { mine[message.name] = own }
         }
-        return Loaded(messages: messages, outbox: outbox, thread: threadMessages, mine: mine)
+        let mentions = outbox.contains { $0.payload.text.contains("<users/") }
+        let names = mentions ? (try? session.contacts.mentionNames(in: space)) ?? [:] : [:]
+        return Loaded(messages: messages, outbox: outbox, outboxNames: names, thread: threadMessages, mine: mine)
     }
 
     @concurrent
