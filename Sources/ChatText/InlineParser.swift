@@ -22,33 +22,61 @@ enum InlineParser {
     }
 
     private static func tokenize(_ line: Substring) -> [Atom] {
-        let chars = Array(line)
         var atoms: [Atom] = []
-        atoms.reserveCapacity(chars.count)
+        atoms.reserveCapacity(line.count)
+        tokenize(line) { atom, _ in atoms.append(atom) }
+        return atoms
+    }
+
+    /// What editing a line's markup can't keep: tokens and custom emoji outside code, with character offsets.
+    static func scan(_ line: Substring, into inventory: inout MarkupInventory) {
+        let indices = Array(line.indices) + [line.endIndex]
+        tokenize(
+            line,
+            emit: { atom, range in
+                switch atom {
+                case .mention(let user):
+                    inventory.mentions.append(
+                        .init(range: indices[range.lowerBound]..<indices[range.upperBound], user: user))
+                case .emoji: inventory.hasCustomEmoji = true
+                case .char, .code, .link: break
+                }
+            }, unknownToken: { inventory.hasUnknownToken = true })
+    }
+
+    private static func tokenize(
+        _ line: Substring, emit: (Atom, Range<Int>) -> Void, unknownToken: () -> Void = {}
+    ) {
+        let chars = Array(line)
         var index = 0
         while index < chars.count {
             let char = chars[index]
             if char == "`", let close = chars[(index + 1)...].firstIndex(of: "`"), close > index + 1 {
-                atoms.append(.code(String(chars[(index + 1)..<close])))
+                emit(.code(String(chars[(index + 1)..<close])), index..<(close + 1))
                 index = close + 1
                 continue
             }
-            if char == "<", let close = chars[(index + 1)...].firstIndex(of: ">"),
-                let atom = token(String(chars[(index + 1)..<close]))
-            {
-                atoms.append(atom)
-                index = close + 1
-                continue
+            if char == "<", let close = chars[(index + 1)...].firstIndex(of: ">") {
+                let body = String(chars[(index + 1)..<close])
+                if let atom = token(body) {
+                    emit(atom, index..<(close + 1))
+                    index = close + 1
+                    continue
+                }
+                if !body.isEmpty, !body.contains(where: \.isWhitespace),
+                    body.contains(where: { $0 == "/" || $0 == ":" })
+                {
+                    unknownToken()
+                }
             }
             if char == ":", let close = emojiEnd(chars, from: index) {
-                atoms.append(.emoji(String(chars[index...close])))
+                emit(.emoji(String(chars[index...close])), index..<(close + 1))
                 index = close + 1
                 continue
             }
-            atoms.append(.char(char))
+            emit(.char(char), index..<(index + 1))
             index += 1
         }
-        return atoms
     }
 
     private static func token(_ body: String) -> Atom? {

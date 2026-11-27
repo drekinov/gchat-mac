@@ -77,7 +77,7 @@ struct MessageEditTests {
             let mine = rig.post("helo", from: rig.alice)
             try await rig.sync()
             let copy = try await rig.session.editableCopy(of: mine.name)
-            #expect(!copy.losesFormatting)
+            #expect(copy.message.formattedText == nil)
 
             let wire = "hello <\(rig.bob.user.name.rawValue)>"
             let updated = try await rig.edit(mine.name, text: wire, basedOn: copy.message.version)
@@ -85,6 +85,7 @@ struct MessageEditTests {
             #expect(updated.lastUpdateTime != nil)
             #expect(updated.annotations.contains { $0.kind == .userMention(rig.bob.user.name) })
             #expect(try rig.stored(mine.name)?.text == "hello @Bob")
+            #expect(try rig.stored(mine.name)?.formattedText == wire)
             #expect(rig.requests("PATCH").first?.value(for: "updateMask") == "text")
         }
     }
@@ -246,18 +247,6 @@ struct MessageEditTests {
             #expect(try rig.stored(mine.name)?.isDeleted == true)
             #expect(await rig.session.retryUntil == nil, "a failed follow-up poll doesn't back the account off")
         }
-    }
-
-    @Test func formattingOnlyGoogleHoldsIsDetected() {
-        let me = User(name: UserName(unchecked: "users/1"))
-        let bob = UserName(unchecked: "users/2")
-        var message = Message(
-            name: MessageName(unchecked: "spaces/A/messages/m"), sender: me, createTime: Timestamp(seconds: 1),
-            text: "hi 🙂 @Bob see docs")
-        message.annotations = [Annotation(kind: .userMention(bob), startIndex: 6, length: 4)]
-        #expect(!AccountSession.losesFormatting(message, formattedText: "hi 🙂 <users/2> see docs"))
-        #expect(AccountSession.losesFormatting(message, formattedText: "hi 🙂 <users/2> see <https://x.example|docs>"))
-        #expect(!AccountSession.losesFormatting(message, formattedText: nil))
     }
 
     @Test func aRetriedFollowUpPollBringsGooglesTombstone() async throws {

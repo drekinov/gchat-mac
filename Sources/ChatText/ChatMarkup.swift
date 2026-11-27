@@ -40,6 +40,19 @@ public struct ChatDocument: Hashable, Sendable {
     }
 }
 
+public struct MarkupInventory: Hashable, Sendable {
+    public struct Mention: Hashable, Sendable {
+        /// The token's range in the markup.
+        public var range: Range<String.Index>
+        public var user: UserName
+    }
+
+    public var mentions: [Mention] = []
+    public var hasCustomEmoji = false
+    /// A `<…>` that looks like a Google token but isn't one this client knows.
+    public var hasUnknownToken = false
+}
+
 public struct Span: Hashable, Sendable {
     public struct Style: OptionSet, Hashable, Sendable {
         public let rawValue: UInt8
@@ -121,6 +134,24 @@ public enum ChatMarkup {
         var matcher = Matcher(text: text, annotations: annotations)
         document.project(into: &matcher)
         return matcher.finished ? document : nil
+    }
+
+    /// The `<users/…>` tokens outside code, in order, and whether there is markup an edit can't carry.
+    public static func inventory(_ markup: String) -> MarkupInventory {
+        let lines = markup.split(separator: "\n", omittingEmptySubsequences: false)
+        var inventory = MarkupInventory()
+        var index = 0
+        while index < lines.count {
+            if let end = fenceEnd(lines, from: index) {
+                index = end + 1
+                continue
+            }
+            let line = lines[index]
+            let content = listItem(line)?.1 ?? quoteLine(line) ?? line
+            InlineParser.scan(content, into: &inventory)
+            index += 1
+        }
+        return inventory
     }
 
     private static func fenceEnd(_ lines: [Substring], from start: Int) -> Int? {
