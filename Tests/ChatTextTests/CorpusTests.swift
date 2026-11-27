@@ -28,7 +28,7 @@ import Testing
                 if markup != text { formatted += 1 }
                 if ChatMarkup.resolve(markup: markup, text: text, annotations: Self.mentions(message)) != nil {
                     resolved += 1
-                } else if markup == text {
+                } else if markup == text, !ChatMarkup.parse(markup).isPlain {
                     literal += 1
                 }
             }

@@ -114,9 +114,8 @@ public enum ChatMarkup {
         return ChatDocument(blocks: blocks)
     }
 
-    /// The parsed markup with each mention's text taken from Google's plain `text`, or nil unless the document's
-    /// plain projection is exactly `text` and every user mention matches one annotation at its offset. Only `@all`
-    /// may appear without an annotation.
+    /// The markup with mention texts taken from `text`, or nil unless it projects exactly onto `text` and each mention
+    /// matches one annotation by user and offset (`@all` may lack one).
     public static func resolve(markup: String, text: String, annotations: [Annotation]) -> ChatDocument? {
         var document = parse(markup)
         var matcher = Matcher(text: text, annotations: annotations)
