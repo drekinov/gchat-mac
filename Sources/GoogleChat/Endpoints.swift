@@ -30,12 +30,14 @@ private struct CreateMessageBody: Encodable {
     }
 
     var text: String
+    var markupSyntax = "MARKUP_SYNTAX_CHAT"
     var thread: ThreadRef?
     var attachment: [AttachmentRef]?
 }
 
 private struct UpdateTextBody: Encodable {
     var text: String
+    var markupSyntax = "MARKUP_SYNTAX_CHAT"
 }
 
 private struct ReadStateBody: Encodable {
