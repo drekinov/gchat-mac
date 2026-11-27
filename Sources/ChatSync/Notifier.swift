@@ -206,6 +206,8 @@ final class Notifier: Sendable {
                 posts += 1
                 settled.messages.append(message.name)
                 settled.notified.append(message.name)
+                // Expired while the post was in flight, after the cleanup that would have taken it down had run.
+                if (try? store.message(message.name)) == nil { await poster.remove(messages: [message.name]) }
             case .suppressed:
                 posts += 1
                 settled.messages.append(message.name)
@@ -218,6 +220,12 @@ final class Notifier: Sendable {
 
     func removeAll() async {
         await poster.remove(account: account)
+    }
+
+    /// Takes down delivered notifications of messages Google has deleted under history-off retention.
+    func removeExpired(_ messages: [MessageName]) async {
+        removed.withLock { $0.formUnion(messages) }
+        await poster.remove(messages: messages)
     }
 
     private func deleted(in spaces: Set<SpaceName>) -> [MessageName] {

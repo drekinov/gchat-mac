@@ -275,6 +275,9 @@ public final class MediaCache: Sendable {
 
     // MARK: Removal
 
+    /// The name `MediaReader.keyedName` reports for `mediaID`, whether or not it is cached.
+    public func keyedName(mediaID: String) -> String { Self.hash(mediaID, key: storeKey) }
+
     public func remove(mediaID: String) throws(MediaCacheError) {
         let hash = Self.hash(mediaID, key: storeKey)
         try state.withLock { (s) throws(MediaCacheError) in

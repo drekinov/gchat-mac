@@ -83,6 +83,8 @@ final class AppModel {
     @ObservationIgnored private var subscriptions: [AccountID: Task<Void, Never>] = [:]
     @ObservationIgnored private var eventSubscriptions: [AccountID: Task<Void, Never>] = [:]
     @ObservationIgnored private var recent: [(key: SpaceKey, messages: [Message])] = []
+    /// Older messages of the open conversation that Google returned, which retention mustn't hide on a guess.
+    @ObservationIgnored private var vouched: Set<MessageName> = []
     @ObservationIgnored private var lastMarked: [SpaceKey: Timestamp] = [:]
     @ObservationIgnored private var visibleThreads: [ThreadName] = []
     @ObservationIgnored private var newestVisibleReply: Timestamp?
@@ -793,13 +795,14 @@ final class AppModel {
         visibleThreads = []
         sendError = nil
         history = []
+        vouched = []
         historyEnd = .open
         loadingHistory = false
         historyCursor = nil
         historyOpening = UUID()
         if let key, let cached = recent.first(where: { $0.key == key }) {
             recent.removeAll { $0.key == key }
-            openMessages = cached.messages
+            openMessages = retained(cached.messages, in: key)
             loadedKey = key
         } else {
             openMessages = []
@@ -870,18 +873,23 @@ final class AppModel {
         let thread = openThread
         let loaded = await StoreReader.load(session: session, space: key.space, thread: thread)
         guard selection == key, sessions[key.account] === session else { return }
-        if historyCursor != nil, let oldest = loaded.messages.first?.createTime {
-            keepInHistory(openMessages.filter { $0.createTime < oldest })
+        let window = retained(loaded.messages, in: key)
+        let keptHistory = retained(history, in: key)
+        if keptHistory.count != history.count { history = keptHistory }
+        if historyCursor != nil, let oldest = window.first?.createTime {
+            keepInHistory(retained(openMessages, in: key).filter { $0.createTime < oldest })
         }
-        storeWindow = loaded.messages
-        openMessages = withLocalDeletes(withHistory(loaded.messages))
+        storeWindow = window
+        openMessages = withLocalDeletes(withHistory(window))
         loadPhotos(for: loaded.messages + loaded.thread, session: session)
         openOutbox = loaded.outbox
         openMine = loaded.mine
         loadedKey = key
         if openThread == thread {
             threadMessages = withLocalDeletes(
-                thread.map { thread in Self.merged(history.filter { $0.thread == thread }, loaded.thread) } ?? [])
+                thread.map { thread in
+                    Self.merged(history.filter { $0.thread == thread }, retained(loaded.thread, in: key))
+                } ?? [])
         }
         updateVisibleThreads(key)
         markReadIfNeeded()
@@ -901,11 +909,14 @@ final class AppModel {
             let session = sessions[key.account]
         else { return }
         if historyCursor == nil {
-            guard let oldest = openMessages.first?.createTime else {
+            if let oldest = openMessages.first?.createTime {
+                historyCursor = (oldest.adding(.microseconds(1)), nil)
+            } else if pagesEmptyHistory {
+                historyCursor = (Timestamp(Date()), nil)
+            } else {
                 historyEnd = .beginning
                 return
             }
-            historyCursor = (oldest.adding(.microseconds(1)), nil)
         }
         let opening = historyOpening
         let threaded = isThreaded(key)
@@ -924,13 +935,15 @@ final class AppModel {
                     break
                 }
                 guard historyOpening == opening else { return }
-                keepInHistory(page.items)
+                // Google just served these, so whatever the space's history-off record guesses, they still exist.
+                vouched.formUnion(page.items.map(\.name))
+                let items = page.items
+                keepInHistory(items)
                 openMessages = withLocalDeletes(withHistory(storeWindow))
                 if let thread = openThread {
-                    threadMessages = withLocalDeletes(
-                        Self.merged(page.items.filter { $0.thread == thread }, threadMessages))
+                    threadMessages = withLocalDeletes(Self.merged(items.filter { $0.thread == thread }, threadMessages))
                 }
-                loadPhotos(for: page.items, session: session)
+                loadPhotos(for: items, session: session)
                 historyCursor = (cursor.before, page.nextPageToken)
                 if page.nextPageToken == nil {
                     end = .beginning
@@ -953,6 +966,16 @@ final class AppModel {
         historyEnd = .open
         loadOlder()
     }
+
+    /// Leaves out what the space's history-off record says Google has deleted, wherever the messages came from.
+    private func retained(_ messages: [Message], in key: SpaceKey) -> [Message] {
+        guard let retention = summary(for: key)?.retention else { return messages }
+        let now = Timestamp(Date())
+        return messages.filter { vouched.contains($0.name) || !retention.isExpired($0.createTime, now: now) }
+    }
+
+    /// A history-off conversation whose cached messages have all expired may still have older ones Google keeps.
+    var pagesEmptyHistory: Bool { selection.flatMap { summary(for: $0)?.retention } != nil }
 
     private func keepInHistory(_ messages: [Message]) {
         guard !messages.isEmpty else { return }

@@ -125,19 +125,28 @@ public final class SQLiteAccountStore: AccountStore {
     private let state: Mutex<Connection?>
     private let codec: RowCodec
     private let directory: AccountDirectory
+    /// The time `HistoryRetention` is applied at.
+    private let now: @Sendable () -> Timestamp
 
-    private init(connection: sending Connection, key: StoreKey, directory: AccountDirectory) {
+    private init(
+        connection: sending Connection, key: StoreKey, directory: AccountDirectory,
+        now: @escaping @Sendable () -> Timestamp
+    ) {
         state = Mutex(connection)
         codec = RowCodec(sealer: RowSealer(key))
         self.directory = directory
+        self.now = now
     }
 
-    public static func open(directory: AccountDirectory, key: StoreKey) throws(StoreError) -> SQLiteAccountStore {
-        try open(directory: directory, key: key, migrations: migrations())
+    public static func open(
+        directory: AccountDirectory, key: StoreKey, now: @escaping @Sendable () -> Timestamp = { Timestamp(Date()) }
+    ) throws(StoreError) -> SQLiteAccountStore {
+        try open(directory: directory, key: key, migrations: migrations(), now: now)
     }
 
     static func open(
-        directory: AccountDirectory, key: StoreKey, migrations: [Migration]
+        directory: AccountDirectory, key: StoreKey, migrations: [Migration],
+        now: @escaping @Sendable () -> Timestamp = { Timestamp(Date()) }
     ) throws(StoreError) -> SQLiteAccountStore {
         guard key.account == directory.account else { throw .crypto(.authenticationFailed) }
         try directory.create()
@@ -149,7 +158,7 @@ public final class SQLiteAccountStore: AccountStore {
         try directory.restrictFile(directory.storeURL)
 
         let store = SQLiteAccountStore(
-            connection: try Connection(path: directory.storeURL.path), key: key, directory: directory)
+            connection: try Connection(path: directory.storeURL.path), key: key, directory: directory, now: now)
         try store.prepareDatabase(migrations: migrations)
         try store.restrictSidecarFiles()
         return store
@@ -381,7 +390,17 @@ public final class SQLiteAccountStore: AccountStore {
                 try self.withConnection { connection throws(StoreError) -> StoreWriteResult in
                     try connection.transaction { () throws(StoreError) -> StoreWriteResult in
                         var result = StoreWriteResult()
-                        for operation in batch.operations { try self.apply(operation, connection, &result) }
+                        let now = self.now()
+                        var touched: [SpaceName] = []
+                        for operation in batch.operations {
+                            if let space = operation.dropsMessages { try self.expire(space, now, connection) }
+                            if try self.apply(operation, connection, now, &result) {
+                                for space in operation.writtenSpaces where !touched.contains(space) {
+                                    touched.append(space)
+                                }
+                            }
+                        }
+                        for space in touched { try self.expire(space, now, connection) }
                         return result
                     }
                 }
@@ -413,9 +432,10 @@ public final class SQLiteAccountStore: AccountStore {
         }
     }
 
+    /// Returns whether the batch must apply retention to `operation.writtenSpaces` at its end.
     private func apply(
-        _ operation: StoreWrite.Operation, _ c: Connection, _ result: inout StoreWriteResult
-    ) throws(StoreError) {
+        _ operation: StoreWrite.Operation, _ c: Connection, _ now: Timestamp, _ result: inout StoreWriteResult
+    ) throws(StoreError) -> Bool {
         let handled = try Bookkeeping.apply(
             operation,
             get: { (key) throws(StoreError) in try self.readMeta(key, c) },
@@ -423,9 +443,9 @@ public final class SQLiteAccountStore: AccountStore {
             hasMessage: { (name) throws(StoreError) in try self.exists("messages", "name", name.rawValue, c) },
             isNotified: { (name) throws(StoreError) in try self.exists("notified", "message", name.rawValue, c) },
             result: &result)
-        if handled { return }
+        if handled { return false }
         switch operation {
-        case .mergeSpace(let space): try mergeSpace(space, c)
+        case .mergeSpace(let space): return try mergeSpace(space, now, c)
         case .setSpaceHidden(let name, let hidden):
             try c.prepare("UPDATE spaces SET is_hidden = ?2 WHERE name = ?1").run([.text(name.rawValue), .bool(hidden)])
         case .deleteSpace(let name): try deleteSpace(name, c)
@@ -460,7 +480,7 @@ public final class SQLiteAccountStore: AccountStore {
         case .setThreadReadState(let thread, let time):
             try setReadState(scope: thread.rawValue, space: thread.space, time, c)
         case .setNotificationSetting(let name, let setting):
-            guard var payload = try loadSpacePayload(name, c) else { return }
+            guard var payload = try loadSpacePayload(name, c) else { return false }
             payload.notificationSetting = setting
             try storeSpacePayload(payload, c)
         case .setMembers(let space, let members, let title, let fetched):
@@ -472,7 +492,7 @@ public final class SQLiteAccountStore: AccountStore {
             if let blob = try statement.first([.text(draft.key)], { $0.blob(0) }),
                 try !codec.open(blob, as: Draft.self, table: "drafts", rowKey: draft.key).isEmpty
             {
-                return
+                return false
             }
             try storeDraft(draft, c)
         case .deleteDraft(let key):
@@ -504,9 +524,95 @@ public final class SQLiteAccountStore: AccountStore {
                 """
             ).run([.text(space.rawValue), .int(Int64(max(0, keep)))])
         case .mergeOwed, .resolveOwed, .deferOwed, .owedOmitted, .clearOwed, .bumpRelist, .resolveRelist,
-            .addNotifyCandidates, .flagNotifyGap, .removeNotifyPending:
+            .addNotifyCandidates, .flagNotifyGap, .removeNotifyPending, .clearExpiredCleanup:
             break
+        case .observeHistory(let space, let historyOn, let at):
+            guard var payload = try loadSpacePayload(space, c) else { return false }
+            try Bookkeeping.observeHistory(
+                space, historyOn: historyOn, previous: payload.space.historyOn, at: at, margin: .zero,
+                get: { (key) throws(StoreError) in try self.readMeta(key, c) },
+                set: { (key, value) throws(StoreError) in try self.writeMeta(key, value, c) })
+            payload.space.historyOn = historyOn
+            try storeSpacePayload(payload, c)
+        case .expireHistoryOff(let spaces):
+            let names: [SpaceName]
+            if let spaces { names = spaces } else { names = try retentionCandidates(c) }
+            for space in names { try expire(space, now, c) }
         }
+        return true
+    }
+
+    /// Spaces stored with history off, and spaces with a retention record.
+    private func retentionCandidates(_ c: Connection) throws(StoreError) -> [SpaceName] {
+        var names = try querySpaces(c, name: nil).filter { $0.space.historyOn == false }.map(\.space.name)
+        let prefix = HistoryRetention.keyPrefix
+        let keys = try c.prepare("SELECT key FROM meta WHERE key >= ?1 AND key < ?2").rows([
+            .text(prefix), .text(Self.upperBound(of: prefix) ?? prefix),
+        ]) { $0.text(0) }
+        for key in keys {
+            if let name = SpaceName(String(key.dropFirst(prefix.count))), !names.contains(name) { names.append(name) }
+        }
+        return names
+    }
+
+    private func expire(_ space: SpaceName, _ now: Timestamp, _ c: Connection) throws(StoreError) {
+        let historyOn = try loadSpacePayload(space, c)?.space.historyOn
+        try Bookkeeping.expire(
+            space, historyOn: historyOn, now: now, rows: retentionRows(c),
+            get: { (key) throws(StoreError) in try self.readMeta(key, c) },
+            set: { (key, value) throws(StoreError) in try self.writeMeta(key, value, c) })
+    }
+
+    /// The bounds of `window` below `cutoff` on the `<column>_s, <column>_n` pair, as SQL and its values from `?2`.
+    private static func range(
+        _ window: HistoryOffWindow, cutoff: Timestamp?, column: String
+    ) -> (sql: String, values: [SQLValue]) {
+        var sql = ""
+        var values: [SQLValue] = []
+        if let from = window.from {
+            sql += " AND (\(column)_s, \(column)_n) >= (?\(values.count + 2), ?\(values.count + 3))"
+            values += [.seconds(from), .nanos(from)]
+        }
+        if let upper = [window.until, cutoff].compactMap({ $0 }).min() {
+            sql += " AND (\(column)_s, \(column)_n) < (?\(values.count + 2), ?\(values.count + 3))"
+            values += [.seconds(upper), .nanos(upper)]
+        }
+        return (sql, values)
+    }
+
+    private func retentionRows(_ c: Connection) -> RetentionRows {
+        RetentionRows(
+            expire: { (space, window, cutoff) throws(StoreError) -> [Message] in
+                let (bounds, values) = Self.range(window, cutoff: cutoff, column: "create")
+                let rows = try c.prepare("SELECT name, payload FROM messages WHERE space = ?1\(bounds)").rows(
+                    [.text(space.rawValue)] + values
+                ) { ($0.text(0), $0.blob(1)) }
+                guard !rows.isEmpty else { return [] }
+                let messages = try self.decodeMessages(rows)
+                let delete = try c.prepare("DELETE FROM messages WHERE name = ?1")
+                for (name, _) in rows { try delete.run([.text(name)]) }
+                return messages
+            },
+            expireOutbox: { (space, window, cutoff) throws(StoreError) in
+                let (bounds, values) = Self.range(window, cutoff: cutoff, column: "created")
+                let rows = try c.prepare("SELECT id, payload FROM outbox WHERE space = ?1\(bounds)").rows(
+                    [.text(space.rawValue)] + values
+                ) { ($0.text(0), $0.blob(1)) }
+                let delete = try c.prepare("DELETE FROM outbox WHERE id = ?1")
+                for (id, blob) in rows {
+                    let item = try self.codec.open(blob, as: OutboxItem.self, table: "outbox", rowKey: id)
+                    if case .committed = item.state { try delete.run([.text(id)]) }
+                }
+            },
+            oldest: { (space, window) throws(StoreError) -> Timestamp? in
+                let (bounds, values) = Self.range(window, cutoff: nil, column: "create")
+                let sql =
+                    "SELECT create_s, create_n FROM messages WHERE space = ?1\(bounds) "
+                    + "ORDER BY create_s, create_n LIMIT 1"
+                return try c.prepare(sql).first([.text(space.rawValue)] + values) { row throws(StoreError) in
+                    try row.timestamp(0)
+                }.flatMap { $0 }
+            })
     }
 
     private func storeDraft(_ draft: Draft, _ c: Connection) throws(StoreError) {
@@ -548,10 +654,22 @@ public final class SQLiteAccountStore: AccountStore {
         return (payload, fetched)
     }
 
-    private func mergeSpace(_ space: Space, _ c: Connection) throws(StoreError) {
+    /// True when the stored history state changed, so retention must run. An unspecified state keeps the stored one.
+    private func mergeSpace(_ space: Space, _ now: Timestamp, _ c: Connection) throws(StoreError) -> Bool {
         if var payload = try loadSpacePayload(space.name, c) {
+            let previous = payload.space.historyOn
             payload.space = space
+            payload.space.historyOn = space.historyOn ?? previous
             try storeSpacePayload(payload, c)
+            guard let historyOn = space.historyOn, previous != historyOn else { return false }
+            // First seen off: nothing to record, but cached rows now count as off and need a due time.
+            guard let previous else { return true }
+            try Bookkeeping.observeHistory(
+                space.name, historyOn: historyOn, previous: previous, at: now,
+                margin: HistoryRetention.observationMargin,
+                get: { (key) throws(StoreError) in try self.readMeta(key, c) },
+                set: { (key, value) throws(StoreError) in try self.writeMeta(key, value, c) })
+            return true
         } else {
             var payload = SpacePayload(space: space)
             if let members = try loadMembers(space.name, c) {
@@ -559,6 +677,7 @@ public final class SQLiteAccountStore: AccountStore {
                 payload.memberTitleFetched = members.fetched
             }
             try storeSpacePayload(payload, c)
+            return false
         }
     }
 
@@ -639,5 +758,6 @@ public final class SQLiteAccountStore: AccountStore {
             try c.prepare("DELETE FROM \(table) WHERE space = ?1").run(key)
         }
         try writeMeta(NotifyRecord.key(name), nil, c)
+        try writeMeta(HistoryRetention.key(name), nil, c)
     }
 }

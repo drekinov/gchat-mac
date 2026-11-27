@@ -62,7 +62,12 @@ enum FakeSeeder {
             if index == 0 { features = [.mention, .longMessage, .link] }
             if index == 1 { features = [.uploaded, .deleted, .link] }
             if index == 2 { features = [.drive, .mention] }
-            let endAgo = [4.0, 35, 130, 420, 1200, 1900][min(index, 5)] * Double.random(in: 0.7...1.3, using: &random)
+            var endAgo = [4.0, 35, 130, 420, 1200, 1900][min(index, 5)] * Double.random(in: 0.7...1.3, using: &random)
+            // Google deletes history-off messages after a day, so such a conversation only ever shows that day.
+            if spec.historyOff {
+                endAgo = min(endAgo, 60)
+                server.setHistory(on: false, in: space)
+            }
             let end = now.date.addingTimeInterval(-endAgo * 60)
             let roots = post(
                 context, count: spec.messages, features: features, in: space, end: end, others: members,
@@ -75,7 +80,6 @@ enum FakeSeeder {
                     at: Timestamp(end.addingTimeInterval(5)))
             }
             setReadState(server, account, space, unread: spec.unread)
-            if spec.historyOff { server.setHistory(on: false, in: space) }
             if spec.unreadReplies > 0 {
                 // The thread with the most replies is read up to its last few, like replies arriving overnight.
                 var replies: [ThreadName: [Message]] = [:]

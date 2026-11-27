@@ -154,6 +154,8 @@ extension State {
             ("reaction", "reactions", wireReaction(reaction))
         case .membershipCreated(let membership), .membershipDeleted(let membership):
             ("membership", "memberships", wireMembership(membership))
+        case .spaceUpdated(let space):
+            ("space", "spaces", wireSpace(space))
         }
     }
 

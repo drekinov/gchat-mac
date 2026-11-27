@@ -10,6 +10,8 @@ struct ReactionRecord: Sendable {
 struct MessageRecord: Sendable {
     var message: Message
     var reactions: [ReactionRecord] = []
+    /// Set when the message was posted with history off: Google deletes it then, without an event.
+    var expires: Timestamp? = nil
 }
 
 struct StoredEvent: Sendable {
@@ -21,11 +23,12 @@ struct StoredEvent: Sendable {
         case reactionDeleted(ReactionRecord)
         case membershipCreated(Membership)
         case membershipDeleted(Membership)
+        case spaceUpdated(Space)
 
         var action: String {
             switch self {
             case .messageCreated, .reactionCreated, .membershipCreated: "Created"
-            case .messageUpdated: "Updated"
+            case .messageUpdated, .spaceUpdated: "Updated"
             case .messageDeleted, .reactionDeleted, .membershipDeleted: "Deleted"
             }
         }
@@ -39,6 +42,15 @@ struct StoredEvent: Sendable {
             case .reactionDeleted: "google.workspace.chat.reaction.v1.deleted"
             case .membershipCreated: "google.workspace.chat.membership.v1.created"
             case .membershipDeleted: "google.workspace.chat.membership.v1.deleted"
+            case .spaceUpdated: "google.workspace.chat.space.v1.updated"
+            }
+        }
+
+        var message: MessageName? {
+            switch self {
+            case .messageCreated(let message), .messageUpdated(let message), .messageDeleted(let message):
+                message.name
+            default: nil
             }
         }
     }
@@ -143,6 +155,30 @@ struct State: Sendable {
             role: role, state: state)
     }
 
+    static let historyOffLifetime = Duration.seconds(24 * 3600)
+
+    /// Deletes what history-off retention has expired by now, with the events that carried it.
+    mutating func purgeExpired() {
+        for name in spaces.keys {
+            guard let space = spaces[name], space.messages.contains(where: { $0.expires.map { $0 <= now } ?? false })
+            else { continue }
+            let gone = Set(space.messages.filter { $0.expires.map { $0 <= now } ?? false }.map(\.message.name))
+            var kept = space
+            kept.messages.removeAll { gone.contains($0.message.name) }
+            kept.messageIndex = Dictionary(
+                uniqueKeysWithValues: kept.messages.enumerated().map { ($1.message.name, $0) })
+            kept.events.removeAll { $0.payload.message.map(gone.contains) ?? false }
+            spaces[name] = kept
+        }
+    }
+
+    mutating func setHistory(on: Bool, in space: SpaceName) {
+        guard spaces[space]?.space.historyOn != on else { return }
+        spaces[space]?.space.historyOn = on
+        let time = stamp(nil)
+        if let updated = spaces[space]?.space { record(.spaceUpdated(updated), in: space, at: time) }
+    }
+
     mutating func record(_ payload: StoredEvent.Payload, in space: SpaceName, at time: Timestamp) {
         eventSeq += 1
         let event = StoredEvent(id: newID(), time: time, seq: eventSeq, payload: payload)
@@ -223,7 +259,8 @@ struct State: Sendable {
         }
         let position = spaces[space]?.messages.count ?? 0
         spaces[space]?.messageIndex[message.name] = position
-        spaces[space]?.messages.append(MessageRecord(message: message))
+        let expires = spaces[space]?.space.historyOn == false ? time.adding(Self.historyOffLifetime) : nil
+        spaces[space]?.messages.append(MessageRecord(message: message, expires: expires))
         record(.messageCreated(message), in: space, at: time)
         bumpLastActive(space, to: time)
         return message

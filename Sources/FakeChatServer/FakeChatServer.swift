@@ -60,7 +60,10 @@ public final class FakeChatServer: Sendable {
     public var now: Timestamp { state.withLock { $0.now } }
 
     public func advance(_ duration: Duration) {
-        state.withLock { $0.now = $0.now.adding(duration) }
+        state.withLock {
+            $0.now = $0.now.adding(duration)
+            $0.purgeExpired()
+        }
     }
 
     /// When false, edits, deletes and reactions leave `Space.lastActiveTime` alone.
@@ -82,9 +85,10 @@ public final class FakeChatServer: Sendable {
         }
     }
 
-    /// Sets `spaceHistoryState`: off means Google Chat deletes the space's messages after about 24 hours.
+    /// Sets `spaceHistoryState` and records a `space.updated` event. Messages posted while it is off are deleted 24
+    /// hours later, with no event, as Google Chat does.
     public func setHistory(on: Bool, in space: SpaceName) {
-        state.withLock { $0.spaces[space]?.space.historyOn = on }
+        state.withLock { $0.setHistory(on: on, in: space) }
     }
 
     public func addMember(_ account: FakeAccount, to space: SpaceName, at: Timestamp? = nil) {

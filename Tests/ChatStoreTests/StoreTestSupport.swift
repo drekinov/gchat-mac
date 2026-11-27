@@ -1,5 +1,6 @@
 import ChatModel
 import Foundation
+import Synchronization
 import Testing
 
 @testable import ChatStore
@@ -82,9 +83,18 @@ final class TempDirectory {
     deinit { try? FileManager.default.removeItem(at: url) }
 }
 
+/// The time the fixture's store applies history retention at.
+final class StoreNow: Sendable {
+    private let value = Mutex(Timestamp(seconds: 1_000_000))
+
+    var now: Timestamp { value.withLock { $0 } }
+    func set(_ time: Timestamp) { value.withLock { $0 = time } }
+}
+
 final class Fixture {
     let backend: Backend
     let temp = TempDirectory()
+    let clock = StoreNow()
     let account = AccountID()
     let key: StoreKey
     let gate = SessionGate()
@@ -99,14 +109,15 @@ final class Fixture {
         generation = gate.current!
         switch backend {
         case .sqlite:
-            store = try SQLiteAccountStore.open(directory: AccountDirectory(root: temp.url, account: account), key: key)
-        case .memory: store = InMemoryAccountStore()
+            store = try SQLiteAccountStore.open(
+                directory: AccountDirectory(root: temp.url, account: account), key: key, now: { [clock] in clock.now })
+        case .memory: store = InMemoryAccountStore(now: { [clock] in clock.now })
         }
     }
 
     func reopenSQLite() throws {
         (store as? SQLiteAccountStore)?.close()
-        store = try SQLiteAccountStore.open(directory: directory, key: key)
+        store = try SQLiteAccountStore.open(directory: directory, key: key, now: { [clock] in clock.now })
     }
 
     func closeSQLite() { (store as? SQLiteAccountStore)?.close() }
