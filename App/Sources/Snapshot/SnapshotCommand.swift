@@ -216,7 +216,6 @@
                 .background(Color(nsColor: .windowBackgroundColor))
                 await window("21-mention-popup-all.png", all, NSSize(width: 640, height: 340))
                 await formatBarScenes(model, entry.id)
-                await composerChecks(model, entry.id, threaded: threaded.id)
             }
 
             for tab in SettingsTab.allCases {
@@ -280,6 +279,10 @@
             }
 
             await mediaChecks(model, wide)
+            // Last, because it sends a message and leaves another space selected.
+            if let entry = model.inbox.first(where: { $0.summary.title == "Engineering" }) {
+                await composerChecks(model, entry.id, threaded: threaded.id)
+            }
 
             model.shutdown()
             let many = AppModel()
@@ -710,7 +713,7 @@
             if let main = host.views.first {
                 let id = ComposerID(key: key, thread: nil)
                 await probeComposer(main, "main", model, id, person)
-                main.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+                press(main, return: true, shift: false)
                 var sent: Message?
                 for _ in 0..<100 {
                     await Self.pump(.milliseconds(100))
@@ -751,6 +754,17 @@
             host.views[1].delete(nil)
             await Self.pump(.milliseconds(300))
             model.closeThread()
+        }
+
+        /// A Return key press through `keyDown`, the way the keyboard sends it.
+        private func press(_ view: NSTextView, return _: Bool, shift: Bool) {
+            guard
+                let event = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: shift ? [.shift] : [], timestamp: 0,
+                    windowNumber: view.window?.windowNumber ?? 0, context: nil, characters: "\r",
+                    charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)
+            else { return }
+            view.keyDown(with: event)
         }
 
         private func hostComposers(_ model: AppModel) async -> (window: NSWindow, views: [ComposerNSTextView]) {
@@ -875,6 +889,24 @@
             await Self.pump(.milliseconds(300))
             check("return inside a code block adds a line", view.string.hasSuffix("let x = 1\n"))
             await type("```")
+            let fenced = view.string
+            press(view, return: true, shift: true)
+            await Self.pump(.milliseconds(300))
+            check("shift-return key adds a line", view.string == fenced + "\n")
+            view.deleteBackward(nil)
+            await Self.pump(.milliseconds(300))
+
+            func nowIsBold() -> Bool {
+                (attribute(.font, at: "now") as? NSFont)?.fontDescriptor.symbolicTraits.contains(.bold) == true
+            }
+            view.setSelectedRange(NSRange(location: (view.string as NSString).range(of: "see").location, length: 0))
+            view.insertText("\n", replacementRange: view.selectedRange())
+            await Self.pump(.milliseconds(300))
+            let split = !nowIsBold()
+            view.deleteBackward(nil)
+            await Self.pump(.milliseconds(300))
+            check("splitting and joining a line restyles both split=\(split)", split && nowIsBold())
+            view.setSelectedRange(end())
         }
 
         /// Edits and deletes my last message through the real session against the fake, and checks that a stale

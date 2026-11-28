@@ -163,6 +163,14 @@ private struct FormatContext {
             return .apply(result(edits, from: selection.lowerBound, to: selection.upperBound), removes: true)
         }
         if flag == .code, touchesMention(selection) { return .unavailable }
+        let literal = syntax.pairs.filter { $0.style == .code || $0.link != nil }
+        for segment in segments {
+            for offset in [segment.range.lowerBound, segment.range.upperBound] {
+                if literal.contains(where: { $0.open.lowerBound < offset && offset < $0.close.upperBound }) {
+                    return .unavailable
+                }
+            }
+        }
         var edits: [TextEdit] = []
         var bounds: [Range<Int>] = []
         for segment in segments where segment.pair == nil {
