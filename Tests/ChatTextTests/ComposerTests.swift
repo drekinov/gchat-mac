@@ -242,6 +242,23 @@ private func annMention(in text: String) -> MentionText.Mention {
                 == nil)
     }
 
+    @Test func strikethroughParsesBack() throws {
+        let done = try #require(run(.strikethrough, "old plan", 0..<8))
+        #expect(paragraph(done.wire) == [Span("old plan", style: .strikethrough)])
+    }
+
+    @Test func emphasisCantStartInsideCodeOrALink() {
+        let text = "run `make all` or <https://example.com|the docs>"
+        for selection in [
+            range(of: "make", in: text), caret(7), range(of: "example", in: text), range(of: "docs", in: text),
+        ] {
+            #expect(run(.bold, text, selection) == nil)
+            #expect(FormatAction.state(in: text, selection: selection, mentions: []).unavailable.contains(.italic))
+        }
+        let whole = try? #require(run(.bold, text, range(of: "run `make all`", in: text)))
+        #expect(whole?.text == "*run `make all`* or <https://example.com|the docs>")
+    }
+
     @Test func inlineStylesSkipCodeBlocks() {
         let text = "```\nx\n```"
         #expect(run(.bold, text, caret(4)) == nil)
@@ -376,6 +393,13 @@ private func annMention(in text: String) -> MentionText.Mention {
         #expect(editor.wireText(wrapped, names: [:]) == "*hi <users/1>*")
         let unknown = editor.recall("something else")
         #expect(!unknown)
+
+        var broken = MentionEditor(mentions: [annMention(in: typed)])
+        broken.remember(typed)
+        broken.mentions = []
+        broken.remember(typed)
+        let relinked = broken.recall(typed)
+        #expect(!relinked)
     }
 
     @Test func insertionReplacesTheTypedPrefix() throws {

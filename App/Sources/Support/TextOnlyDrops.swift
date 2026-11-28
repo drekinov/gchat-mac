@@ -1,9 +1,8 @@
 import AppKit
 import UniformTypeIdentifiers
 
-/// The drag types a composer's text view keeps, so file and image drags reach the enclosing drop destination and
-/// attach. A plain `NSTextView` accepts any file drag and types the file's path, and as the innermost view it gets
-/// the drag before SwiftUI can.
+/// The drag types a composer's text view keeps. A plain `NSTextView` takes file drags and types their paths, so
+/// files would never reach the composer's drop destination and attach.
 enum TextOnlyDrops {
     /// Text views register mostly legacy type names, which `UTType` doesn't know.
     static let legacyText: Set<String> = [

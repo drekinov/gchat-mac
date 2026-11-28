@@ -61,9 +61,10 @@ public struct MentionEditor: Sendable {
 
     /// Records the mentions `text` holds, for `recall` after undo or redo returns to it.
     public mutating func remember(_ text: String) {
-        guard !mentions.isEmpty else { return }
+        guard !mentions.isEmpty || !remembered.isEmpty else { return }
         let hash = text.hashValue
         remembered.removeAll { $0.hash == hash }
+        guard !mentions.isEmpty else { return }
         remembered.append((hash, mentions))
         if remembered.count > Self.rememberLimit { remembered.removeFirst(remembered.count - Self.rememberLimit) }
     }

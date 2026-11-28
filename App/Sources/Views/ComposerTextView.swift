@@ -250,7 +250,9 @@ struct ComposerTextView: NSViewRepresentable {
         private func restyle(_ storage: NSTextStorage, around edited: NSRange) {
             let string = storage.mutableString
             let fence = string.range(of: "```").location != NSNotFound
-            let target = fence || hadFence ? NSRange(location: 0, length: string.length) : string.lineRange(for: edited)
+            let reach = NSRange(
+                location: edited.location, length: min(edited.length + 1, string.length - edited.location))
+            let target = fence || hadFence ? NSRange(location: 0, length: string.length) : string.lineRange(for: reach)
             hadFence = fence
             guard target.length > 0 else { return }
             storage.addAttributes(ComposerStyle.base, range: target)
