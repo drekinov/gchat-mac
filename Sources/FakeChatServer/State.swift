@@ -234,8 +234,8 @@ struct State: Sendable {
 
     @discardableResult
     mutating func post(
-        _ text: String, in space: SpaceName, from sender: User, thread: ThreadName?, annotations: [Annotation],
-        attachments: [Attachment], gifURLs: [URL] = [], quoted: QuotedMessage? = nil,
+        _ text: String, in space: SpaceName, from sender: User, thread: ThreadName?, formattedText: String? = nil,
+        annotations: [Annotation], attachments: [Attachment], gifURLs: [URL] = [], quoted: QuotedMessage? = nil,
         cardsFallbackText: String? = nil, privateViewer: UserName? = nil, clientMessageID: String? = nil,
         at: Timestamp?
     ) -> Message {
@@ -251,7 +251,7 @@ struct State: Sendable {
         }
         let message = Message(
             name: MessageName(unchecked: "\(space.rawValue)/messages/\(newID()).\(newID())"), sender: sender,
-            createTime: time, text: text, annotations: annotations, thread: threadName,
+            createTime: time, text: text, formattedText: formattedText, annotations: annotations, thread: threadName,
             isThreadReply: thread != nil, attachments: attachments, gifURLs: gifURLs, quoted: quoted,
             cardsFallbackText: cardsFallbackText, privateViewer: privateViewer, clientMessageID: clientMessageID)
         for attachment in attachments {
@@ -278,12 +278,14 @@ struct State: Sendable {
 
     @discardableResult
     mutating func edit(
-        _ name: MessageName, text: String, annotations: [Annotation]? = nil, at: Timestamp?
+        _ name: MessageName, text: String, formattedText: String? = nil, annotations: [Annotation]? = nil,
+        at: Timestamp?
     ) -> Message {
         let index = recordIndex(name)
         precondition(spaces[name.space]?.messages[index].message.isDeleted == false, "message is deleted")
         let time = stamp(at)
         spaces[name.space]?.messages[index].message.text = text
+        spaces[name.space]?.messages[index].message.formattedText = formattedText
         if let annotations { spaces[name.space]?.messages[index].message.annotations = annotations }
         spaces[name.space]?.messages[index].message.lastUpdateTime = time
         let message = spaces[name.space]!.messages[index].message
@@ -299,6 +301,7 @@ struct State: Sendable {
         let time = stamp(at)
         var tombstone = spaces[name.space]!.messages[index].message
         tombstone.text = ""
+        tombstone.formattedText = nil
         tombstone.annotations = []
         tombstone.attachments = []
         tombstone.gifURLs = []

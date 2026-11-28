@@ -729,18 +729,36 @@ public final class SQLiteAccountStore: AccountStore {
             {
                 let older = (incoming.version.seconds, Int64(incoming.version.nanos)) < (seconds, nanos)
                 let equal = (incoming.version.seconds, Int64(incoming.version.nanos)) == (seconds, nanos)
+                var needsStored = incoming.isDeleted
                 switch (storedDeleted, incoming.isDeleted) {
                 case (true, false): continue
-                case (false, false): if older || (equal && !rewriteEqual) { continue }
+                case (false, false):
+                    if older { continue }
+                    if equal {
+                        if Message.equalCopyNeedsStored(incoming, rewriteEqual: rewriteEqual) {
+                            needsStored = true
+                        } else if !rewriteEqual {
+                            continue
+                        }
+                    }
                 case (true, true): if older { continue }
                 case (false, true): break
                 }
-                // Only a tombstone needs the stored copy: Google's deletion events leave out the thread and sender.
-                if incoming.isDeleted, let sealed = try payload.first([.text(name)], { $0.blob(0) }) {
+                // Decoding is only for tombstones, which keep the stored thread and sender, and for equal copies
+                // whose markup `Message.merge` reconciles.
+                if needsStored, let sealed = try payload.first([.text(name)], { $0.blob(0) }) {
                     let stored = try codec.open(sealed, as: Message.self, table: "messages", rowKey: name)
-                    message = Message.merge(incoming, over: stored, rewriteEqual: true) ?? incoming
+                    if incoming.isDeleted {
+                        message = Message.merge(incoming, over: stored, rewriteEqual: true) ?? incoming
+                    } else {
+                        guard let merged = Message.merge(incoming, over: stored, rewriteEqual: rewriteEqual) else {
+                            continue
+                        }
+                        message = merged
+                    }
                 }
             }
+            if message.isDeleted { message.formattedText = nil }
             let version = message.version
             let sealed = try codec.seal(message, table: "messages", rowKey: name)
             try insert.run([

@@ -1,6 +1,7 @@
 import AppKit
 import ChatModel
 import ChatSync
+import ChatText
 import SwiftUI
 
 struct ComposerView: View {
@@ -170,8 +171,9 @@ struct ComposerView: View {
             if edit == nil { model.restartEdit(composerID) }
             startRequestedEdit()
             model.prepareMentions(for: key)
-            await loadDraft()
+            // Names first, so a draft a failed send gave back shows its mentions as names.
             candidates = await model.mentionCandidates(for: key)
+            await loadDraft()
             guard !Task.isCancelled else { return }
             refreshTrigger()
         }
@@ -427,10 +429,11 @@ struct ComposerView: View {
         insertDroppedText()
     }
 
-    /// Shows the stored draft in place of the field's text, which has no mentions of its own then.
+    /// Shows the stored draft in place of the field's text, with the mentions a failed send gave back as names.
     private func showDraft() {
-        text = draft.text
-        mentionEditor = MentionEditor()
+        let restored = EditableText(wire: draft.text, names: mentionNames)
+        text = restored.text
+        mentionEditor = MentionEditor(mentions: restored.mentions)
         refreshTrigger()
     }
 
@@ -458,16 +461,7 @@ struct ComposerView: View {
 // MARK: Editing a sent message
 
 extension ComposerView {
-    /// One edit in progress: `basedOn` is nil while the message loads.
-    struct ActiveEdit: Equatable {
-        let attempt: UUID
-        let message: MessageName
-        var basedOn: Timestamp?
-        var original = ""
-        var losesFormatting = false
-        var saving = false
-        var problem: String?
-    }
+    typealias ActiveEdit = PendingEdit
 
     /// Up arrow in an empty composer edits my last message here.
     fileprivate func editLast() -> KeyPress.Result {
@@ -493,15 +487,10 @@ extension ComposerView {
             guard edit?.attempt == request.id, model.isCurrentEdit(request.id, in: composerID) else { return }
             switch result {
             case .success(let copy):
-                text = copy.message.text
-                mentionEditor = MentionEditor(mentions: MentionText.mentions(in: copy.message))
-                edit?.basedOn = copy.message.version
-                edit?.original = mentionEditor.wireText(text, names: mentionNames)
-                edit?.losesFormatting = copy.losesFormatting
+                show(edit?.load(copy.message))
                 selection = TextSelection(insertionPoint: text.endIndex)
             case .failure(.changed(let latest)):
-                text = latest.text
-                edit?.basedOn = latest.version
+                show(edit?.load(latest))
             case .failure(.message(let problem)):
                 finishEdit()
                 model.showComposerNotice(problem)
@@ -509,10 +498,17 @@ extension ComposerView {
         }
     }
 
+    private func show(_ editable: EditableText?) {
+        guard let editable else { return }
+        text = editable.text
+        mentionEditor = MentionEditor(mentions: editable.mentions)
+    }
+
     fileprivate func saveEdit() {
         guard let current = edit, let basedOn = current.basedOn, !current.saving else { return }
-        let wire = mentionEditor.wireText(text, names: mentionNames)
-        guard wire != current.original else { return finishEdit() }
+        guard let wire = current.changes(mentionEditor.wireText(text, names: mentionNames)) else {
+            return finishEdit()
+        }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             edit?.problem = "A message can't be empty. Delete it instead."
             return
@@ -526,8 +522,7 @@ extension ComposerView {
             case .success:
                 finishEdit()
             case .failure(.changed(let latest)):
-                edit?.saving = false
-                edit?.basedOn = latest.version
+                edit?.conflicted(with: latest)
                 edit?.problem = "Changed somewhere else since you started. Save again to replace that version."
             case .failure(.message(let problem)):
                 edit?.saving = false
@@ -568,7 +563,7 @@ private struct EditBar: View {
             }
             if edit.losesFormatting {
                 Label(
-                    "Formatting added in Google Chat (links, bold, lists) may be lost.",
+                    "Some of this message (custom emoji, links or mentions) can't be edited here and may change.",
                     systemImage: "exclamationmark.triangle"
                 )
                 .foregroundStyle(.orange)

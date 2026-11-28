@@ -47,6 +47,7 @@ func richMessage(canary: String = "rich") -> Message {
     Message(
         name: messageName("A", "rich"), sender: User(name: UserName(unchecked: "users/9"), displayName: canary),
         createTime: stamp(100, 123_456_789), lastUpdateTime: stamp(101, 5), deleteTime: nil, text: "text \(canary)",
+        formattedText: "*text* \(canary)",
         annotations: [
             Annotation(kind: .userMention(UserName(unchecked: "users/2")), startIndex: 0, length: 4),
             Annotation(kind: .richLink(URL(string: "https://example.com/\(canary)")!), startIndex: 5, length: 3),

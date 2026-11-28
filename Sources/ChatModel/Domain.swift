@@ -187,6 +187,8 @@ public struct Message: Hashable, Sendable, Codable, Identifiable {
     /// Set on tombstones (`showDeleted`, deleted events).
     public var deleteTime: Timestamp?
     public var text: String
+    /// Google's Chat-syntax markup for `text`; nil on tombstones and on rows cached before it was stored.
+    public var formattedText: String?
     public var annotations: [Annotation]
     public var thread: ThreadName?
     public var isThreadReply: Bool
@@ -210,9 +212,9 @@ public struct Message: Hashable, Sendable, Codable, Identifiable {
 
     /// The copy to keep when `incoming` meets `stored`, or nil to keep `stored`. Deletes are terminal: a live copy
     /// never replaces a tombstone, and a tombstone keeps the sender and thread that Google's sparse deletion events
-    /// leave out.
+    /// leave out. An equal copy with the same text fills in markup with its annotations, or keeps the stored markup.
     public static func merge(_ incoming: Message, over stored: Message?, rewriteEqual: Bool = false) -> Message? {
-        guard let stored else { return incoming }
+        guard let stored else { return incoming.isDeleted ? incoming.withoutMarkup : incoming }
         switch (stored.isDeleted, incoming.isDeleted) {
         case (true, false):
             return nil
@@ -222,12 +224,38 @@ public struct Message: Hashable, Sendable, Codable, Identifiable {
             return incoming.version < stored.version ? nil : incoming.keepingIdentity(of: stored)
         case (false, false):
             if incoming.version < stored.version { return nil }
-            return incoming.version == stored.version && !rewriteEqual ? nil : incoming
+            guard incoming.version == stored.version else { return incoming }
+            let sameText = incoming.text == stored.text
+            if rewriteEqual {
+                guard sameText, incoming.formattedText == nil, stored.formattedText != nil else { return incoming }
+                var kept = incoming
+                kept.formattedText = stored.formattedText
+                return kept
+            }
+            guard sameText, let markup = incoming.formattedText,
+                markup != stored.formattedText || incoming.annotations != stored.annotations
+            else { return nil }
+            var backfilled = stored
+            backfilled.formattedText = markup
+            backfilled.annotations = incoming.annotations
+            return backfilled
         }
     }
 
+    /// Whether an equal-version live `incoming` can change a live stored row, which only `merge` can tell after
+    /// decoding it. Lets a store skip decoding rows the merge would leave alone.
+    public static func equalCopyNeedsStored(_ incoming: Message, rewriteEqual: Bool) -> Bool {
+        rewriteEqual ? incoming.formattedText == nil : incoming.formattedText != nil
+    }
+
+    private var withoutMarkup: Message {
+        var copy = self
+        copy.formattedText = nil
+        return copy
+    }
+
     private func keepingIdentity(of stored: Message) -> Message {
-        var merged = self
+        var merged = withoutMarkup
         merged.sender = stored.sender
         merged.thread = stored.thread ?? thread
         merged.isThreadReply = stored.isThreadReply
@@ -236,7 +264,8 @@ public struct Message: Hashable, Sendable, Codable, Identifiable {
 
     public init(
         name: MessageName, sender: User, createTime: Timestamp, lastUpdateTime: Timestamp? = nil,
-        deleteTime: Timestamp? = nil, text: String = "", annotations: [Annotation] = [], thread: ThreadName? = nil,
+        deleteTime: Timestamp? = nil, text: String = "", formattedText: String? = nil, annotations: [Annotation] = [],
+        thread: ThreadName? = nil,
         isThreadReply: Bool = false, attachments: [Attachment] = [], gifURLs: [URL] = [],
         reactions: [ReactionSummary] = [], quoted: QuotedMessage? = nil, cardsFallbackText: String? = nil,
         cards: [Card]? = nil, privateViewer: UserName? = nil, clientMessageID: String? = nil
@@ -247,6 +276,7 @@ public struct Message: Hashable, Sendable, Codable, Identifiable {
         self.lastUpdateTime = lastUpdateTime
         self.deleteTime = deleteTime
         self.text = text
+        self.formattedText = formattedText
         self.annotations = annotations
         self.thread = thread
         self.isThreadReply = isThreadReply

@@ -4,7 +4,8 @@
       "name": "spaces/AAAA/messages/GOOD1",
       "sender": { "name": "users/1001", "type": "BOT" },
       "createTime": "2026-10-14T12:00:00Z",
-      "text": "first"
+      "text": "first",
+      "formattedText": "*first*"
     },
     { "name": "spaces/AAAA/messages", "createTime": "2026-10-14T12:00:01Z", "text": "bad name" },
     { "name": "spaces/AAAA/messages/..", "createTime": "2026-10-14T12:00:02Z", "text": "dotdot" },
@@ -28,6 +29,7 @@
       "name": "spaces/AAAA/messages/TOMB",
       "createTime": "2026-10-14T12:00:06Z",
       "deleteTime": "2026-10-14T12:30:00Z",
+      "formattedText": "",
       "deletionMetadata": { "deletionType": "SPACE_OWNER" }
     }
   ],

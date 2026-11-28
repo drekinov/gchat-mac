@@ -64,6 +64,23 @@ public final class Contacts: Sendable {
     public var directoryAvailable: Bool { directory != nil && !directoryOff.withLock { $0 } }
 
     /// Everyone you share a cached chat with, ranked DM partners first, then by name.
+    /// Display names for mentions in `space`'s outbox: its members first, then people from other cached chats.
+    public func mentionNames(in space: SpaceName) throws(StoreError) -> [UserName: String] {
+        Self.mentionNames(members: try store.members(in: space), contacts: try fromChats())
+    }
+
+    public static func mentionNames(members: [Membership], contacts: [Contact]) -> [UserName: String] {
+        var names: [UserName: String] = [:]
+        for membership in members {
+            if let name = membership.member.displayName, !name.isEmpty { names[membership.member.name] = name }
+        }
+        for contact in contacts where !contact.displayName.isEmpty {
+            guard let user = contact.user, names[user] == nil else { continue }
+            names[user] = contact.displayName
+        }
+        return names
+    }
+
     public func fromChats() throws(StoreError) -> [Contact] {
         var byUser: [UserName: Contact] = [:]
         for stored in try store.spaces() where !stored.isHidden {

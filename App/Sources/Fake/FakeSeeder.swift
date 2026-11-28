@@ -250,7 +250,7 @@ enum FakeSeeder {
 
     // MARK: Showcase
 
-    /// Dense, deterministic content at the end of three Studio A spaces so renders show every message kind.
+    /// Dense, deterministic content at the end of four Studio A spaces so renders show every message kind.
     private static func showcase(
         _ context: Context, _ title: String, _ space: SpaceName, end: Date, others: [User]
     ) {
@@ -361,6 +361,23 @@ enum FakeSeeder {
                         kind: .userMention(context.account.user.name), startIndex: lead.utf16.count,
                         length: tag.utf16.count)
                 ])
+
+        case "Studio Lounge":
+            func markup(_ text: String, _ index: Int) {
+                context.server.post(markup: text, in: space, from: .user(others[index % others.count]), at: next())
+            }
+            let me = context.account.user.name.rawValue
+            markup(
+                "The deploy is *blocked* until _someone_ reviews `migrations/0042`. The old flag is ~needed~ gone. "
+                    + "Runbook: <https://example.com/runbooks/staging|staging checklist>", 0)
+            markup(
+                "> Is staging in sync again?\nNot yet. Remaining:\n* Re-run the *backfill*\n* Verify counts\n"
+                    + "    * users\n    * spaces\n* Ping <\(me)>", 1)
+            context.server.post(
+                markup:
+                    "On it. I'll run `make backfill` with *--dry-run* first, see <https://example.com/pull/7|the PR>.",
+                in: space, from: .account(context.account), at: next())
+            markup("Run `make bench` *before* merging:\n```\nswift test --parallel\nmake footprint\n```", 2)
 
         default:
             break

@@ -30,6 +30,7 @@ final class AppModel {
         didSet { rowsRevision &+= 1 }
     }
     private(set) var openOutbox: [OutboxItem] = []
+    private(set) var openOutboxNames: [UserName: String] = [:]
     private(set) var openMine: [MessageName: [Emoji: ReactionName]] = [:]
     private(set) var openThread: ThreadName?
     private(set) var threadMessages: [Message] = [] {
@@ -791,6 +792,7 @@ final class AppModel {
         threadReadPosition = nil
         threadMessages = []
         openOutbox = []
+        openOutboxNames = [:]
         openMine = [:]
         visibleThreads = []
         sendError = nil
@@ -883,6 +885,7 @@ final class AppModel {
         openMessages = withLocalDeletes(withHistory(window))
         loadPhotos(for: loaded.messages + loaded.thread, session: session)
         openOutbox = loaded.outbox
+        if openOutboxNames != loaded.outboxNames { openOutboxNames = loaded.outboxNames }
         openMine = loaded.mine
         loadedKey = key
         if openThread == thread {

@@ -2,6 +2,7 @@
     import AppKit
     import ChatModel
     import ChatSync
+    import FakeChatServer
     import SwiftUI
 
     /// Renders windows into PNGs from offscreen windows, driven by the fake world.
@@ -128,6 +129,7 @@
                 ("06-attachments.png", "Releases", NSSize(width: 1280, height: 1500)),
                 ("07-quoted-card-mention.png", "Design Reviews", wide),
                 ("30-history-off.png", "On-call Handover", wide),
+                ("36-formatting.png", "Studio Lounge", wide),
             ]
             for item in showcases {
                 if let entry = model.inbox.first(where: { $0.summary.title == item.title }) {
@@ -135,6 +137,7 @@
                     await mainWindow(item.file, model, item.size)
                 }
             }
+            await formattingChecks(model, wide)
 
             if let entry = model.inbox.first(where: { $0.summary.title == "Releases" }) {
                 print("snapshot: Releases unread count: \(entry.summary.unreadCount)")
@@ -611,6 +614,50 @@
             let edited = text.replacingOccurrences(of: "@" + (candidates.first?.displayName ?? ""), with: "@X")
             editor.applyEdit(old: text, new: edited)
             print("snapshot: after editing first mention, wire: \(editor.wireText(edited, names: names))")
+        }
+
+        /// A formatted message whose send fails stays readable in the outbox, and editing a formatted message loads
+        /// its markup with mentions as names.
+        private func formattingChecks(_ model: AppModel, _ size: NSSize) async {
+            guard let entry = model.inbox.first(where: { $0.summary.title == "Studio Lounge" }),
+                let index = model.accounts.firstIndex(where: { $0.id == entry.account }),
+                let server = model.world?.servers[safe: index]
+            else { return print("snapshot: formatting checks skipped") }
+            model.select(entry.id)
+            await model.waitUntilSettled(timeout: .seconds(3))
+            let me = model.info(entry.account)?.me
+            guard let other = model.openMessages.first(where: { $0.sender.name != me })?.sender.name else {
+                return print("snapshot: formatting checks FAILED no other member")
+            }
+            server.fail(
+                FailureRule(
+                    route: .createMessage, space: entry.summary.name,
+                    response: .http(status: 400, googleStatus: "INVALID_ARGUMENT")))
+            _ = await model.send(
+                "*Heads up* <\(other.rawValue)>: the `staging` deploy is _paused_", key: entry.id, thread: nil)
+            var failed: OutboxItem?
+            for _ in 0..<150 {
+                await model.waitUntilSettled(timeout: .seconds(1))
+                failed = model.openOutbox.first { $0.state.isTerminal }
+                if failed != nil { break }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            print("snapshot: formatted outbox failed=\(failed != nil) named=\(model.openOutboxNames[other] != nil)")
+            await mainWindow("37-formatted-outbox-failed.png", model, size)
+            if let failed { await model.discard(failed, key: entry.id) }
+
+            await model.waitUntilSettled(timeout: .seconds(3))
+            let id = ComposerID(key: entry.id, thread: nil)
+            guard let mine = model.lastEditable(for: id), mine.formattedText != nil else {
+                return print("snapshot: formatted edit FAILED no formatted message of mine")
+            }
+            model.beginEdit(mine, key: entry.id)
+            await mainWindow("38-formatted-edit.png", model, size) {
+                try? await Task.sleep(for: .milliseconds(800))
+            }
+            model.endEdit(id, attempt: nil)
+            model.setDraftText("", for: id)
+            _ = await model.drafts(for: entry.account).flush()
         }
 
         /// Edits and deletes my last message through the real session against the fake, and checks that a stale

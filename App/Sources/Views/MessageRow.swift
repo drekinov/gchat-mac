@@ -126,7 +126,7 @@ enum MessageRendering {
         }
     }
 
-    private static func linkify(_ text: String, underlined: Bool, in result: inout AttributedString) {
+    static func linkify(_ text: String, underlined: Bool, in result: inout AttributedString) {
         guard let detector = linkDetector, text.utf8.count < 20_000 else { return }
         let whole = NSRange(text.startIndex..., in: text)
         for match in detector.matches(in: text, range: whole) {
@@ -357,10 +357,16 @@ struct MessageRow: View {
             VStack(alignment: .leading, spacing: 6) {
                 if let quote { QuotedBlock(sender: quote.sender, text: quote.text) }
                 if !message.text.isEmpty {
-                    Text(MessageRendering.attributed(message, me: context.me, onAccent: mine))
-                        .textSelection(.enabled)
-                        .tint(mine ? Theme.onAccent : Theme.accentText)
-                        .padding(.horizontal, quote == nil ? 0 : 4)
+                    Group {
+                        if let document = MessageMarkup.document(for: message) {
+                            FormattedMessageText(document: document, me: context.me, onAccent: mine)
+                        } else {
+                            Text(MessageRendering.attributed(message, me: context.me, onAccent: mine))
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .tint(mine ? Theme.onAccent : Theme.accentText)
+                    .padding(.horizontal, quote == nil ? 0 : 4)
                 }
             }
             .padding(.horizontal, 12)
@@ -636,6 +642,8 @@ private struct CardWidgetView: View {
 struct OutboxRow: View {
     let item: OutboxItem
     var context: MessageContext?
+    /// Names for the `<users/…>` tokens in the pending text.
+    var names: [UserName: String] = [:]
     var onRepost: (() -> Void)?
     var onDiscard: (() -> Void)?
 
@@ -645,12 +653,18 @@ struct OutboxRow: View {
             Spacer(minLength: 56)
             VStack(alignment: .trailing, spacing: 4) {
                 if !item.payload.text.isEmpty {
-                    Text(RemoteText.message(item.payload.text))
-                        .textSelection(.enabled)
-                        .foregroundStyle(Theme.onAccent)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(Theme.accent.opacity(isFailure ? 0.45 : 0.6), in: Bubble())
+                    Group {
+                        if let document = MessageMarkup.pending(item.payload.text, names: names) {
+                            FormattedMessageText(document: document, me: context?.me, onAccent: true)
+                        } else {
+                            Text(RemoteText.message(item.payload.text)).textSelection(.enabled)
+                        }
+                    }
+                    .tint(Theme.onAccent)
+                    .foregroundStyle(Theme.onAccent)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Theme.accent.opacity(isFailure ? 0.45 : 0.6), in: Bubble())
                 }
                 ForEach(item.payload.attachments) { attachment in
                     Label(

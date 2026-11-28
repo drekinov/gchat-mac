@@ -60,7 +60,7 @@ import Testing
         #expect(queryItems(request) == ["updateMask": "text"])
         let body = try #require(
             request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: String] })
-        #expect(body == ["text": "fixed"])
+        #expect(body == ["text": "fixed", "markupSyntax": "MARKUP_SYNTAX_CHAT"])
         #expect(updated.text == "fixed")
 
         let other = StubTransport(status: 200, body: Data(reply.replacingOccurrences(of: "M.1", with: "M.2").utf8))
@@ -236,7 +236,7 @@ import Testing
         #expect(request.method == .post)
         #expect(request.url.path == "/v1/spaces/AAAA/messages")
         #expect(queryItems(request) == ["requestId": "a1b2c3d4-0000-4000-8000-abcdef012345"])
-        #expect(bodyString(request) == #"{"text":"hello \"world\" / ✓"}"#)
+        #expect(bodyString(request) == #"{"markupSyntax":"MARKUP_SYNTAX_CHAT","text":"hello \"world\" / ✓"}"#)
     }
 
     @Test func createMessageReplyToThread() async throws {
@@ -249,7 +249,9 @@ import Testing
             queryItems(request) == [
                 "requestId": "a1b2c3d4-0000-4000-8000-abcdef012345", "messageReplyOption": "REPLY_MESSAGE_OR_FAIL",
             ])
-        #expect(bodyString(request) == #"{"text":"re","thread":{"name":"spaces/AAAA/threads/THR1"}}"#)
+        #expect(
+            bodyString(request)
+                == #"{"markupSyntax":"MARKUP_SYNTAX_CHAT","text":"re","thread":{"name":"spaces/AAAA/threads/THR1"}}"#)
     }
 
     @Test func createMessageWithAttachments() async throws {
@@ -261,7 +263,7 @@ import Testing
         let body = try #require(bodyString(request))
         #expect(
             body
-                == #"{"attachment":[{"attachmentDataRef":{"attachmentUploadToken":"tok1"}},{"attachmentDataRef":{"attachmentUploadToken":"tok/2"}}],"text":"pics"}"#
+                == #"{"attachment":[{"attachmentDataRef":{"attachmentUploadToken":"tok1"}},{"attachmentDataRef":{"attachmentUploadToken":"tok/2"}}],"markupSyntax":"MARKUP_SYNTAX_CHAT","text":"pics"}"#
         )
     }
 

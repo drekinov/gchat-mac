@@ -18,11 +18,9 @@ public enum MessageEditError: Error, Sendable, Equatable {
     case failed(SyncError)
 }
 
-/// A fresh copy of a message to edit.
+/// A fresh copy of a message to edit, with its markup.
 public struct EditableCopy: Sendable, Equatable {
     public var message: Message
-    /// Google holds formatting (links, bold, lists) the plain-text editor can't carry, so saving drops it.
-    public var losesFormatting: Bool
 }
 
 extension AccountSession {
@@ -44,9 +42,7 @@ extension AccountSession {
         }
         guard !fetched.message.isDeleted else { throw .gone }
         commitQuietly(name.space, generation) { $0.append(.upsertMessages([fetched.message])) }
-        return EditableCopy(
-            message: fetched.message,
-            losesFormatting: Self.losesFormatting(fetched.message, formattedText: fetched.formattedText))
+        return EditableCopy(message: fetched.message)
     }
 
     /// Replaces the text of one of the user's messages unless it changed after `basedOn`.
@@ -142,6 +138,7 @@ extension AccountSession {
             var tombstone = message
             tombstone.deleteTime = message.version
             tombstone.text = ""
+            tombstone.formattedText = nil
             tombstone.annotations = []
             tombstone.attachments = []
             tombstone.gifURLs = []
@@ -174,19 +171,5 @@ extension AccountSession {
         } catch {
             return false
         }
-    }
-
-    /// Compares the editor's plain text with Google's markup, ignoring mentions, which both carry.
-    static func losesFormatting(_ message: Message, formattedText: String?) -> Bool {
-        guard let formattedText else { return false }
-        var plain = Array(message.text.utf16)
-        let mentions = message.annotations.compactMap { annotation -> Range<Int>? in
-            guard case .userMention = annotation.kind else { return nil }
-            let range = annotation.startIndex..<(annotation.startIndex + annotation.length)
-            return range.upperBound <= plain.count ? range : nil
-        }
-        for range in mentions.sorted(by: { $0.lowerBound > $1.lowerBound }) { plain.removeSubrange(range) }
-        let marked = formattedText.replacing(/<users\/[^>]+>/, with: "")
-        return String(decoding: plain, as: UTF16.self) != marked
     }
 }

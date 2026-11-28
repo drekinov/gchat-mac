@@ -125,6 +125,19 @@ public final class FakeChatServer: Sendable {
         }
     }
 
+    /// Posts Chat-syntax markup the way the API's `markupSyntax` does: plain text, mentions and markup together.
+    @discardableResult
+    public func post(
+        markup: String, in space: SpaceName, from sender: FakeSender, thread: ThreadName? = nil, at: Timestamp? = nil
+    ) -> Message {
+        state.withLock { state in
+            let composed = state.compose(markup: markup)
+            return state.post(
+                composed.text, in: space, from: sender.user, thread: thread, formattedText: composed.formattedText,
+                annotations: composed.annotations, attachments: [], at: at)
+        }
+    }
+
     @discardableResult
     public func edit(_ message: MessageName, text: String, at: Timestamp? = nil) -> Message {
         state.withLock { $0.edit(message, text: text, at: at) }

@@ -84,6 +84,8 @@ import Testing
 
         #expect(items[0].sender == User(name: UserName(unchecked: "users/1001"), type: .bot))
         #expect(items[0].text == "first")
+        #expect(items[0].formattedText == "*first*")
+        #expect(items[1].formattedText == nil)
 
         #expect(items[1].sender == User(name: UserName(unchecked: "users/unknown"), type: .human))
         #expect(items[1].cardsFallbackText == nil)
@@ -93,6 +95,7 @@ import Testing
 
         #expect(items[3].deleteTime == ts("2026-10-14T12:30:00Z"))
         #expect(items[3].isDeleted)
+        #expect(items[3].formattedText == nil)
         #expect(items[0].deleteTime == nil)
     }
 

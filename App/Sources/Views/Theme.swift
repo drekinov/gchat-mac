@@ -22,6 +22,8 @@ enum Theme {
     static let islandEdge = dynamic(light: 0x00_0000, dark: 0xFF_FFFF, lightAlpha: 0.07, darkAlpha: 0.08)
     /// Selected rows and highlighted search results.
     static let selection = dynamic(light: 0x4A_6382, dark: 0x6E_87A6, lightAlpha: 0.14, darkAlpha: 0.32)
+    /// The tint behind inline code on other people's bubbles.
+    static let inlineCode = dynamic(light: 0x00_0000, dark: 0xFF_FFFF, lightAlpha: 0.07, darkAlpha: 0.09)
     static let warning = dynamic(light: 0x9A_5B00, dark: 0xF2_B455)
     static let error = dynamic(light: 0xC4_352B, dark: 0xFF_6B61)
 
