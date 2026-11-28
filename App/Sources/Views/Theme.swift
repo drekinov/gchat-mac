@@ -28,11 +28,14 @@ enum Theme {
     static let error = dynamic(light: 0xC4_352B, dark: 0xFF_6B61)
 
     static func dynamic(light: UInt32, dark: UInt32, lightAlpha: CGFloat = 1, darkAlpha: CGFloat = 1) -> Color {
-        Color(
-            nsColor: NSColor(name: nil) { appearance in
-                let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                return rgb(isDark ? dark : light, alpha: isDark ? darkAlpha : lightAlpha)
-            })
+        Color(nsColor: dynamicNS(light: light, dark: dark, lightAlpha: lightAlpha, darkAlpha: darkAlpha))
+    }
+
+    static func dynamicNS(light: UInt32, dark: UInt32, lightAlpha: CGFloat = 1, darkAlpha: CGFloat = 1) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return rgb(isDark ? dark : light, alpha: isDark ? darkAlpha : lightAlpha)
+        }
     }
 
     private static func rgb(_ value: UInt32, alpha: CGFloat) -> NSColor {

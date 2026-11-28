@@ -154,7 +154,7 @@ public enum ChatMarkup {
         return inventory
     }
 
-    private static func fenceEnd(_ lines: [Substring], from start: Int) -> Int? {
+    static func fenceEnd(_ lines: [Substring], from start: Int) -> Int? {
         let first = lines[start]
         guard first.hasPrefix("```") else { return nil }
         if first.count >= 6, first.hasSuffix("```") { return start }
@@ -169,7 +169,7 @@ public enum ChatMarkup {
         return .code(String(body), source: source)
     }
 
-    private static func listItem(_ line: Substring) -> (Int, Substring)? {
+    static func listItem(_ line: Substring) -> (Int, Substring)? {
         let indent = line.prefix { $0 == " " }.count
         guard indent.isMultiple(of: 4) else { return nil }
         let rest = line.dropFirst(indent)
@@ -177,7 +177,7 @@ public enum ChatMarkup {
         return (indent / 4, rest.dropFirst(2))
     }
 
-    private static func quoteLine(_ line: Substring) -> Substring? {
+    static func quoteLine(_ line: Substring) -> Substring? {
         if line == ">" { return line.dropFirst() }
         return line.hasPrefix("> ") ? line.dropFirst(2) : nil
     }

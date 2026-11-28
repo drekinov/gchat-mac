@@ -2,6 +2,7 @@
     import AppKit
     import ChatModel
     import ChatSync
+    import ChatText
     import FakeChatServer
     import SwiftUI
 
@@ -214,6 +215,7 @@
                 }
                 .background(Color(nsColor: .windowBackgroundColor))
                 await window("21-mention-popup-all.png", all, NSSize(width: 640, height: 340))
+                await formatBarScenes(model, entry.id)
             }
 
             for tab in SettingsTab.allCases {
@@ -277,6 +279,10 @@
             }
 
             await mediaChecks(model, wide)
+            // Last, because it sends a message and leaves another space selected.
+            if let entry = model.inbox.first(where: { $0.summary.title == "Engineering" }) {
+                await composerChecks(model, entry.id, threaded: threaded.id)
+            }
 
             model.shutdown()
             let many = AppModel()
@@ -658,6 +664,249 @@
             model.endEdit(id, attempt: nil)
             model.setDraftText("", for: id)
             _ = await model.drafts(for: entry.account).flush()
+        }
+
+        /// The composer with the format bar open: inline styles with the caret in bold, then lists, a quote and a
+        /// code block.
+        private func formatBarScenes(_ model: AppModel, _ key: SpaceKey) async {
+            let suite = "io.github.drekinov.gchat-mac.snapshot.formatbar"
+            guard let defaults = UserDefaults(suiteName: suite) else { return }
+            defaults.set(true, forKey: "composerFormatBar")
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let scenes = [
+                (
+                    "39-composer-format-bar.png",
+                    "Please *don't merge* until `ci/check` is _green_\nsee <https://example.com/pr/42|the PR>, ~not~ the old one",
+                    "merge"
+                ),
+                (
+                    "40-composer-blocks.png",
+                    "* fetch\n* ~skip~ rebase\n> from the runbook\n```\ngit fetch origin\n```", "fetch origin"
+                ),
+            ]
+            for (file, text, at) in scenes {
+                let caret = (text as NSString).range(of: at).location
+                let composer = VStack(spacing: 0) {
+                    Color(nsColor: .textBackgroundColor).frame(height: 160)
+                    ComposerView(
+                        model: model, key: key, thread: nil, previewText: text, previewSelection: caret..<caret)
+                }
+                .background(Color(nsColor: .windowBackgroundColor))
+                .defaultAppStorage(defaults)
+                await window(file, composer, NSSize(width: 640, height: 340))
+            }
+        }
+
+        /// Drives the real composers' text views the way keys, an input method and the format bar do, in the main
+        /// composer and a thread's, then sends from the main one and checks what the server got.
+        private func composerChecks(_ model: AppModel, _ key: SpaceKey, threaded: SpaceKey) async {
+            guard let index = model.accounts.firstIndex(where: { $0.id == key.account }),
+                let server = model.world?.servers[safe: index], let space = model.summary(for: key)?.name
+            else { return print("snapshot: composer checks skipped") }
+            model.select(key)
+            await model.waitUntilSettled(timeout: .seconds(3))
+            let candidates = await model.mentionCandidates(for: key)
+            guard let person = candidates.first(where: { $0.user != nil }), let user = person.user else {
+                return print("snapshot: composer FAILED no mention candidates")
+            }
+            var host = await hostComposers(model)
+            if let main = host.views.first {
+                let id = ComposerID(key: key, thread: nil)
+                await probeComposer(main, "main", model, id, person)
+                press(main, return: true, shift: false)
+                var sent: Message?
+                for _ in 0..<100 {
+                    await Self.pump(.milliseconds(100))
+                    sent = server.messages(in: space).last { $0.formattedText?.contains("let x = 1") == true }
+                    if sent != nil { break }
+                }
+                let wire = sent?.formattedText ?? ""
+                let ok =
+                    main.string.isEmpty && wire.hasPrefix("*Ping <\(user.rawValue)> see now `ci`é*")
+                    && wire.hasSuffix("```\nlet x = 1\n```")
+                print("snapshot: composer main send \(ok ? "ok" : "FAILED") wire=\(wire.debugDescription)")
+            } else {
+                print("snapshot: composer FAILED no main composer")
+            }
+            host.window.close()
+
+            model.select(threaded)
+            await model.waitUntilSettled(timeout: .seconds(3))
+            let replied = Set(model.openMessages.filter(\.isThreadReply).compactMap(\.thread))
+            guard
+                let thread = model.openMessages.last(where: {
+                    !$0.isThreadReply && $0.thread.map(replied.contains) == true
+                })?.thread
+            else { return print("snapshot: composer FAILED no thread to open") }
+            model.openThread(thread)
+            host = await hostComposers(model)
+            defer { host.window.close() }
+            guard host.views.count == 2 else {
+                return print("snapshot: composer FAILED found \(host.views.count) composers with a thread open")
+            }
+            let threadCandidates = await model.mentionCandidates(for: threaded)
+            guard let member = threadCandidates.first(where: { $0.user != nil }) else {
+                return print("snapshot: composer FAILED no thread mention candidates")
+            }
+            let id = ComposerID(key: threaded, thread: thread)
+            await probeComposer(host.views[1], "thread", model, id, member)
+            host.views[1].selectAll(nil)
+            host.views[1].delete(nil)
+            await Self.pump(.milliseconds(300))
+            model.closeThread()
+        }
+
+        /// A Return key press through `keyDown`, the way the keyboard sends it.
+        private func press(_ view: NSTextView, return _: Bool, shift: Bool) {
+            guard
+                let event = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: shift ? [.shift] : [], timestamp: 0,
+                    windowNumber: view.window?.windowNumber ?? 0, context: nil, characters: "\r",
+                    charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)
+            else { return }
+            view.keyDown(with: event)
+        }
+
+        private func hostComposers(_ model: AppModel) async -> (window: NSWindow, views: [ComposerNSTextView]) {
+            await model.waitUntilSettled(timeout: .seconds(3))
+            let window = NSWindow(
+                contentRect: NSRect(x: 20, y: 20, width: 1280, height: 800), styleMask: [.borderless],
+                backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: ContentView(model: model).environment(\.isSnapshotMode, true))
+            window.alphaValue = 0.01
+            window.ignoresMouseEvents = true
+            window.orderFrontRegardless()
+            window.makeKey()
+            await Self.pump(.milliseconds(1800))
+            func find(_ view: NSView) -> [ComposerNSTextView] {
+                (view as? ComposerNSTextView).map { [$0] } ?? view.subviews.flatMap(find)
+            }
+            let views = window.contentView.map(find)?.filter(\.isEditable).sorted {
+                $0.convert($0.bounds, to: nil).minY < $1.convert($1.bounds, to: nil).minY
+            }
+            return (window, views ?? [])
+        }
+
+        /// Types, composes, pastes, formats and undoes through the text view, printing one line per check. Leaves
+        /// `*Ping @Name see now `ci`é*` and an open code block ready to send.
+        private func probeComposer(
+            _ view: ComposerNSTextView, _ label: String, _ model: AppModel, _ id: ComposerID, _ person: Contact
+        ) async {
+            func check(_ name: String, _ ok: Bool) {
+                print(
+                    "snapshot: composer \(label) \(name) \(ok ? "ok" : "FAILED text=\(view.string.debugDescription)")")
+            }
+            func type(_ text: String) async {
+                for char in text { view.insertText(String(char), replacementRange: view.selectedRange()) }
+                await Self.pump(.milliseconds(300))
+            }
+            func end() -> NSRange { NSRange(location: view.string.utf16.count, length: 0) }
+            func attribute(_ key: NSAttributedString.Key, at needle: String) -> Any? {
+                let found = (view.string as NSString).range(of: needle)
+                guard found.location != NSNotFound else { return nil }
+                return view.textStorage?.attribute(key, at: found.location, effectiveRange: nil)
+            }
+            view.window?.makeFirstResponder(view)
+            await Self.pump(.milliseconds(300))
+
+            await type("Ping @" + String(person.displayName.prefix(2)))
+            view.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            await Self.pump(.milliseconds(300))
+            check("mention popup pick", view.string == "Ping @\(person.displayName) ")
+
+            await type("see *now* `ci`")
+            let bold = (attribute(.font, at: "now") as? NSFont)?.fontDescriptor.symbolicTraits.contains(.bold) == true
+            let dim = (attribute(.foregroundColor, at: "*") as? NSColor) == ComposerStyle.marker
+            let mono = (attribute(.font, at: "ci") as? NSFont)?.isFixedPitch == true
+            check("live styling bold=\(bold) dimmed=\(dim) code=\(mono)", bold && dim && mono)
+            check("caret stays at the end", view.selectedRange() == end())
+            check("draft follows the text", model.composerDraft(id).text == view.string)
+
+            let middle = (view.string as NSString).range(of: "see").location
+            view.setSelectedRange(NSRange(location: middle, length: 0))
+            await type("x")
+            check("caret after a mid-text insert", view.selectedRange().location == middle + 1)
+            view.deleteBackward(nil)
+            view.setSelectedRange(end())
+            await Self.pump(.milliseconds(200))
+
+            view.setMarkedText(
+                "´", selectedRange: NSRange(location: 1, length: 0), replacementRange: view.selectedRange())
+            await Self.pump(.milliseconds(300))
+            let composing = view.hasMarkedText()
+            view.insertText("é", replacementRange: view.markedRange())
+            await Self.pump(.milliseconds(300))
+            check(
+                "dead key composition kept=\(composing)",
+                composing && !view.hasMarkedText() && view.string.hasSuffix("`ci`é"))
+
+            let before = view.string
+            let board = NSPasteboard(name: NSPasteboard.Name("snapshot-composer-paste"))
+            board.clearContents()
+            board.writeObjects([
+                NSAttributedString(
+                    string: "RICH",
+                    attributes: [.font: NSFont.boldSystemFont(ofSize: 20), .foregroundColor: NSColor.systemRed])
+            ])
+            _ = view.readSelection(from: board)
+            board.releaseGlobally()
+            await Self.pump(.milliseconds(300))
+            var stray = false
+            view.textStorage?.enumerateAttributes(in: NSRange(location: 0, length: view.string.utf16.count)) {
+                attributes, _, _ in
+                if (attributes[.font] as? NSFont)?.pointSize != ComposerStyle.font.pointSize { stray = true }
+                if (attributes[.foregroundColor] as? NSColor) == NSColor.systemRed { stray = true }
+            }
+            check("rich paste adds no attributes", view.string == before + "RICH" && !stray)
+            view.undoManager?.undo()
+            await Self.pump(.milliseconds(300))
+            check("undo a paste", view.string == before)
+
+            view.setSelectedRange(NSRange(location: 0, length: view.string.utf16.count))
+            view.format(.bold)
+            await Self.pump(.milliseconds(300))
+            let wrapped = view.string
+            check("bold over the mention", wrapped == "*Ping @\(person.displayName) see now `ci`é*")
+            view.undoManager?.undo()
+            await Self.pump(.milliseconds(300))
+            let undone = view.string == before
+            view.undoManager?.redo()
+            await Self.pump(.milliseconds(300))
+            check("undo and redo the bar undone=\(undone)", undone && view.string == wrapped)
+
+            let kept = NSRange(location: 1, length: 4)
+            view.setSelectedRange(kept)
+            view.window?.makeFirstResponder(nil)
+            await Self.pump(.milliseconds(300))
+            view.window?.makeFirstResponder(view)
+            await Self.pump(.milliseconds(300))
+            check("selection survives losing focus", view.selectedRange() == kept)
+
+            view.setSelectedRange(end())
+            await type("\n```\nlet x = 1")
+            view.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            await Self.pump(.milliseconds(300))
+            check("return inside a code block adds a line", view.string.hasSuffix("let x = 1\n"))
+            await type("```")
+            let fenced = view.string
+            press(view, return: true, shift: true)
+            await Self.pump(.milliseconds(300))
+            check("shift-return key adds a line", view.string == fenced + "\n")
+            view.deleteBackward(nil)
+            await Self.pump(.milliseconds(300))
+
+            func nowIsBold() -> Bool {
+                (attribute(.font, at: "now") as? NSFont)?.fontDescriptor.symbolicTraits.contains(.bold) == true
+            }
+            view.setSelectedRange(NSRange(location: (view.string as NSString).range(of: "see").location, length: 0))
+            view.insertText("\n", replacementRange: view.selectedRange())
+            await Self.pump(.milliseconds(300))
+            let split = !nowIsBold()
+            view.deleteBackward(nil)
+            await Self.pump(.milliseconds(300))
+            check("splitting and joining a line restyles both split=\(split)", split && nowIsBold())
+            view.setSelectedRange(end())
         }
 
         /// Edits and deletes my last message through the real session against the fake, and checks that a stale

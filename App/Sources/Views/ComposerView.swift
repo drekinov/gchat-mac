@@ -11,7 +11,7 @@ struct ComposerView: View {
 
     @State private var text: String
     @State private var restored = false
-    @State private var selection: TextSelection?
+    @State private var selection: Range<Int>?
     @State private var pickerOpen = false
     @State private var mentionEditor = MentionEditor()
     @State private var candidates: [Contact] = []
@@ -20,19 +20,23 @@ struct ComposerView: View {
     @State private var popupHighlight = 0
     @State private var dropTargeted = false
     @State private var edit: ActiveEdit?
-    @FocusState private var focused: Bool
+    @State private var focused = false
+    @State private var textController = ComposerTextController()
+    @State private var linkDraft: LinkDraft?
+    @AppStorage("composerFormatBar") private var formatBarShown = false
     private let previewMode: Bool
     /// A drag is over the conversation's messages, whose drops attach here, so the composer shows its drop outline.
     private let conversationDropTargeted: Bool
 
     init(
         model: AppModel, key: SpaceKey, thread: ThreadName?, previewText: String? = nil,
-        conversationDropTargeted: Bool = false
+        previewSelection: Range<Int>? = nil, conversationDropTargeted: Bool = false
     ) {
         self.model = model
         self.key = key
         self.thread = thread
         _text = State(initialValue: previewText ?? "")
+        _selection = State(initialValue: previewSelection)
         previewMode = previewText != nil
         self.conversationDropTargeted = conversationDropTargeted
     }
@@ -77,6 +81,13 @@ struct ComposerView: View {
                 .help("Attach files")
                 .accessibilityLabel("Attach files")
                 VStack(alignment: .leading, spacing: 6) {
+                    if formatBarShown {
+                        FormatBar(
+                            state: formatState, enabled: editable && !locked, onAction: applyFormat,
+                            link: $linkDraft, onLink: addLink
+                        )
+                        .padding(.top, 5)
+                    }
                     if !pending.isEmpty {
                         PendingAttachmentChips(attachments: pending) { model.removeAttachment($0, from: composerID) }
                             .padding(.top, 6)
@@ -90,6 +101,22 @@ struct ComposerView: View {
                                 .accessibilityLabel("Sending from \(account)")
                         }
                         editor(items)
+                        Button {
+                            formatBarShown.toggle()
+                        } label: {
+                            Text("Aa").font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(formatBarShown ? Theme.accentText : Color.secondary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(
+                                    formatBarShown ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 5)
+                                )
+                                .frame(height: Self.rowHeight)
+                        }
+                        .buttonStyle(.plain)
+                        .help(formatBarShown ? "Hide formatting" : "Show formatting")
+                        .accessibilityLabel("Formatting")
+                        .accessibilityAddTraits(formatBarShown ? .isSelected : [])
                         Button {
                             pickerOpen = true
                         } label: {
@@ -208,60 +235,61 @@ struct ComposerView: View {
     }
 
     private func editor(_ items: [Contact]) -> some View {
-        TextEditor(text: editorBinding, selection: $selection)
-            .disabled(!editable)
-            .background(TextOnlyDrops())
-            .font(.body)
-            .scrollContentBackground(.hidden)
-            .scrollIndicators(.never)
-            .focused($focused)
-            .frame(height: editorHeight)
-            .overlay(alignment: .topLeading) {
-                if text.isEmpty {
-                    Text(placeholder)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .padding(.horizontal, 5)
-                        .allowsHitTesting(false)
-                }
+        ComposerTextView(
+            text: text, selection: $selection, focused: $focused, editable: editable && !locked,
+            controller: textController, onChange: commit, onCommand: { handle($0, items) }, onFormat: applyFormat
+        )
+        .frame(height: editorHeight)
+        .overlay(alignment: .topLeading) {
+            if text.isEmpty {
+                Text(placeholder)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 5)
+                    .allowsHitTesting(false)
             }
-            // The text view draws its first line at its very top, so this centres one line in the row; the
-            // buttons beside it stay level with the last line as the text grows.
-            .padding(.top, (Self.rowHeight - Self.lineHeight) / 2)
-            .padding(.bottom, (Self.rowHeight - Self.lineHeight) / 2 - Self.editorSlack)
-            .onKeyPress(.return, phases: .down) { press in
-                if let pick = items[safe: popupHighlight] {
-                    pickMention(pick)
-                    return .handled
-                }
-                guard !press.modifiers.contains(.shift) else { return .ignored }
-                submit()
-                return .handled
-            }
-            .onKeyPress(.tab) {
-                guard let pick = items[safe: popupHighlight] else { return .ignored }
+        }
+        // The text view draws its first line at its very top, so this centres one line in the row; the
+        // buttons beside it stay level with the last line as the text grows.
+        .padding(.top, (Self.rowHeight - Self.lineHeight) / 2)
+        .padding(.bottom, (Self.rowHeight - Self.lineHeight) / 2 - Self.editorSlack)
+    }
+
+    /// Keys the text view hands over before acting on them itself; false lets it act.
+    private func handle(_ command: ComposerCommand, _ items: [Contact]) -> Bool {
+        switch command {
+        case .send(let shift):
+            if let pick = items[safe: popupHighlight] {
                 pickMention(pick)
-                return .handled
+                return true
             }
-            .onKeyPress(.downArrow) {
-                guard !items.isEmpty else { return .ignored }
-                popupHighlight = min(popupHighlight + 1, items.count - 1)
-                return .handled
+            guard !shift else { return false }
+            if ChatMarkup.isInsideCodeBlock(text, at: selection?.lowerBound ?? text.utf16.count) {
+                return false
             }
-            .onKeyPress(.upArrow) {
-                guard !items.isEmpty else { return editLast() }
-                popupHighlight = max(popupHighlight - 1, 0)
-                return .handled
+            submit()
+            return true
+        case .tab:
+            guard let pick = items[safe: popupHighlight] else { return false }
+            pickMention(pick)
+            return true
+        case .down:
+            guard !items.isEmpty else { return false }
+            popupHighlight = min(popupHighlight + 1, items.count - 1)
+            return true
+        case .up:
+            guard !items.isEmpty else { return editLast() }
+            popupHighlight = max(popupHighlight - 1, 0)
+            return true
+        case .escape:
+            guard !items.isEmpty, let trigger else {
+                guard edit != nil else { return false }
+                finishEdit()
+                return true
             }
-            .onKeyPress(.escape) {
-                guard !items.isEmpty, let trigger else {
-                    guard edit != nil else { return .ignored }
-                    finishEdit()
-                    return .handled
-                }
-                dismissedAt = trigger.at
-                return .handled
-            }
+            dismissedAt = trigger.at
+            return true
+        }
     }
 
     private var placeholder: String {
@@ -272,22 +300,37 @@ struct ComposerView: View {
 
     // MARK: Editing
 
-    /// Only edits made through the editor are persisted; programmatic changes (restore, clear on send) never are.
-    private var editorBinding: Binding<String> {
-        Binding(
-            get: { text },
-            set: { newValue in
-                guard newValue != text, !(edit.map { $0.saving || $0.basedOn == nil } ?? false) else { return }
-                commit(newValue)
-            })
-    }
+    /// While a sent message loads or saves, the field takes no edits.
+    private var locked: Bool { edit.map { $0.saving || $0.basedOn == nil } ?? false }
 
-    /// Applies a user edit: shifts or drops mention ranges, schedules the draft save, re-evaluates the popup.
-    private func commit(_ newValue: String) {
-        mentionEditor.applyEdit(old: text, new: newValue)
+    /// Takes a change from the text view: moves mention ranges, schedules the draft save, re-evaluates the popup.
+    /// Programmatic changes (restore, clear on send) set `text` directly and are never saved.
+    private func commit(_ newValue: String, _ change: ComposerChange) {
+        switch change {
+        case .typed: mentionEditor.applyEdit(old: text, new: newValue)
+        case .undo: if !mentionEditor.recall(newValue) { mentionEditor.applyEdit(old: text, new: newValue) }
+        case .edits: break
+        }
         text = newValue
+        mentionEditor.remember(newValue)
         saveDraft()
         refreshTrigger()
+    }
+
+    /// Makes edits through the text view, so they can be undone, after `mentions` has moved the mention ranges.
+    private func apply(
+        _ edits: [TextEdit], selection next: Range<Int>,
+        mentions: (inout MentionEditor, [TextEdit]) -> Void = { $0.apply($1) }
+    ) {
+        guard editable, !locked, !textController.isComposing else { return }
+        if textController.canEdit {
+            mentions(&mentionEditor, edits)
+            textController.perform(edits, selection: next)
+        } else {
+            mentions(&mentionEditor, edits)
+            commit(TextEdit.apply(edits, to: text), .edits)
+            selection = next
+        }
     }
 
     /// Types in text and links that reached a drop destination instead of the text view: dropped beside it, or a
@@ -300,19 +343,65 @@ struct ComposerView: View {
         insert(texts.joined(separator: " "))
     }
 
+    // MARK: Formatting
+
+    /// The selection, or the end of the text before the text view has reported one.
+    private var currentSelection: Range<Int> {
+        let count = text.utf16.count
+        guard let selection else { return count..<count }
+        let lower = min(selection.lowerBound, count)
+        return lower..<max(lower, min(selection.upperBound, count))
+    }
+
+    private var formatState: FormatState {
+        FormatAction.state(in: text, selection: currentSelection, mentions: mentionEditor.ranges)
+    }
+
+    private func applyFormat(_ action: FormatAction) {
+        let range = currentSelection
+        guard action != .link else { return openLink(range) }
+        guard let result = action.apply(to: text, selection: range, mentions: mentionEditor.ranges) else { return }
+        apply(result.edits, selection: result.selection)
+        focused = true
+    }
+
+    /// Fills the link popover from the link at the selection, or the selected text and a link on the clipboard.
+    private func openLink(_ range: Range<Int>) {
+        guard editable, !locked,
+            !FormatAction.state(in: text, selection: range, mentions: mentionEditor.ranges).unavailable.contains(.link)
+        else { return }
+        let found = FormatAction.linkDraft(in: text, selection: range)
+        linkDraft = LinkDraft(label: found.label, url: found.url ?? "", selection: range)
+        guard found.url == nil else { return }
+        // Only a probable web link is read, so the clipboard privacy prompt doesn't come up for anything else.
+        guard NSPasteboard.general.accessBehavior != .alwaysDeny else { return }
+        Task {
+            guard let found = try? await NSPasteboard.general.detectedPatterns(for: [\.probableWebURL]),
+                found.contains(\.probableWebURL),
+                let clip = NSPasteboard.general.string(forType: .string).flatMap(FormatAction.linkTarget),
+                linkDraft?.url.isEmpty == true
+            else { return }
+            linkDraft?.url = clip
+        }
+    }
+
+    private func addLink(_ draft: LinkDraft) {
+        linkDraft = nil
+        guard
+            let result = FormatAction.link(
+                url: draft.url, label: draft.label, in: text, selection: draft.selection,
+                mentions: mentionEditor.ranges)
+        else { return }
+        apply(result.edits, selection: result.selection)
+        focused = true
+    }
+
     /// Inserts at the caret, replacing any selection.
     private func insert(_ addition: String) {
-        var updated = text
-        var caret = updated.utf16.count + addition.utf16.count
-        if let selection, case .selection(let range) = selection.indices, range.upperBound <= updated.endIndex {
-            let offset = updated.utf16.distance(from: updated.utf16.startIndex, to: range.lowerBound)
-            updated.replaceSubrange(range, with: addition)
-            caret = offset + addition.utf16.count
-        } else {
-            updated += addition
-        }
-        commit(updated)
-        selection = TextSelection(insertionPoint: String.Index(utf16Offset: min(caret, text.utf16.count), in: text))
+        let count = text.utf16.count
+        let range = selection.map { min($0.lowerBound, count)..<min($0.upperBound, count) } ?? count..<count
+        let caret = range.lowerBound + addition.utf16.count
+        apply([TextEdit(range: range, replacement: addition)], selection: caret..<caret)
     }
 
     // MARK: Mentions
@@ -327,9 +416,8 @@ struct ComposerView: View {
     }
 
     private func caretOffset() -> Int? {
-        guard let selection, case .selection(let range) = selection.indices else { return nil }
-        guard range.isEmpty, range.lowerBound <= text.endIndex else { return nil }
-        return text.utf16.distance(from: text.utf16.startIndex, to: range.lowerBound)
+        guard let selection, selection.isEmpty, selection.lowerBound <= text.utf16.count else { return nil }
+        return selection.lowerBound
     }
 
     private func refreshTrigger() {
@@ -343,12 +431,10 @@ struct ComposerView: View {
     }
 
     private func pickMention(_ contact: Contact) {
-        guard let trigger else { return }
-        let result = mentionEditor.insert(contact, into: text, trigger: trigger)
-        text = result.text
-        saveDraft()
+        guard let trigger, let user = contact.user, let token = MentionEditor.token(for: contact) else { return }
+        let (edit, caret) = mentionEditor.insertion(of: token, in: text, trigger: trigger)
         self.trigger = nil
-        selection = TextSelection(insertionPoint: String.Index(utf16Offset: result.caret, in: text))
+        apply([edit], selection: caret..<caret) { editor, _ in editor.recordInsertion(edit, user: user, token: token) }
     }
 
     /// The members list asked for this person to be mentioned: types "@" at the caret and picks them.
@@ -363,10 +449,8 @@ struct ComposerView: View {
 
     /// Where `insert` puts text: the start of the selection, or the end of the draft without one.
     private func insertionOffset() -> Int {
-        if let selection, case .selection(let range) = selection.indices, range.upperBound <= text.endIndex {
-            return text.utf16.distance(from: text.utf16.startIndex, to: range.lowerBound)
-        }
-        return text.utf16.count
+        guard let selection, selection.upperBound <= text.utf16.count else { return text.utf16.count }
+        return selection.lowerBound
     }
 
     /// Whether an "@" at `offset` starts a word, by the same rule the mention popup uses.
@@ -464,12 +548,12 @@ extension ComposerView {
     typealias ActiveEdit = PendingEdit
 
     /// Up arrow in an empty composer edits my last message here.
-    fileprivate func editLast() -> KeyPress.Result {
+    fileprivate func editLast() -> Bool {
         guard edit == nil, restored, text.isEmpty, draft.attachments.isEmpty,
             let message = model.lastEditable(for: composerID)
-        else { return .ignored }
+        else { return false }
         model.beginEdit(message, key: key)
-        return .handled
+        return true
     }
 
     fileprivate func startRequestedEdit() {
@@ -488,7 +572,7 @@ extension ComposerView {
             switch result {
             case .success(let copy):
                 show(edit?.load(copy.message))
-                selection = TextSelection(insertionPoint: text.endIndex)
+                selection = text.utf16.count..<text.utf16.count
             case .failure(.changed(let latest)):
                 show(edit?.load(latest))
             case .failure(.message(let problem)):
@@ -541,8 +625,127 @@ extension ComposerView {
         let stash = model.takeStashedDraft(composerID)
         text = draft.text
         mentionEditor = stash?.text == text ? stash?.mentions ?? MentionEditor() : MentionEditor()
-        selection = TextSelection(insertionPoint: text.endIndex)
+        selection = text.utf16.count..<text.utf16.count
         focused = true
+    }
+}
+
+struct LinkDraft: Equatable {
+    var label: String
+    var url: String
+    let selection: Range<Int>
+}
+
+/// The format buttons above the field. The one for the formatting at the selection is highlighted.
+private struct FormatBar: View {
+    let state: FormatState
+    let enabled: Bool
+    let onAction: (FormatAction) -> Void
+    @Binding var link: LinkDraft?
+    let onLink: (LinkDraft) -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            button(.bold)
+            button(.italic)
+            button(.strikethrough)
+            separator
+            button(.code)
+            button(.codeBlock)
+            separator
+            button(.bullet)
+            button(.quote)
+            button(.link)
+                .popover(
+                    isPresented: Binding(get: { link != nil }, set: { if !$0 { link = nil } }), arrowEdge: .top
+                ) {
+                    if let draft = link {
+                        LinkPopover(draft: draft, onAdd: onLink, onCancel: { link = nil })
+                    }
+                }
+            Spacer(minLength: 0)
+        }
+        .frame(height: 24)
+    }
+
+    private var separator: some View {
+        Rectangle().fill(Color.secondary.opacity(0.25)).frame(width: 1, height: 16).padding(.horizontal, 4)
+    }
+
+    private func button(_ action: FormatAction) -> some View {
+        let active = state.active.contains(action)
+        return Button {
+            onAction(action)
+        } label: {
+            label(action)
+                .foregroundStyle(active ? Theme.accentText : Color.primary)
+                .frame(minWidth: 26, minHeight: 24)
+                .background(active ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled || state.unavailable.contains(action))
+        .help(action.title)
+        .accessibilityLabel(action.title)
+        .accessibilityAddTraits(active ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private func label(_ action: FormatAction) -> some View {
+        switch action {
+        case .bold: Text("B").font(.system(size: 13, weight: .bold))
+        case .italic: Text("I").font(.system(size: 13, design: .serif)).italic()
+        case .strikethrough: Text("S").font(.system(size: 13)).strikethrough()
+        case .code: Image(systemName: "chevron.left.forwardslash.chevron.right").font(.system(size: 11))
+        case .codeBlock: Image(systemName: "curlybraces").font(.system(size: 12))
+        case .bullet: Image(systemName: "list.bullet").font(.system(size: 12))
+        case .quote: Image(systemName: "text.quote").font(.system(size: 12))
+        case .link: Image(systemName: "link").font(.system(size: 12))
+        }
+    }
+}
+
+extension FormatAction {
+    var title: String {
+        switch self {
+        case .bold: "Bold"
+        case .italic: "Italic"
+        case .strikethrough: "Strikethrough"
+        case .code: "Inline code"
+        case .codeBlock: "Code block"
+        case .bullet: "Bulleted list"
+        case .quote: "Quote"
+        case .link: "Link"
+        }
+    }
+}
+
+/// Text and URL for a link, which goes in as `<url|text>`.
+private struct LinkPopover: View {
+    @State var draft: LinkDraft
+    let onAdd: (LinkDraft) -> Void
+    let onCancel: () -> Void
+
+    private var valid: Bool { FormatAction.linkTarget(draft.url) != nil }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add link").fontWeight(.semibold)
+            TextField("Text", text: $draft.label)
+            TextField("URL", text: $draft.url, prompt: Text("https://"))
+                .onSubmit { if valid { onAdd(draft) } }
+            if !draft.url.isEmpty, !valid {
+                Text("Use an https link.").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel).keyboardShortcut(.cancelAction)
+                Button("Add") { onAdd(draft) }.keyboardShortcut(.defaultAction).disabled(!valid)
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+        .padding(12)
+        .frame(width: 300)
     }
 }
 

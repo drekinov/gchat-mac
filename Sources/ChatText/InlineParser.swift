@@ -16,7 +16,7 @@ enum InlineParser {
         for (index, line) in lines.enumerated() {
             if index > 0 { out.append("\n", style: []) }
             let atoms = tokenize(line)
-            Emphasis(atoms: atoms).emit(0..<atoms.count, style: [], into: &out)
+            Emphasis(atoms: atoms).emit(into: &out)
         }
         return out.spans
     }
@@ -26,6 +26,56 @@ enum InlineParser {
         atoms.reserveCapacity(line.count)
         tokenize(line) { atom, _ in atoms.append(atom) }
         return atoms
+    }
+
+    /// The syntax of one line as the composer shows it, in UTF-16 offsets from `base`.
+    static func syntax(_ line: Substring, base: Int, into out: inout ComposerSyntax) {
+        var atoms: [Atom] = []
+        var ranges: [Range<Int>] = []
+        atoms.reserveCapacity(line.count)
+        ranges.reserveCapacity(line.count)
+        tokenize(line) { atom, range in
+            atoms.append(atom)
+            ranges.append(range)
+        }
+        var offsets = [base]
+        offsets.reserveCapacity(line.count + 1)
+        for char in line { offsets.append(offsets[offsets.count - 1] + char.utf16.count) }
+        func span(_ chars: Range<Int>) -> Range<Int> { offsets[chars.lowerBound]..<offsets[chars.upperBound] }
+
+        Emphasis(atoms: atoms).walk(0..<atoms.count, style: []) { event in
+            switch event {
+            case .open(let open, let style):
+                out.run(span(ranges[open]), .marker, style)
+            case .close(let open, let close, let flag, let style):
+                out.pairs.append(.init(open: span(ranges[open]), close: span(ranges[close]), style: flag))
+                out.run(span(ranges[close]), .marker, style)
+            case .atom(let index, let style):
+                let chars = ranges[index]
+                switch atoms[index] {
+                case .char, .mention, .emoji:
+                    out.run(span(chars), .text, style)
+                case .code:
+                    let open = chars.lowerBound..<(chars.lowerBound + 1)
+                    let close = (chars.upperBound - 1)..<chars.upperBound
+                    out.pairs.append(.init(open: span(open), close: span(close), style: .code))
+                    out.run(span(open), .marker, style.union(.code))
+                    out.run(span(open.upperBound..<close.lowerBound), .text, style.union(.code))
+                    out.run(span(close), .marker, style.union(.code))
+                case .link(let url, let label):
+                    let head = label == nil ? 1 : url.count + 2
+                    let open = chars.lowerBound..<(chars.lowerBound + head)
+                    let close = (chars.upperBound - 1)..<chars.upperBound
+                    out.pairs.append(
+                        .init(
+                            open: span(open), close: span(close), style: [],
+                            link: .init(url: url, label: label ?? url)))
+                    out.run(span(open), .marker, style)
+                    out.run(span(open.upperBound..<close.lowerBound), .link, style)
+                    out.run(span(close), .marker, style)
+                }
+            }
+        }
     }
 
     /// What editing a line's markup can't keep: tokens and custom emoji outside code, with character offsets.
@@ -179,18 +229,35 @@ enum InlineParser {
             return positions[low]
         }
 
-        func emit(_ range: Range<Int>, style: Span.Style, into out: inout SpanBuilder) {
+        enum Event {
+            case atom(Int, Span.Style)
+            /// An emphasis marker atom, with the style around it.
+            case open(Int, Span.Style)
+            case close(open: Int, close: Int, flag: Span.Style, style: Span.Style)
+        }
+
+        func walk(_ range: Range<Int>, style: Span.Style, visit: (Event) -> Void) {
             var index = range.lowerBound
             while index < range.upperBound {
+                if case .char(let char) = atoms[index], let flag = Self.flag(char), !style.contains(flag),
+                    Self.canOpen(atoms, index, char), let close = closer(char, after: index, before: range.upperBound)
+                {
+                    visit(.open(index, style))
+                    walk((index + 1)..<close, style: style.union(flag), visit: visit)
+                    visit(.close(open: index, close: close, flag: flag, style: style))
+                    index = close + 1
+                    continue
+                }
+                visit(.atom(index, style))
+                index += 1
+            }
+        }
+
+        func emit(into out: inout SpanBuilder) {
+            walk(0..<atoms.count, style: []) { event in
+                guard case .atom(let index, let style) = event else { return }
                 switch atoms[index] {
                 case .char(let char):
-                    if let flag = Self.flag(char), !style.contains(flag), Self.canOpen(atoms, index, char),
-                        let close = closer(char, after: index, before: range.upperBound)
-                    {
-                        emit((index + 1)..<close, style: style.union(flag), into: &out)
-                        index = close + 1
-                        continue
-                    }
                     out.append(String(char), style: style)
                 case .code(let code):
                     out.add(Span(code, style: style.union(.code)))
@@ -201,7 +268,6 @@ enum InlineParser {
                 case .emoji(let shortcode):
                     out.add(Span(shortcode, style: style, kind: .customEmoji))
                 }
-                index += 1
             }
         }
     }
