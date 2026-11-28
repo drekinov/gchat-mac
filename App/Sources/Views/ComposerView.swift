@@ -11,7 +11,7 @@ struct ComposerView: View {
 
     @State private var text: String
     @State private var restored = false
-    @State private var selection: TextSelection?
+    @State private var selection: Range<Int>?
     @State private var pickerOpen = false
     @State private var mentionEditor = MentionEditor()
     @State private var candidates: [Contact] = []
@@ -20,7 +20,8 @@ struct ComposerView: View {
     @State private var popupHighlight = 0
     @State private var dropTargeted = false
     @State private var edit: ActiveEdit?
-    @FocusState private var focused: Bool
+    @State private var focused = false
+    @State private var textController = ComposerTextController()
     private let previewMode: Bool
     /// A drag is over the conversation's messages, whose drops attach here, so the composer shows its drop outline.
     private let conversationDropTargeted: Bool
@@ -208,60 +209,61 @@ struct ComposerView: View {
     }
 
     private func editor(_ items: [Contact]) -> some View {
-        TextEditor(text: editorBinding, selection: $selection)
-            .disabled(!editable)
-            .background(TextOnlyDrops())
-            .font(.body)
-            .scrollContentBackground(.hidden)
-            .scrollIndicators(.never)
-            .focused($focused)
-            .frame(height: editorHeight)
-            .overlay(alignment: .topLeading) {
-                if text.isEmpty {
-                    Text(placeholder)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .padding(.horizontal, 5)
-                        .allowsHitTesting(false)
-                }
+        ComposerTextView(
+            text: text, selection: $selection, focused: $focused, editable: editable && !locked,
+            controller: textController, onChange: commit, onCommand: { handle($0, items) }
+        )
+        .frame(height: editorHeight)
+        .overlay(alignment: .topLeading) {
+            if text.isEmpty {
+                Text(placeholder)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 5)
+                    .allowsHitTesting(false)
             }
-            // The text view draws its first line at its very top, so this centres one line in the row; the
-            // buttons beside it stay level with the last line as the text grows.
-            .padding(.top, (Self.rowHeight - Self.lineHeight) / 2)
-            .padding(.bottom, (Self.rowHeight - Self.lineHeight) / 2 - Self.editorSlack)
-            .onKeyPress(.return, phases: .down) { press in
-                if let pick = items[safe: popupHighlight] {
-                    pickMention(pick)
-                    return .handled
-                }
-                guard !press.modifiers.contains(.shift) else { return .ignored }
-                submit()
-                return .handled
-            }
-            .onKeyPress(.tab) {
-                guard let pick = items[safe: popupHighlight] else { return .ignored }
+        }
+        // The text view draws its first line at its very top, so this centres one line in the row; the
+        // buttons beside it stay level with the last line as the text grows.
+        .padding(.top, (Self.rowHeight - Self.lineHeight) / 2)
+        .padding(.bottom, (Self.rowHeight - Self.lineHeight) / 2 - Self.editorSlack)
+    }
+
+    /// Keys the text view hands over before acting on them itself; false lets it act.
+    private func handle(_ command: ComposerCommand, _ items: [Contact]) -> Bool {
+        switch command {
+        case .send(let shift):
+            if let pick = items[safe: popupHighlight] {
                 pickMention(pick)
-                return .handled
+                return true
             }
-            .onKeyPress(.downArrow) {
-                guard !items.isEmpty else { return .ignored }
-                popupHighlight = min(popupHighlight + 1, items.count - 1)
-                return .handled
+            guard !shift else { return false }
+            if ChatMarkup.isInsideCodeBlock(text, at: selection?.lowerBound ?? text.utf16.count) {
+                return false
             }
-            .onKeyPress(.upArrow) {
-                guard !items.isEmpty else { return editLast() }
-                popupHighlight = max(popupHighlight - 1, 0)
-                return .handled
+            submit()
+            return true
+        case .tab:
+            guard let pick = items[safe: popupHighlight] else { return false }
+            pickMention(pick)
+            return true
+        case .down:
+            guard !items.isEmpty else { return false }
+            popupHighlight = min(popupHighlight + 1, items.count - 1)
+            return true
+        case .up:
+            guard !items.isEmpty else { return editLast() }
+            popupHighlight = max(popupHighlight - 1, 0)
+            return true
+        case .escape:
+            guard !items.isEmpty, let trigger else {
+                guard edit != nil else { return false }
+                finishEdit()
+                return true
             }
-            .onKeyPress(.escape) {
-                guard !items.isEmpty, let trigger else {
-                    guard edit != nil else { return .ignored }
-                    finishEdit()
-                    return .handled
-                }
-                dismissedAt = trigger.at
-                return .handled
-            }
+            dismissedAt = trigger.at
+            return true
+        }
     }
 
     private var placeholder: String {
@@ -272,22 +274,37 @@ struct ComposerView: View {
 
     // MARK: Editing
 
-    /// Only edits made through the editor are persisted; programmatic changes (restore, clear on send) never are.
-    private var editorBinding: Binding<String> {
-        Binding(
-            get: { text },
-            set: { newValue in
-                guard newValue != text, !(edit.map { $0.saving || $0.basedOn == nil } ?? false) else { return }
-                commit(newValue)
-            })
-    }
+    /// While a sent message loads or saves, the field takes no edits.
+    private var locked: Bool { edit.map { $0.saving || $0.basedOn == nil } ?? false }
 
-    /// Applies a user edit: shifts or drops mention ranges, schedules the draft save, re-evaluates the popup.
-    private func commit(_ newValue: String) {
-        mentionEditor.applyEdit(old: text, new: newValue)
+    /// Takes a change from the text view: moves mention ranges, schedules the draft save, re-evaluates the popup.
+    /// Programmatic changes (restore, clear on send) set `text` directly and are never saved.
+    private func commit(_ newValue: String, _ change: ComposerChange) {
+        switch change {
+        case .typed: mentionEditor.applyEdit(old: text, new: newValue)
+        case .undo: if !mentionEditor.recall(newValue) { mentionEditor.applyEdit(old: text, new: newValue) }
+        case .edits: break
+        }
         text = newValue
+        mentionEditor.remember(newValue)
         saveDraft()
         refreshTrigger()
+    }
+
+    /// Makes edits through the text view, so they can be undone, after `mentions` has moved the mention ranges.
+    private func apply(
+        _ edits: [TextEdit], selection next: Range<Int>,
+        mentions: (inout MentionEditor, [TextEdit]) -> Void = { $0.apply($1) }
+    ) {
+        guard editable, !locked, !textController.isComposing else { return }
+        if textController.canEdit {
+            mentions(&mentionEditor, edits)
+            textController.perform(edits, selection: next)
+        } else {
+            mentions(&mentionEditor, edits)
+            commit(TextEdit.apply(edits, to: text), .edits)
+            selection = next
+        }
     }
 
     /// Types in text and links that reached a drop destination instead of the text view: dropped beside it, or a
@@ -302,17 +319,10 @@ struct ComposerView: View {
 
     /// Inserts at the caret, replacing any selection.
     private func insert(_ addition: String) {
-        var updated = text
-        var caret = updated.utf16.count + addition.utf16.count
-        if let selection, case .selection(let range) = selection.indices, range.upperBound <= updated.endIndex {
-            let offset = updated.utf16.distance(from: updated.utf16.startIndex, to: range.lowerBound)
-            updated.replaceSubrange(range, with: addition)
-            caret = offset + addition.utf16.count
-        } else {
-            updated += addition
-        }
-        commit(updated)
-        selection = TextSelection(insertionPoint: String.Index(utf16Offset: min(caret, text.utf16.count), in: text))
+        let count = text.utf16.count
+        let range = selection.map { min($0.lowerBound, count)..<min($0.upperBound, count) } ?? count..<count
+        let caret = range.lowerBound + addition.utf16.count
+        apply([TextEdit(range: range, replacement: addition)], selection: caret..<caret)
     }
 
     // MARK: Mentions
@@ -327,9 +337,8 @@ struct ComposerView: View {
     }
 
     private func caretOffset() -> Int? {
-        guard let selection, case .selection(let range) = selection.indices else { return nil }
-        guard range.isEmpty, range.lowerBound <= text.endIndex else { return nil }
-        return text.utf16.distance(from: text.utf16.startIndex, to: range.lowerBound)
+        guard let selection, selection.isEmpty, selection.lowerBound <= text.utf16.count else { return nil }
+        return selection.lowerBound
     }
 
     private func refreshTrigger() {
@@ -343,12 +352,10 @@ struct ComposerView: View {
     }
 
     private func pickMention(_ contact: Contact) {
-        guard let trigger else { return }
-        let result = mentionEditor.insert(contact, into: text, trigger: trigger)
-        text = result.text
-        saveDraft()
+        guard let trigger, let user = contact.user, let token = MentionEditor.token(for: contact) else { return }
+        let (edit, caret) = mentionEditor.insertion(of: token, in: text, trigger: trigger)
         self.trigger = nil
-        selection = TextSelection(insertionPoint: String.Index(utf16Offset: result.caret, in: text))
+        apply([edit], selection: caret..<caret) { editor, _ in editor.recordInsertion(edit, user: user, token: token) }
     }
 
     /// The members list asked for this person to be mentioned: types "@" at the caret and picks them.
@@ -363,10 +370,8 @@ struct ComposerView: View {
 
     /// Where `insert` puts text: the start of the selection, or the end of the draft without one.
     private func insertionOffset() -> Int {
-        if let selection, case .selection(let range) = selection.indices, range.upperBound <= text.endIndex {
-            return text.utf16.distance(from: text.utf16.startIndex, to: range.lowerBound)
-        }
-        return text.utf16.count
+        guard let selection, selection.upperBound <= text.utf16.count else { return text.utf16.count }
+        return selection.lowerBound
     }
 
     /// Whether an "@" at `offset` starts a word, by the same rule the mention popup uses.
@@ -464,12 +469,12 @@ extension ComposerView {
     typealias ActiveEdit = PendingEdit
 
     /// Up arrow in an empty composer edits my last message here.
-    fileprivate func editLast() -> KeyPress.Result {
+    fileprivate func editLast() -> Bool {
         guard edit == nil, restored, text.isEmpty, draft.attachments.isEmpty,
             let message = model.lastEditable(for: composerID)
-        else { return .ignored }
+        else { return false }
         model.beginEdit(message, key: key)
-        return .handled
+        return true
     }
 
     fileprivate func startRequestedEdit() {
@@ -488,7 +493,7 @@ extension ComposerView {
             switch result {
             case .success(let copy):
                 show(edit?.load(copy.message))
-                selection = TextSelection(insertionPoint: text.endIndex)
+                selection = text.utf16.count..<text.utf16.count
             case .failure(.changed(let latest)):
                 show(edit?.load(latest))
             case .failure(.message(let problem)):
@@ -541,7 +546,7 @@ extension ComposerView {
         let stash = model.takeStashedDraft(composerID)
         text = draft.text
         mentionEditor = stash?.text == text ? stash?.mentions ?? MentionEditor() : MentionEditor()
-        selection = TextSelection(insertionPoint: text.endIndex)
+        selection = text.utf16.count..<text.utf16.count
         focused = true
     }
 }
