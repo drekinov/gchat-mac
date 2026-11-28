@@ -2,6 +2,7 @@
     import AppKit
     import ChatModel
     import ChatSync
+    import ChatText
     import FakeChatServer
     import SwiftUI
 
