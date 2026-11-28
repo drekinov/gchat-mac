@@ -22,18 +22,21 @@ struct ComposerView: View {
     @State private var edit: ActiveEdit?
     @State private var focused = false
     @State private var textController = ComposerTextController()
+    @State private var linkDraft: LinkDraft?
+    @AppStorage("composerFormatBar") private var formatBarShown = false
     private let previewMode: Bool
     /// A drag is over the conversation's messages, whose drops attach here, so the composer shows its drop outline.
     private let conversationDropTargeted: Bool
 
     init(
         model: AppModel, key: SpaceKey, thread: ThreadName?, previewText: String? = nil,
-        conversationDropTargeted: Bool = false
+        previewSelection: Range<Int>? = nil, conversationDropTargeted: Bool = false
     ) {
         self.model = model
         self.key = key
         self.thread = thread
         _text = State(initialValue: previewText ?? "")
+        _selection = State(initialValue: previewSelection)
         previewMode = previewText != nil
         self.conversationDropTargeted = conversationDropTargeted
     }
@@ -78,6 +81,13 @@ struct ComposerView: View {
                 .help("Attach files")
                 .accessibilityLabel("Attach files")
                 VStack(alignment: .leading, spacing: 6) {
+                    if formatBarShown {
+                        FormatBar(
+                            state: formatState, enabled: editable && !locked, onAction: applyFormat,
+                            link: $linkDraft, onLink: addLink
+                        )
+                        .padding(.top, 5)
+                    }
                     if !pending.isEmpty {
                         PendingAttachmentChips(attachments: pending) { model.removeAttachment($0, from: composerID) }
                             .padding(.top, 6)
@@ -91,6 +101,22 @@ struct ComposerView: View {
                                 .accessibilityLabel("Sending from \(account)")
                         }
                         editor(items)
+                        Button {
+                            formatBarShown.toggle()
+                        } label: {
+                            Text("Aa").font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(formatBarShown ? Theme.accentText : Color.secondary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(
+                                    formatBarShown ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 5)
+                                )
+                                .frame(height: Self.rowHeight)
+                        }
+                        .buttonStyle(.plain)
+                        .help(formatBarShown ? "Hide formatting" : "Show formatting")
+                        .accessibilityLabel("Formatting")
+                        .accessibilityAddTraits(formatBarShown ? .isSelected : [])
                         Button {
                             pickerOpen = true
                         } label: {
@@ -211,7 +237,7 @@ struct ComposerView: View {
     private func editor(_ items: [Contact]) -> some View {
         ComposerTextView(
             text: text, selection: $selection, focused: $focused, editable: editable && !locked,
-            controller: textController, onChange: commit, onCommand: { handle($0, items) }
+            controller: textController, onChange: commit, onCommand: { handle($0, items) }, onFormat: applyFormat
         )
         .frame(height: editorHeight)
         .overlay(alignment: .topLeading) {
@@ -315,6 +341,59 @@ struct ComposerView: View {
         let texts = model.takeDroppedText(composerID)
         guard !texts.isEmpty else { return }
         insert(texts.joined(separator: " "))
+    }
+
+    // MARK: Formatting
+
+    /// The selection, or the end of the text before the text view has reported one.
+    private var currentSelection: Range<Int> {
+        let count = text.utf16.count
+        guard let selection else { return count..<count }
+        let lower = min(selection.lowerBound, count)
+        return lower..<max(lower, min(selection.upperBound, count))
+    }
+
+    private var formatState: FormatState {
+        FormatAction.state(in: text, selection: currentSelection, mentions: mentionEditor.ranges)
+    }
+
+    private func applyFormat(_ action: FormatAction) {
+        let range = currentSelection
+        guard action != .link else { return openLink(range) }
+        guard let result = action.apply(to: text, selection: range, mentions: mentionEditor.ranges) else { return }
+        apply(result.edits, selection: result.selection)
+        focused = true
+    }
+
+    /// Fills the link popover from the link at the selection, or the selected text and a link on the clipboard.
+    private func openLink(_ range: Range<Int>) {
+        guard editable, !locked,
+            !FormatAction.state(in: text, selection: range, mentions: mentionEditor.ranges).unavailable.contains(.link)
+        else { return }
+        let found = FormatAction.linkDraft(in: text, selection: range)
+        linkDraft = LinkDraft(label: found.label, url: found.url ?? "", selection: range)
+        guard found.url == nil else { return }
+        // Only a probable web link is read, so the clipboard privacy prompt doesn't come up for anything else.
+        guard NSPasteboard.general.accessBehavior != .alwaysDeny else { return }
+        Task {
+            guard let found = try? await NSPasteboard.general.detectedPatterns(for: [\.probableWebURL]),
+                found.contains(\.probableWebURL),
+                let clip = NSPasteboard.general.string(forType: .string).flatMap(FormatAction.linkTarget),
+                linkDraft?.url.isEmpty == true
+            else { return }
+            linkDraft?.url = clip
+        }
+    }
+
+    private func addLink(_ draft: LinkDraft) {
+        linkDraft = nil
+        guard
+            let result = FormatAction.link(
+                url: draft.url, label: draft.label, in: text, selection: draft.selection,
+                mentions: mentionEditor.ranges)
+        else { return }
+        apply(result.edits, selection: result.selection)
+        focused = true
     }
 
     /// Inserts at the caret, replacing any selection.
@@ -548,6 +627,125 @@ extension ComposerView {
         mentionEditor = stash?.text == text ? stash?.mentions ?? MentionEditor() : MentionEditor()
         selection = text.utf16.count..<text.utf16.count
         focused = true
+    }
+}
+
+struct LinkDraft: Equatable {
+    var label: String
+    var url: String
+    let selection: Range<Int>
+}
+
+/// The format buttons above the field. The one for the formatting at the selection is highlighted.
+private struct FormatBar: View {
+    let state: FormatState
+    let enabled: Bool
+    let onAction: (FormatAction) -> Void
+    @Binding var link: LinkDraft?
+    let onLink: (LinkDraft) -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            button(.bold)
+            button(.italic)
+            button(.strikethrough)
+            separator
+            button(.code)
+            button(.codeBlock)
+            separator
+            button(.bullet)
+            button(.quote)
+            button(.link)
+                .popover(
+                    isPresented: Binding(get: { link != nil }, set: { if !$0 { link = nil } }), arrowEdge: .top
+                ) {
+                    if let draft = link {
+                        LinkPopover(draft: draft, onAdd: onLink, onCancel: { link = nil })
+                    }
+                }
+            Spacer(minLength: 0)
+        }
+        .frame(height: 24)
+    }
+
+    private var separator: some View {
+        Rectangle().fill(Color.secondary.opacity(0.25)).frame(width: 1, height: 16).padding(.horizontal, 4)
+    }
+
+    private func button(_ action: FormatAction) -> some View {
+        let active = state.active.contains(action)
+        return Button {
+            onAction(action)
+        } label: {
+            label(action)
+                .foregroundStyle(active ? Theme.accentText : Color.primary)
+                .frame(minWidth: 26, minHeight: 24)
+                .background(active ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled || state.unavailable.contains(action))
+        .help(action.title)
+        .accessibilityLabel(action.title)
+        .accessibilityAddTraits(active ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private func label(_ action: FormatAction) -> some View {
+        switch action {
+        case .bold: Text("B").font(.system(size: 13, weight: .bold))
+        case .italic: Text("I").font(.system(size: 13, design: .serif)).italic()
+        case .strikethrough: Text("S").font(.system(size: 13)).strikethrough()
+        case .code: Image(systemName: "chevron.left.forwardslash.chevron.right").font(.system(size: 11))
+        case .codeBlock: Image(systemName: "curlybraces").font(.system(size: 12))
+        case .bullet: Image(systemName: "list.bullet").font(.system(size: 12))
+        case .quote: Image(systemName: "text.quote").font(.system(size: 12))
+        case .link: Image(systemName: "link").font(.system(size: 12))
+        }
+    }
+}
+
+extension FormatAction {
+    var title: String {
+        switch self {
+        case .bold: "Bold"
+        case .italic: "Italic"
+        case .strikethrough: "Strikethrough"
+        case .code: "Inline code"
+        case .codeBlock: "Code block"
+        case .bullet: "Bulleted list"
+        case .quote: "Quote"
+        case .link: "Link"
+        }
+    }
+}
+
+/// Text and URL for a link, which goes in as `<url|text>`.
+private struct LinkPopover: View {
+    @State var draft: LinkDraft
+    let onAdd: (LinkDraft) -> Void
+    let onCancel: () -> Void
+
+    private var valid: Bool { FormatAction.linkTarget(draft.url) != nil }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add link").fontWeight(.semibold)
+            TextField("Text", text: $draft.label)
+            TextField("URL", text: $draft.url, prompt: Text("https://"))
+                .onSubmit { if valid { onAdd(draft) } }
+            if !draft.url.isEmpty, !valid {
+                Text("Use an https link.").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel).keyboardShortcut(.cancelAction)
+                Button("Add") { onAdd(draft) }.keyboardShortcut(.defaultAction).disabled(!valid)
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+        .padding(12)
+        .frame(width: 300)
     }
 }
 
