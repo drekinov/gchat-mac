@@ -50,6 +50,7 @@ struct ComposerTextView: NSViewRepresentable {
     let controller: ComposerTextController
     let onChange: (String, ComposerChange) -> Void
     let onCommand: (ComposerCommand) -> Bool
+    let onFormat: (FormatAction) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -109,6 +110,7 @@ struct ComposerTextView: NSViewRepresentable {
             textView.textStorage?.delegate = self
             textView.onFocus = { [weak self] focused in self?.focusChanged(focused) }
             textView.onWindow = { [weak self] in self?.queueFocus() }
+            textView.onFormat = { [weak self] action in self?.parent?.onFormat(action) }
             sync(parent)
         }
 
@@ -268,6 +270,7 @@ struct ComposerTextView: NSViewRepresentable {
 final class ComposerNSTextView: NSTextView {
     var onFocus: ((Bool) -> Void)?
     var onWindow: (() -> Void)?
+    var onFormat: ((FormatAction) -> Void)?
     private(set) var lastModifiers: NSEvent.ModifierFlags = []
 
     override var acceptableDragTypes: [NSPasteboard.PasteboardType] {
@@ -277,6 +280,9 @@ final class ComposerNSTextView: NSTextView {
     override func registerForDraggedTypes(_ newTypes: [NSPasteboard.PasteboardType]) {
         super.registerForDraggedTypes(newTypes.filter(TextOnlyDrops.isText))
     }
+
+    /// Formats the selection the way the format bar's button does.
+    func format(_ action: FormatAction) { onFormat?(action) }
 
     override func keyDown(with event: NSEvent) {
         lastModifiers = event.modifierFlags
