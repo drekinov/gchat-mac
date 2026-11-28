@@ -1,5 +1,6 @@
 import ChatModel
 import ChatSync
+import ChatText
 import Foundation
 
 struct SpaceKey: Hashable, Sendable {
